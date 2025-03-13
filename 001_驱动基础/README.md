@@ -177,3 +177,109 @@ MODULE_VERSION("V1.0");
 
 ### 1.4 编译Linux驱动程序
 
+如何编译驱动程序？
+
+第一种编译方法：将驱动放在Linux内核里面，然后编译Linux内核。
+
+第二种编译方法：将驱动编译成内核模块，独立于Linux内核以外。
+
+什么是Linux内核模块？
+
+内核模块是Linux系统中一个特殊的机制，可以将一些使用频率很少或者暂时不用的功能编译成内核模块，在需要时再动态加载到内核里面。
+
+使用内核模块可以较少内核体积，加快启动速度。内核模块的后缀是`.ko`
+
+#### 1.4.1 驱动编译成内核模块
+
+##### 1.4.1.1 通用模板
+
+把驱动编译成Linux内核模块，需要一个简单的Makefile
+
+```makefile
+# 定义模块名称
+obj-m += mydriver.o
+
+# 定义内核源码路径
+KDIR ?= /xxx/linux-kernel
+PWD  ?= $(shell pwd)
+
+all:
+	make -C $(KDIR) M=$(PWD) modules
+
+clean:
+	make -C $(KDIR) M=$(PWD) clean
+```
+
+Makefile解释如下：
+
+1. `obj-m += mydriver.o`: `-m`表示编译成模块
+2. `KDIR ?= /xxx/linux-kernel`: 使用绝对路径来指定内核源码的路径
+3. `PWD ?= $(shell pwd)`: 获取Makefile和驱动源码文件所在的路径
+4. `make -C $(KDIR) M=$(PWD) modules`: 进入KDIR目录，使用PWD路径下源码和Makefile文件编译驱动模块
+5. `make -C $(KDIR) M=$(PWD) clean`: 清除编译文件
+
+**注意：要编译驱动模块，必须先把Linux内核源码编译通过，否则无法编译内核模块**
+
+##### 1.4.1.2 实际编译
+
+还记得内核如何编译的吗？我们写了个脚本`build.sh`，然后在脚本里面指定了`ARCH`和`CROSS_COMPILE`
+
+```sh
+export ARCH=arm
+export CROSS_COMPILE=/usr/local/arm/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-
+
+# 其他编译
+```
+
+现在我们来编译helloworld驱动模块试试：
+
+```makefile
+obj-m += helloworld.o
+
+KDIR ?= /home/ding/linux/imx/kernel
+PWD  ?= $(shell pwd)
+
+all:
+	make -C $(KDIR) M=$(PWD) modules
+
+clean:
+	make -C $(KDIR) M=$(PWD) clean
+```
+
+编译输出结果如下：编译失败了！
+
+![](./src/0003.jpg)
+
+似乎我们没有指定架构和编译器。在shell中通过export临时设置一下环境变量。再试试编译：
+
+**可以看到，设置完ARCH和CROSS_COMPILE之后，就编译成功了**
+
+![](./src/0004.jpg)
+
+**注意：export设置的环境变量是临时的，而且只对当前的终端有效。比如我们关闭终端再重新打开，就有没了**
+
+每次设置`ARCH`和`CROSS_COMPILE`都很麻烦啊，所以我们直接在内核的顶层Makefile中把这两个环境变量写死。
+
+```Makefile
+ARCH		?= arm
+CROSS_COMPILE	?= /usr/local/arm/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-
+```
+
+##### 1.4.1.3 模块操作的基本命令
+
+1. 加载模块：`insmod helloworld.ko`或`modprobe helloworld.ko`
+2. 卸载模块：`rmmod helloworld.ko`
+3. 查看加载的模块：
+
+    + `lsmod`命令：列出已经载入的内核模块
+    + `cat /proc/modules`：查看模块是否加载成功
+
+4. 查看模块信息：`modinfo helloworld.ko`
+
+实测结果如下：
+
+![](./src/0005.jpg)
+
+还可以在ubuntu中查看模块信息：
+
+![](./src/0006.jpg)
