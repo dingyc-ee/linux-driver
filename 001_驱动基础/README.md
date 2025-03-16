@@ -283,3 +283,261 @@ CROSS_COMPILE	?= /usr/local/arm/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueab
 还可以在ubuntu中查看模块信息：
 
 ![](./src/0006.jpg)
+
+#### 1.4.2 menuconfig图形化配置
+
+##### 1.4.2.1 打开图形化界面
+
+1. 在终端中输入`export ARCH=arm`设置平台架构。平台结构是arm还是arm64，根据实际开发板来选择
+   
+   *为什么要先设置平台架构？因为linux支持多种平台架构，所以需要我们手动配置告诉他*
+
+2. 在内核源码的顶层目录下，输入`make menuconfig`
+
+输入完成即可打开配置页面：
+
+![](./src/0007.jpg)
+
+##### 1.4.2.2 图形化配置界面的操作
+
+1. 移动
+
+使用键盘的上、下、左、右按键，可以移动光标
+
+2. 搜索功能
+
+输入`/`即可弹出搜索界面
+
+3. 配置驱动选项状态
+
+    + 把驱动编译成模块，用M来表示
+    + 把驱动编译到内核里面，用*来表示
+    + 不编译
+    + 使用`空格`来配置这三种不同的状态
+  
+比如我们想搜索LAN8720的驱动厂商SMSC，输入`/`，然后再输入SMSC，有以下界面：
+
+![](./src/0008.jpg)
+
+##### 1.4.2.3 与图形化有关的文件
+
+Makefile、.config和Kconfig之间的关系：
+
+**Kconfig文件**
+
+Kconfig文件时图形化配置界面的源文件，图形化界面中的选项由Kconfig文件决定。当执行命令`make menuconfig`时，内核的配置工具会读取内核源码目录下的`arch/xxx/Kconfig`，`xxx`是命令`export ARCH=arm`中的`ARCH`值，然后再生成对应的配置界面。
+
+如果我们要把`helloworld`编译进内核，那就可以修改Kconfig文件，在menuconfig的界面中增加一项。
+
+**config文件和.config文件**
+
+config文件和.config文件，都是Linux内核的配置文件。config位于`arch/$(ARCH)/configs`目录下，是Linux系统默认的配置文件。
+
+.config位于内核源码的顶层目录下，编译Linux内核时会使用.config里面的配置来编译内核镜像。
+
+若.config存在，`make menuconfig`界面的默认配置就是.config文件的配置，修改图形配置界面并保存时，会刷新.config文件。
+
+若.config不存在，`make menuconfig`界面的默认配置，就是Kconfig文件中的默认配置。
+
+使用命令`make xxx_defconfig`命令，会根据`arch/$(ARCH)configs`目录下默认配置文件，生成.config文件。
+
+理解一下这幅图，沿着箭头的指向从上往下看。
+
+1. 首先执行`make menuconfig`，打开图形化配置界面。图形化界面中的选项，由Kconfig决定
+2. 打开图形化配置界面后，就可以在里面进行配置。比如让A驱动编译，B驱动不编译。设置完成保存，自动生成了.config文件
+3. 执行`make`，就可以编译内核了
+
+![](./src/0009.jpg)
+
+*那么问题来了，似乎我们只用到了Kconfig和.config文件。config文件有什么用？*
+
+Kconfig是固定不变的，menuconfig中的配置项成千上万。怎么知道哪些有用？我们需要一份默认配置(由厂商提供)，然后在默认配置上增加我们自己的内容了。
+
+**所以，config文件就是厂商提供给我们的，可以生成定制化的.config文件，方便我们开发。**
+
+![](./src/0010.jpg)
+
+那么xxx_defconfig和.config的文件内容，是一致的吗？我们来看下。
+
+可以看到，两个文件的大小明显不同。xxx_defconfig更像是一个精简的配置，而生成的.config文件则要大很多。
+
+![](./src/0011.jpg)
+
+从内容上看，两个文件的内容也不一样。那么.config文件是怎么来的？
+
+![](./src/0012.jpg)
+
+deepseek的回答是，xxx_defconfig只是覆盖了某些特定的配置项，而其他选项则保留为Kconfig中定义的默认值。
+
+*也就是说，.config文件是defconfig和Kconfig默认值合并之后的结果，而且还自动处理了依赖关系。*
+
+![](./src/0013.jpg)
+
+##### 1.4.2.4 savedefconfig
+
+*还有个问题，如果我们在图形界面中更改了某项值，那当然会生成.config文件对吧。但是只要执行`make distclean`全部重新编译时，.config就被删除了，这意味着下次我们还要重新打开图形界面再重复配置一次。*
+
+如何解决？
+
+`最理想的办法是，把更改图形界面配置项带来的增量变化，添加到xxx_defconfig这个默认的配置文件中。这样下次生成.config时，就会包含我们的更改了。`
+
+能不能把.config直接覆盖xxx_defconfig？
+
+`这样不好。因为前面提到，.config文件包含了默认Kconfig要大很多，而我们需要的只是修改的那几项，而不是整个的配置。所以要有个工具，能够去除.config中的合并引入的配置项，还原一个最精简的xxx_defconfig。这就是save_config`
+
+![](./src/0014.jpg)
+
+下面是一个简单的示例，添加博通的PHY驱动，看看saveconfig是怎么用的。
+
+![](./src/0015.jpg)
+
+当前目录下已经有了.config和Kconfig文件，我们执行`make savedefconfig`，来生成精简的`defconfig`配置文件。
+
+![](./src/0017.jpg)
+
+执行完成后得到了`defconfig`文件，与原配置文件`xxx_defconfig`比较发现，确实只增加了博通的PHY驱动，这是我们想要的。
+
+![](./src/0018.jpg)
+
+savedefconfig的工作原理：提取用户自定义的配置项，剥离默认值和隐式依赖项，生成最小化的配置模板
+
+![](./src/0016.jpg)
+
+#### 1.4.3 Makefile
+
+Makefile里面包含了编译规则，告诉我们要如何编译Linux。
+
+刚才我们再图形配置界面添加了博通的PHY驱动，对应的.config增加了`CONFIG_BROADCOM_PHY=y`
+
+那么接下来Makefile就应该识别到这个配置项，来把博通的PHY驱动.c文件编译到内核
+
+![](./src/0019.jpg)
+
+#### 1.4.4 Kconfig语法
+
+**mainmenu: 设置主菜单的标题**
+
+![](./src/0020.jpg)
+
+**menu/endmenu: 设置菜单结构**
+
+可以用menu/endmenu来生成菜单，menu是菜单开始的标志，endmenu是菜单结束的标志。
+
+![](./src/0021.jpg)
+
+**配置选项**
+
+使用关键字`config`来定义一个新的选项。每个选项都必须指定类型，类型包括bool、tristate、string、hex、int。
+
+最常见的是bool tristate string这3种。bool类型有2种值(Y和N)，tristate有3种值(Y M N)
+
+default提供了CONFIG_xxx的默认值。前面我们提到，当.config不存在时，使用的是Kconfig中的默认值，就是这个玩意了。
+
+![](./src/0022.jpg)
+
+**依赖关系**
+
+Kconfig中的依赖关系，可以用depends on和select来描述
+
+![](./src/0023.jpg)
+
+这个在uboot中已经使用到了，举例如下：
+
+![](./src/0024.jpg)
+
+**注释**
+
+Kconfig中使用comment用于注释，不过此注释非彼注释，这个注释是在图形化界面中显示一行注释。
+
+![](./src/0025.jpg)
+
+**source 读取另一个Kconfig文件**
+
+![](./src/0026.jpg)
+
+#### 1.4.5 实例: 把驱动编译进linux内核
+
+现在我们尝试把驱动编译进linux内核。想想之前做了什么？
+
+1. 要修改Kconfig文件，增加图形界面的配置项，最终在.config中得到`CONFIG_HELLOWORLD=y`
+2. 要修改Makefile文件，增加helloworld.c的编译。既`obj-(CONFIG_HELLOWORLD) += helloworld.o`
+
+接下来我们就尝试修改这些文件。加到哪里呢？放在字符设备中。`drivers/char`目录下
+
+![](./src/0027.jpg)
+
+这是当前字符设备的配置界面。我们可以有两种方式来添加helloworld。
+
+1. 直接把helloworld加到`drivers/char`目录下，在这个Kconfig目录下增加helloworld
+2. 在`drivers/char`目录下新增一个helloworld，在里面创建Kconfig，然后在上层通过source引用
+
+先来试试第一种：很简单。
+
+![](./src/0028.jpg)
+
+实测结果如下：
+
+![](./src/0029.jpg)
+
+第二种方式更加复杂，我们来试试
+
+##### 1.4.5.1 写Kconfig包含
+
+1. 在`drivers/char`目录下创建`helloworld`目录
+2. 在`hellowolrd`目录下创建Kconfig，内容跟前面第一种的内容一致
+   
+    ```Kconfig
+    config HELLOWORLD
+	bool "helloworld support"
+	default y
+	help
+		build-in helloworld to kernel
+    ```
+
+3. 在`drivers/char`的Kconfig中使用`source`，把hellowolrd的Kconfig加进来
+
+![](./src/0030.jpg)
+
+验证结果没问题：
+
+![](./src/0031.jpg)
+
+##### 1.4.5.2 写驱动.c源文件
+
+现在第一步完成了。我们要把之前写的helloworld.c复制到`helloworld`目录下
+
+##### 1.4.5.3 写Makefile包含
+
+`helloworld.c`复制好之后，我们要添加Makefile文件。这该怎么写？
+
+在helloworld目录下，创建一个Makefile，内容如下：`obj-$(CONFIG_HELLOWORLD) += helloworld.o`
+
+然后在上层Makefile中，包含子Makefile，添加一条：`obj-$(CONFIG_HELLOWORLD)	+= helloworld/`
+
+![](./src/0032.jpg)
+
+##### 1.4.5.3 编译linux内核
+
+考虑以下，现在我们做了些什么，我们在Kconfig中增加了helloworld驱动编译。
+
+之前编译Linux内核的步骤：
+
+1. `make xxx_defconfig`
+
+    执行make时，linux会把默认的defconfig和Kconfig合并，来生成一个.config文件。我想说的是，合并Kconfg这个过程应该已经把我们的`hellowolrd`驱动程序带进去了，不需要我们每次都执行`menuconfig`再保存一次
+
+2. 执行`make menuconfig`修改配置界面，或者不要menuconfig，直接编译
+
+3. 编译linux内核
+
+编译完成后，在helloworld目录下生成了编译文件
+
+![](./src/0033.jpg)
+
+接下来启动一下linux内核，看内核启动时会不会自动加载helloworld驱动，可以看到，果然是有的
+
+![](./src/0034.jpg)
+
+如果日志太多不方便查看，我们还可以在`dmesg`中直接搜索，方式是`dmesg | grep "helloworld"`，看下输出结果
+
+![](./src/0035.jpg)
