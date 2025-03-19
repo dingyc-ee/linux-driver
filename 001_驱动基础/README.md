@@ -541,3 +541,374 @@ Kconfig中使用comment用于注释，不过此注释非彼注释，这个注释
 如果日志太多不方便查看，我们还可以在`dmesg`中直接搜索，方式是`dmesg | grep "helloworld"`，看下输出结果
 
 ![](./src/0035.jpg)
+
+## 第2章 驱动程序传参
+
+**注意，给驱动模块传参时，如`a=1`不能写成`a = 1`，即`=`两边不能有空格，因为这会被shell识别成分隔符**
+
+在C语言应用程序中，经常通过`(int argc, char *argv[])`来给应用程序传参。
+
+驱动程序中，也可以给驱动来传参，增加驱动程序的灵活性
+
+![](./src/0036.jpg)
+
+既然驱动程序可以传参，那可以传递哪种类型的参数呢？
+
+**C语言传参的常用类型，驱动程序基本也都支持：**
+
+1. 基本类型：`char bool int long short byte ushort uint`
+2. 数组：`array`
+3. 字符串：`string`
+
+**如何给驱动传递参数？**
+
+驱动支持的参数有3种，分别对应函数。这3个函数在内核源码`include/linux/moduleparam.h`中有定义
+
+1. 传递基本类型函数：`module_param(name,type,perm);`
+
+    函数参数：
+
+    + name: 要传递给驱动代码中的变量的名字
+    + type: 参数类型
+    + perm: 参数的读写权限
+
+2. 传递数组类型函数：`module_param_array(name,type,nump,perm);`
+
+    + name: 要传递给驱动代码中的变量的名字
+    + type: 参数类型
+    + nump: 一个指针，会被传入数组的实际长度来填充
+    + perm: 参数的读写权限
+
+3. 传递字符串类型函数：`module_param_string(name,string,len,perm);`
+
+    + name: insmod传参时，指定的参数的名称
+    + string: 驱动代码中变量的名称
+    + len: 字符串的最大长度，包括\0。可以用sizeof来计算
+    + perm: 参数的读写权限
+
+4. MODULE_PARM_DESC函数
+   
+    + 函数功能：为模块参数提供文档说明，使用`modinfo <模块名>`命令时，可以查看这些描述
+    + 函数原型：`#define MODULE_PARM_DESC(_parm, desc)`
+    + _parm：要描述的参数的参数名称
+    + desc：描述信息
+    
+    实例：
+
+    ```c
+    #include <linux/module.h>
+
+    static int debug_level = 0;
+    module_param(debug_level, int, 0644);
+    MODULE_PARM_DESC(debug_level, "调试级别：0（关闭），1（基本），2（详细）");
+
+    static char *device_name = "default_device";
+    module_param(device_name, charp, 0644);
+    MODULE_PARM_DESC(device_name, "设备名称（字符串）");
+
+    static int __init my_module_init(void) {
+        printk(KERN_INFO "模块加载，设备名称：%s\n", device_name);
+        return 0;
+    }
+
+    static void __exit my_module_exit(void) {
+        printk(KERN_INFO "模块卸载\n");
+    }
+
+    module_init(my_module_init);
+    module_exit(my_module_exit);
+
+    MODULE_LICENSE("GPL");
+    MODULE_AUTHOR("Your Name");
+    MODULE_DESCRIPTION("一个示例驱动模块");
+    ```
+
+    通过 modinfo 查看模块信息：
+
+    ```sh
+    $ modinfo my_module.ko
+    parm:           debug_level:调试级别：0（关闭），1（基本），2（详细） (int)
+    parm:           device_name:设备名称（字符串） (charp)
+    ```
+
+*参数的读写权限*
+
+参数的读写权限，定义在`include/linux/stat.h`和`include/uapi/linux/stat.h`，一般使用S_IRUDO，也可以使用数字表示，如444表示S_IRUGO
+
+可以这样分析：
+
+```c
+#define S_IRWXU 00700   // S_I先不管，U是User的缩写，表示文件的拥有者具有可读可写的权限
+#define S_IRUSR 00400   // 读
+#define S_IWUSR 00200   // 写
+#define S_IXUSR 00100   // 执行
+
+#define S_IRWXG 00070   // S_I先不管，U是User的缩写，表示与文件拥有者同组的用户，具有可读可写的权限
+#define S_IRGRP 00040
+#define S_IWGRP 00020
+#define S_IXGRP 00010
+
+#define S_IRWXO 00007   // S_I先不管，U是User的缩写，表示与文件拥有者不同组的用户，具有可读可写的权限
+#define S_IROTH 00004
+#define S_IWOTH 00002
+#define S_IXOTH 00001
+```
+
+可以把这些权限组合起来用，设置 所有者+组+其他人 的权限：
+
+```c
+#define S_IRWXUGO	(S_IRWXU|S_IRWXG|S_IRWXO)
+#define S_IALLUGO	(S_ISUID|S_ISGID|S_ISVTX|S_IRWXUGO)
+#define S_IRUGO		(S_IRUSR|S_IRGRP|S_IROTH)
+#define S_IWUGO		(S_IWUSR|S_IWGRP|S_IWOTH)
+#define S_IXUGO		(S_IXUSR|S_IXGRP|S_IXOTH)
+```
+
+**驱动传参实测**
+
+`param.c`
+
+```c
+#include <linux/module.h>
+#include <linux/init.h>
+#include <linux/moduleparam.h>
+#include <linux/stat.h>
+#include <uapi/linux/stat.h>
+
+static int a = 0;
+module_param(a, int, S_IRUGO);
+MODULE_PARM_DESC(a, "eg: a=1");
+
+static int array[5] = {0};
+static int array_size = 0;
+module_param_array(array, int, &array_size, S_IRUGO);
+MODULE_PARM_DESC(array, "eg: array=1,2,3");
+
+static char str1[20] = {0};
+module_param_string(str, str1, (sizeof(str1) - 1), S_IRUGO);
+MODULE_PARM_DESC(str, "eg: str=helloworld");
+
+static int module_param_init(void)
+{
+	int i;
+
+	printk("a = %d\n", a);
+	printk("array_size = %d\n", array_size);
+	for (i = 0; i < array_size; i++) {
+		printk("array[%d] = %d\n", i, array[i]);
+	}
+	printk("str1: %s\n", str1);
+
+	return 0;
+}
+
+static void module_param_exit(void)
+{
+	printk("bye!\n");
+}
+
+module_init(module_param_init);
+module_exit(module_param_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+MODULE_VERSION("V1.0");
+```
+
+使用`modinfo`查看模块信息，确实打印了传参的帮助信息。
+
+![](./src/0037.jpg)
+
+使用insmod测试，不设参数和传递参数时，模块加载的打印情况：
+
+![](./src/0038.jpg)
+
+**注意：驱动程序传参时，=左右两个一定不能有空格！**
+
+## 第3章 内核模块符号导出
+
+### 3.1 内核符号表引入：
+
+驱动程序可以编译成内核模块，也就是ko文件。通常情况下，每个ko文件时相互独立的，也就是说模块之间无法相互访问。但是在某些场景下要互相访问，如B模块要用A模块中的函数。怎么做？
+
+什么是符号表？
+
+*Linux中的符号表，是内核或程序在编译、链接和运行过程中生成的数据结构，记录了代码中所有函数、变量、全局对象等符号的名称、地址和类型信息。符号表在调试、性能分析、内核模块开发时至关重要。*
+
+符号表中的每个条目通常包含以下信息：
+
+1. 符号名称：例如函数名、变量名
+2. 符号地址：符号在内核地址空间中的内存位置
+3. 符号类型：函数(T/t) 变量(D/d) 未定义符号(U)
+4. 作用域：全局符号(大写类型标记)  局部符号(小写标记)
+
+Linux内核符号表的作用：
+
+1. 调试coredump：通过符号表可以把coredump转换为函数名和代码位置
+2. 动态加载内核模块：内核模块在加载时，需要依赖内核导出的符号(EXPORT_SYMBOL)来调用核心函数
+3. 反汇编和逆向工程
+
+Linux内核符号表，有2种形式：
+
+1. 静态符号表(map文件)：System.map
+   
+   在内核编译时生成，仅包含编译时确定的符号(不包含动态加载的模块符号)
+
+2. 动态符号表(`/proc/kallsyms`)：通过`cat /proc/kallsyms`可以查看
+
+    实时反映当前运行内核的所有符号(包括动态加载的模块)
+
+    ![](./src/0039.jpg)
+
+回到刚才的问题。如果B模块要用A模块中的函数，那就可以导出A模块中的函数名导入到符号表中，B模块根据符号表就可以找到要调用的函数。
+
+### 3.2 内核符号表的格式
+
+每个编译出来的内核模块，都包含一个`Module.symvers`文件，这就是符号表。如果模块没有依赖或`EXPORT_SYMBOL`导出符号的话，这个文件的内容为空。
+
+当我们使用`EXPORT_SYMBOL`导出符号时，`Module.symvers`文件如下：**最前面的是CRC，不是地址。只有模块加载到内核中，最前面才显示地址。**
+
+![](./src/0049.jpg)
+
+### 3.3 内核符号表导出
+
+模块可以使用宏`EXPORT_SYMBOL`导出符号，到内核符号表中。
+
+`EXPORT_SYMBOL(符号名);`
+
+导出去的符号可以被其他模块使用，使用前只需要`extern`声明一下即可。
+
+我们写一个简单的内核模块a，这里面定义实现了一个`add`函数。
+
+```c
+#include <linux/module.h>
+#include <linux/init.h>
+
+int add(int a, int b)
+{
+	return a + b;
+}
+// EXPORT_SYMBOL(add);
+
+static int module_a_init(void)
+{
+	printk("module_a_init\n");
+	return 0;
+}
+
+static void module_a_exit(void)
+{
+	printk("module_a_exit\n");
+}
+
+module_init(module_a_init);
+module_exit(module_a_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+MODULE_VERSION("V1.0");
+```
+
+先注释掉符号导出，看看编译结果：
+
+![](./src/0040.jpg)
+
+然后使用`EXPORT_SYMBOL(add)`导出符号表，再次编译。
+
+**注意了，我们的模块刚编译完，最前面这个可不是地址，而是符号的CRC校验。这很好理解，我们还没有加载到内核呢，哪来的地址啊？**
+
+*但是，一旦模块加载到了内核，使用`cat /proc/kallsyms看到的符号表，最前面这个就真的是地址了。`*
+
+![](./src/0041.jpg)
+
+现在再写一个驱动模块c，我们直接调用`add`函数，看看有没有什么问题。
+
+可以看到，直接调用`add`函数编译时，会产生一个警告(显示add函数未定义)但没有报错，最终还是得到了ko文件。
+
+![](./src/0042.jpg)
+
+这跟我们想的还不太一样啊。我预期他应该编译不过的，但竟然编译过了。接下来试试运行一下，看正不正常
+
+因为模块c依赖于模块a，所以我们先加载a，再加载c。
+
+**可以看到，模块a正常加载没问题，但模块c加载时报错，找不到符号add，与预期一致。**
+
+![](./src/0043.jpg)
+
+我们下一步想要做的是，把模块a的符号表给模块c来使用，这样他应该就能找到`add`函数了。应该怎么做？
+
+`很简单，直接把模块a编译生成的Module.Symvers文件，复制到模块c的目录下，然后再编译模块c。`
+
+我们试试看：可以看到，现在编译警告没有了。
+
+![](./src/0044.jpg)
+
+加载模块运行以下试试：现在模块c能够正确加载了。
+
+![](./src/0045.jpg)
+
+看起来问题已经很好的解决了。但真的是这样吗？
+
+考虑一个更加复杂的情况，模块c同时依赖于模块a和模块b，此时应该如何处理符号表？
+
+**首先，我们应该分别编译模块a和模块b，得到各自的符号表。这样实际上我们有了2个符号表，而且名字都一样**
+
+现在我们应该怎么把a和b的符号表放到模块c的目录下呢？
+
+如果还是跟之前一样，先复制a再复制b，那么b就会把a覆盖掉。这样肯定有问题。
+
+**我们最终希望实现的效果是，在模块c中有一个符号表，包含了a和b的符号表的全部内容**
+
+### 3.3.1 手动复制
+
+把a和b的符号表，手动追加到模块c的符号表中
+
+使用`cat`命令和`>>`重定向，把a和b的符号表手动合并
+
+```sh
+cat ../a/Module.symvers >> Module.symvers
+cat ../b/Module.symvers >> Module.symvers
+```
+
+实测运行结果如下：
+
+![](./src/0046.jpg)
+
+### 3.3.2 `Makefile`自动处理符号表
+
+修改makefile，自动处理符号表
+
+上面这种方式。如果执行了`make clean`，那么`Module.symvers`就会被删掉，意味着还需要重新制作一次符号表。太麻烦了，有没有自动化的方式呢？
+
+**有的，使用Makefile的`KBUILD_EXTRA_SYMBOLS`变量**
+
+我们先来看下，内核标准文档对于`KBUILD_EXTRA_SYMBOLS`的描述：
+
+如果从另一个模块中复制`Module.symvers`不切实际的话，可以使用`KBUILD_EXTRA_SYMBOLS来构建。`
+
+![](./src/0047.jpg)
+
+DeepSeek对于`KBUILD_EXTRA_SYMBOLS`，有更加详细的解释：
+
+![](./src/0048.jpg)
+
+工作原理简单来说，就是内核的`kbuild`系统，根据`KBUILD_EXTRA_SYMBOLS`来构建合并符号表。
+
+![](./src/0050.jpg)
+
+我们尝试一下，模块c的Makfile改为：
+
+1. 直接使用相对路径来设置`KBUILD_EXTRA_SYMBOLS`，编译报错
+
+![](./src/0051.jpg)
+
+2. 使用绝对路径来设置`KBUILD_EXTRA_SYMBOLS`，正常编译
+
+![](./src/0052.jpg)
+
+3. 通过$(PWD)来间接使用相对路径，编译成功
+
+![](./src/0053.jpg)
+
+**总结：当使用`KBUILD_EXTRA_SYMBOLS`自动构建符号表时，建议使用$(PWD)相对路径，或直接使用绝对路径。**
+
