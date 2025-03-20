@@ -912,3 +912,364 @@ DeepSeek对于`KBUILD_EXTRA_SYMBOLS`，有更加详细的解释：
 
 **总结：当使用`KBUILD_EXTRA_SYMBOLS`自动构建符号表时，建议使用$(PWD)相对路径，或直接使用绝对路径。**
 
+## 第4章 编译进内核的驱动，是如何工作的
+
+这一章我们从源码来分析，编译进内核的驱动程序，是如何被加载执行的
+
+驱动程序的入口是`module_init`，那就从这里开始。在源码中，根据有没有定义`MODULE`宏，`module_init`有2种不同的实现。我们是把驱动编译进内核，所以没有定义`MODULE`。对应的，如果把驱动编译成模块了，kbuild构建时就会定义`MODULE`。
+
+`linux/init.h`
+
+```c
+/*
+ * Used for initialization calls..
+ */
+typedef int (*initcall_t)(void);
+typedef void (*exitcall_t)(void);
+
+#ifndef MODULE
+
+#define __define_initcall(fn, id) \
+	static initcall_t __initcall_##fn##id __used \
+	__attribute__((__section__(".initcall" #id ".init"))) = fn; \
+
+
+#define pure_initcall(fn)		__define_initcall(fn, 0)
+
+#define core_initcall(fn)		__define_initcall(fn, 1)
+#define core_initcall_sync(fn)		__define_initcall(fn, 1s)
+#define postcore_initcall(fn)		__define_initcall(fn, 2)
+#define postcore_initcall_sync(fn)	__define_initcall(fn, 2s)
+#define arch_initcall(fn)		__define_initcall(fn, 3)
+#define arch_initcall_sync(fn)		__define_initcall(fn, 3s)
+#define subsys_initcall(fn)		__define_initcall(fn, 4)
+#define subsys_initcall_sync(fn)	__define_initcall(fn, 4s)
+#define fs_initcall(fn)			__define_initcall(fn, 5)
+#define fs_initcall_sync(fn)		__define_initcall(fn, 5s)
+#define rootfs_initcall(fn)		__define_initcall(fn, rootfs)
+#define device_initcall(fn)		__define_initcall(fn, 6)
+#define device_initcall_sync(fn)	__define_initcall(fn, 6s)
+#define late_initcall(fn)		__define_initcall(fn, 7)
+#define late_initcall_sync(fn)		__define_initcall(fn, 7s)
+
+#define __initcall(fn) device_initcall(fn)
+
+/**
+ * module_init() - driver initialization entry point
+ * @x: function to be run at kernel boot time or module insertion
+ * 
+ * module_init() will either be called during do_initcalls() (if
+ * builtin) or at module insertion time (if a module).  There can only
+ * be one per module.
+ */
+#define module_init(x)	__initcall(x);
+
+#else /* MODULE */
+
+#define early_initcall(fn)		module_init(fn)
+#define core_initcall(fn)		module_init(fn)
+#define core_initcall_sync(fn)		module_init(fn)
+#define postcore_initcall(fn)		module_init(fn)
+#define postcore_initcall_sync(fn)	module_init(fn)
+#define arch_initcall(fn)		module_init(fn)
+#define subsys_initcall(fn)		module_init(fn)
+#define subsys_initcall_sync(fn)	module_init(fn)
+#define fs_initcall(fn)			module_init(fn)
+#define fs_initcall_sync(fn)		module_init(fn)
+#define rootfs_initcall(fn)		module_init(fn)
+#define device_initcall(fn)		module_init(fn)
+#define device_initcall_sync(fn)	module_init(fn)
+#define late_initcall(fn)		module_init(fn)
+#define late_initcall_sync(fn)		module_init(fn)
+
+#define console_initcall(fn)		module_init(fn)
+#define security_initcall(fn)		module_init(fn)
+
+/* Each module must use one module_init(). */
+#define module_init(initfn)					\
+	static inline initcall_t __inittest(void)		\
+	{ return initfn; }					\
+	int init_module(void) __attribute__((alias(#initfn)));
+
+#endif
+```
+
+我们大概的看下，`MODULE`是在哪里设置的。DeepSeek提供的构建流程如下，我们不去探究细节，只需要理解，编译模块时，就会定义`MODULE`。
+
+![](./src/0054.jpg)
+
+接下来继续分析`module_init`代码，以`module_init(helloworld)`为例：
+
+```c
+#define module_init(x)	    __initcall(x);
+    #define __initcall(fn) device_initcall(fn)
+        #define device_initcall(fn)		__define_initcall(fn, 6)
+            #define __define_initcall(fn, id) \
+                static initcall_t __initcall_##fn##id __used \
+                __attribute__((__section__(".initcall" #id ".init"))) = fn;
+
+```
+
+把宏定义展开，最终得到的结果：
+
+```c
+typedef int (*initcall_t)(void);    // init函数原型
+typedef void (*exitcall_t)(void);   // exit函数原型
+
+#define module_init(fn)  \
+    static initcall_t __initcall_##fn6 __attribute__((__section__(".initcall6.init"))) = fn;
+```
+
+带入helloworld函数，分析如下：
+
+1. `initcall_t`是一个函数指针，准确的说是`xxx_init`的函数指针
+2. 这里创建了一个函数指针的静态变量，变量名为`__initcall_helloworld6`，然后把我们的初始化函数`helloworld`赋值给这个静态变量
+3. 把静态变量设置section属性`.initcall6.init`，保存在`.initcall6.init`段中
+4. linux内核中有很多驱动程序，都用了`module_init(xxx)`函数，所以这些函数最终按编译顺序，都放在了`.initcall6.init`段中
+5. `init.h`里面还定义了其他的id(0~7)，数字越小优先级越高
+
+```c
+module_init(helloworld)
+
+static initcall_t __initcall_helloworld6 __attribute__((__section__(".initcall6.init"))) = helloworld;
+```
+
+`.initcall6.init`段有什么用，被谁调用？
+
+`vmlinux.lds.h`链接脚本，把所有的`.initcall.init`都放在了一起。
+
+```c
+#define INIT_CALLS_LEVEL(level)						\
+		__initcall##level##_start = .;		\
+		*(.initcall##level##.init)				\
+		*(.initcall##level##s.init)				\
+
+#define INIT_CALLS							\
+		__initcall_start = .;			\
+		*(.initcallearly.init)					\
+		INIT_CALLS_LEVEL(0)					\
+		INIT_CALLS_LEVEL(1)					\
+		INIT_CALLS_LEVEL(2)					\
+		INIT_CALLS_LEVEL(3)					\
+		INIT_CALLS_LEVEL(4)					\
+		INIT_CALLS_LEVEL(5)					\
+		INIT_CALLS_LEVEL(rootfs)				\
+		INIT_CALLS_LEVEL(6)					\
+		INIT_CALLS_LEVEL(7)					\
+		__initcall_end = .;
+```
+
+全部的`initcall`函数指针表，以`__initcall_start`地址开始，`__initcall_end`地址结束。而具体到每个id，又定义了id表集合的开始`__initcall6_start`，按顺序存放`.initcall6.init`和`.initcall6s.init`。
+
+这些由`initcall`组成的函数指针集合，在linux内核的main函数中有声明：
+
+`main.c`，列出了全部段和每个具体id段的数组地址。
+
+```c
+extern initcall_t __initcall_start[];
+extern initcall_t __initcall0_start[];
+extern initcall_t __initcall1_start[];
+extern initcall_t __initcall2_start[];
+extern initcall_t __initcall3_start[];
+extern initcall_t __initcall4_start[];
+extern initcall_t __initcall5_start[];
+extern initcall_t __initcall6_start[];
+extern initcall_t __initcall7_start[];
+extern initcall_t __initcall_end[];
+
+static initcall_t *initcall_levels[] = {
+	__initcall0_start,
+	__initcall1_start,
+	__initcall2_start,
+	__initcall3_start,
+	__initcall4_start,
+	__initcall5_start,
+	__initcall6_start,
+	__initcall7_start,
+	__initcall_end,
+};
+
+/* Keep these in sync with initcalls in include/linux/init.h */
+static char *initcall_level_names[] = {
+	"early",
+	"core",
+	"postcore",
+	"arch",
+	"subsys",
+	"fs",
+	"device",
+	"late",
+};
+```
+
+那么linux是怎么调用这些初始化函数的？还是在`main.c`文件中。简单追踪一下：
+
+1. `do_initcalls`函数：按优先级从高到低(数字从0~7)，依次调用每一级id的初始化函数
+2. `do_initcall_level`函数：按编译顺序依次取出同一ID等级的`初始化函数指针变量`，交给`do_one_initcall`执行初始化
+3. `do_one_initcall`函数：执行一个`initcall_t`类型的初始化函数
+
+```c
+// 总的初始化函数。循环调用每一级id的初始化
+static void do_initcalls(void)
+{
+	int level;
+
+	for (level = 0; level < ARRAY_SIZE(initcall_levels) - 1; level++)
+		do_initcall_level(level);
+}
+
+// ID级初始化函数。循环调用同一ID等级的初始化
+static void do_initcall_level(int level)
+{
+	initcall_t *fn;
+
+	for (fn = initcall_levels[level]; fn < initcall_levels[level+1]; fn++)
+		do_one_initcall(*fn);
+}
+
+// 执行一个初始化函数。以helloworld为例，这里就会执行到hellowolrd
+int do_one_initcall(initcall_t fn)
+{
+	int ret;
+	ret = fn();
+	return ret;
+}
+```
+
+最后一个问题。`do_initcalls`函数被谁执行？
+
+我们直接给出调用关系顺序：
+
+```c
+start_kernel
+    rest_init
+        kernel_init
+            kernel_init_freeable
+                do_basic_setup
+                    do_initcalls
+```
+
+## 第5章 驱动代码使用Makefile的宏
+
+我们先看一个简单的代码，在驱动程序中判断有没有定义`DEBUG`宏。如果定义了就打印。
+
+```c
+#include <linux/module.h>
+#include <linux/init.h>
+
+static int define_init(void)
+{
+#ifndef DEBUG
+	printk("define_init no DEBUG\n");
+#else
+	printk("define_init DEBUG\n");
+#endif
+	return 0;
+}
+
+static void define_exit(void)
+{
+	printk("define_exit\n");
+}
+
+module_init(define_init);
+module_exit(define_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+MODULE_VERSION("V1.0");
+```
+
+执行结果如下：打印`no DEBUG`，我们确实没有定义`DEBUG`。
+
+![](./src/0055.jpg)
+
+**现在我们如果想定义DEBUG宏，应该怎么做？**
+
+回想一下，上一章我们分析了`MODULE`宏在编译构建模块时，会自动定义。那么是在哪定义的？
+
+*是在内核的顶层Makefile中定义的*
+
+`内核顶层Makefile` 可以看到，`MODULE`是由`KBUILD_CFLAGS_MODULE`变量定义的。
+
+```Makefile
+# 编译内核c文件的变量
+KBUILD_CFLAGS_KERNEL :=
+
+# 编译模块c文件的变量
+KBUILD_CFLAGS_MODULE  := -DMODULE
+```
+
+如果我们想要编译某个具体的模块时，定义`DEBUG`。怎么做？
+
+修改顶层`Makefile`：增加`-DDEBUG`。这样行吗？
+
+    *不行。因为这样会影响到其他所有模块的编译*
+
+**正确的做法是，在编译的那个模块的Makefile中，添加一行`KBUILD_CFLAGS_MODULE += -DDEBUG`**
+
+修改完之后的`Makefile`如下，我们在编译试试：
+
+`模块的Makefile`
+
+```Makefile
+obj-m += define.o
+
+KBUILD_CFLAGS_MODULE += -DDEBUG
+
+KDIR ?= /home/ding/linux/imx/kernel
+PWD  ?= $(shell pwd)
+
+all:
+	make -C $(KDIR) M=$(PWD) modules
+
+clean:
+	make -C $(KDIR) M=$(PWD) clean
+```
+
+运行测试一下。跟预期一致，现在DEBUG已经定义了。
+
+![](./src/0056.jpg)
+
+**还有个问题。如果我们想实现这种效果：`#define DEBUG 3`，应该怎么做？**
+
+很简单，还是在模块的Makefile中，把`KBUILD_CFLAGS_MODULE += -DDEBUG`改为`KBUILD_CFLAGS_MODULE += -DDEBUG=3`
+
+我们试试：
+
+`模块Makefile`
+
+```Makefile
+obj-m += define.o
+
+KBUILD_CFLAGS_MODULE += -DDEBUG=3
+
+KDIR ?= /home/ding/linux/imx/kernel
+PWD  ?= $(shell pwd)
+
+all:
+	make -C $(KDIR) M=$(PWD) modules
+
+clean:
+	make -C $(KDIR) M=$(PWD) clean
+```
+
+驱动程序，打印这个`DEBUG`值：
+
+```c
+static int define_init(void)
+{
+#ifndef DEBUG
+	printk("define_init no DEBUG\n");
+#else
+	printk("define_init DEBUG = %d\n", DEBUG);
+#endif
+	return 0;
+}
+```
+
+测试效果如下，正确的定义了`DEBUG`值。
+
+![](./src/0057.jpg)
+
+**总结：当我们在Linux内核源码中，找不到某些宏或变量时，可以去Makefile或链接脚本中去寻找。思路要打开！**
