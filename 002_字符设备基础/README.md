@@ -159,3 +159,653 @@ OK，我们可以先查看`/proc/devices`，然后分别测试静态/动态注�
 
 ![](./src/0003.jpg)
 
+### 1.4 内存占用问题
+
+前面无论是静态注册，还是动态注册，都需要我们传递一个参数：`连续注册的次设备号数量`。现在需要思考几个问题：
+
+1. 应该申请多少个次设备号？有什么用
+2. 申请多个次设备号，会带来显著的内存开销吗？
+
+对于次设备号的作用，以下是DeepSeek给出的解释：
+
+![](./src/0004.jpg)
+
+而内存开销上，即使申请多个次设备号，也几乎不会产生多少的开销。
+
+![](./src/0005.jpg)
+
+下面是一个典型的使用场景。申请了4个次设备号，用来管理4个硬件设备。*注意，设备文件名相同，只是后面的数字不同。*
+
+![](./src/0006.jpg)
+
+用户空间可以通过打开设备文件(如/dev/device2)，来操作LED2。Open打开文件时，通过inode可以获取到次设备号，继而关联到硬件设备。
+
+![](./src/0007.jpg)
+
+## 第2章 注册字符类设备
+
+### 2.1 cdev结构体
+
+Linux系统中，使用cdev结构体描述一个字符设备。cdev结构体定义在`linux/cdev.h`文件中。
+
+```c
+struct cdev {
+	struct kobject kobj;
+	struct module *owner;
+	const struct file_operations *ops;
+	struct list_head list;
+	dev_t dev;
+	unsigned int count;
+};
+```
+
+成员详解：
+
+1. `struct kobject kobj`：开发者不用管
+2. `struct module *owner`：指向拥有该设备的模块，通常都设为`THIS_MODULE`
+3. `struct file_operations *ops`：定义设备支持的操作函数。这是核心，驱动必须要实现这些函数
+4. `struct list_head list`：开发者不用管
+5. `dev_t dev`：起始设备号，由主设备号和起始次设备号组成
+6. `unsigned int count`：驱动管理的设备实例个数
+
+### 2.2 cdev_init 初始化函数
+
+cdev_init函数，用于初始化cdev结构体成员，建立cdev和file_operations之间的联系：
+
+```c
+void cdev_init(struct cdev *cdev, const struct file_operations *fops)
+{
+	memset(cdev, 0, sizeof *cdev);
+
+	cdev->ops = fops;   // 关联ops
+}
+```
+
+### 2.3 cdev_add 向系统添加一个字符设备
+
+初始化cdev结构体之后，就可以调用cdev_add函数，向系统间添加一个字符设备。
+
+函数原型：`int cdev_add(struct cdev *p, dev_t dev, unsigned count);`
+
+DeepSeek给出了非常好的函数详解：
+
+![](./src/0008.jpg)
+
+下面是cdev_add的底层原理。简单来说，干了2个事情：
+
+1. 把`cdev`添加到内核的字符设备链表。我们执行`cat /proc/devices`时，就会遍历这个链表，来打印全部的字符设备
+2. 维护全局哈希表`cdev_map`，把`cdev`的设备号映射到map哈希表。为什么已经有了链表还需要map？因为哈希表访问速度快，而俩表需要遍历
+
+![](./src/0009.jpg)
+
+用户空间通过设备文件，操作设备驱动的流程：
+
+1. 通过设备文件，找到设备号
+2. 根据设备号，在哈希表`cdev_map`中，找到对应的cdev设备
+3. 执行`cdev->ops`操作函数
+
+![](./src/0010.jpg)
+
+这里还有个问题。如果有多个连续的次设备号，在执行`cdev_add`时，会给每一个次设备号都映射一个map位图吗？
+
+**答案当然是不会。前面我们说了，即使注册很多个次设备号也不会带来显著的内存开销。我们看看这种情况下，是怎么实现的。**
+
+1. 存储：根据主设备号的哈希值存储到不同的桶中，每个桶中存储的是设备号范围的起始值和数量，而非单独记录每个次设备号
+
+![](./src/0011.jpg)
+
+2. 查找：当用户空间访问设备号时，内核遍历哈希桶中的范围条目，检查目标设备号是否在某个已注册的范围内
+
+![](./src/0012.jpg)
+
+### 2.4 cdev_del 从系统中删除一个字符设备
+
+函数原型：`void cdev_del(struct cdev *);`
+
+### 2.5 代码示例
+
+回想以下，我们写字符设备驱动的流程：
+
+1. 申请得到设备号
+2. 初始化cdev字符设备，关联file_ops
+3. 把字符设备+设备号一起，添加到系统中
+
+下面是对应的代码实例：
+
+```c
+#include <linux/init.h>			/* module_init, module_exit */
+#include <linux/module.h>		/* MODULE_LISENCE, MODULE_AUTHOR */
+#include <linux/moduleparam.h>	/* module_cdev */
+#include <linux/types.h>		/* dev_t */
+#include <linux/kdev_t.h>		/* MAJOR, MINOR, MKDEV */
+#include <linux/fs.h>			/* alloc_chrdev_region, unregister_chrdev_region */
+#include <linux/cdev.h>			/* struct cdev, cdev_init, cdev_add */
+
+#define CDEV_NAME		"cdev_test"
+
+static dev_t dev_num;
+static struct cdev cdev_test;
+
+/* THIS_MODULE在linux/export.h中定义, 而这个头文件已经被linux/module.h包含了 */
+static struct file_operations cdev_test_ops = {
+	.owner	= THIS_MODULE,
+};
+
+static __init int module_cdev_init(void)
+{
+	alloc_chrdev_region(&dev_num, 0, 1, CDEV_NAME);
+	printk("alloc_chrdev_region OK\n");
+	printk("major:%d, minor:%d\n", MAJOR(dev_num), MINOR(dev_num));
+
+	/* 先初始化再设置. 因为初始化会清空结构体 */
+	cdev_init(&cdev_test, &cdev_test_ops);
+	cdev_test.owner = THIS_MODULE;
+	cdev_add(&cdev_test, dev_num, 1);
+
+	return 0;
+}
+
+static __exit void module_cdev_exit(void)
+{
+	cdev_del(&cdev_test);
+	unregister_chrdev_region(dev_num, 1);
+
+	printk("exit\n");
+}
+
+module_init(module_cdev_init);
+module_exit(module_cdev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+### 2.6 file_operations结构体的作用
+
+Linux系统中，一切皆文件，访问设备也是在访问文件。在应用程序中调用open、read、write、close这几个系统调用时，最终会去执行到file_operations里面的函数。
+
+![](./src/0013.jpg)
+
+## 第3章 设备节点(设备文件)
+
+### 3.1 什么是设备节点
+
+前面提到，Linux系统一切皆文件的思想。每个设备在Linux系统中，都有一个对应的`设备文件`代表他们，应用程序通过操作这个`设备文件`，便可以操作对应的硬件。如下代码所示：
+
+`fd = open("/dev/hello", O_RDWR);`
+
+这个`设备文件`就是设备节点，所以Linux设备节点是应用程序和驱动程序沟通的一个桥梁。
+
+下面是DeepSeek对设备节点的解释：
+
+设备节点包含2和关键标识：
+
+1. 设备类型：字符设备或块设备
+2. 设备号：主设备号对应了内核中的驱动程序，次设备号标识了同意驱动下的不同设备实例
+
+我们可以这样理解执行过程：用户程序打开了一个设备文件，内核首先判断设备类型。如果是字符设备，就去`cdev_map`哈希表中遍历注册的字符设备，如果设备号匹配上了，那就找到了具体的`cdev`结构体。`cdev_init`时把cdev结构体和file_ops进行了绑定，所以最终会调用到`struct file+operations`中，我们自己写的操作函数。
+
+![](./src/0014.jpg)
+
+### 3.2 如何创建设备节点
+
+有两种方式，创建设备节点：
+
+1. 手动创建：通过命令`mknod`创建设备节点
+
+命令语法：`mknod 设备文件名 c 主设备号 次设备号`。
+
+例如：`mknod /dev/hello c 236 0`
+
+2. 自动创建
+
+可以通过mdev机制，实现设备节点的自动创建与删除。
+
+udev机制：例如自动为USV串口设备创建节点/dev/ttyUSBx
+
++ 内核检测到新设备(如插入USB)时，会发送事件到用户空间的udev守护进程
++ udev根据规则动态创建设备节点，并设备权限
+
+接下来我们写一个简单的应用程序`app.c`，来进行测试。
+
+```c
+#include <stdio.h>
+#include <unistd.h>		/* close函数 */
+#include <sys/types.h>	/* open函数要使用以下3个头文件 */
+#include <sys/stat.h>
+#include <fcntl.h>
+
+int main(int argc, char *argv[])
+{
+	int fd;
+	if (argc < 2) {
+		fprintf(stderr, "Usage: %s /dev/xxx\n", argv[0]);
+		return -1;
+	}
+
+	fd = open(argv[1], O_RDWR);
+	if (fd < 0) {
+		printf("open %s error\n", argv[1]);
+		return fd;
+	}
+	close(fd);
+
+	return 0;
+}
+```
+
+测试流程：
+
+1. `insmod`加载驱动模块。并查看`/proc/devices`中的设备名为`cdev_test`
+
+![](./src/0015.jpg)
+
+2. `mknod`创建设备节点。`mknod /dev/cdev_test c 248 0`
+3. 查看设备节点
+4. 执行应用程序，Open打开访问设备节点。跟我们预期的一致，执行了open和close动作
+
+![](./src/0016.jpg)
+
+### 3.3 自动创建设备节点
+
+前面测试时，使用的手动创建设备节点太麻烦了。接下来我们使用udev自动创建设备节点。
+
+![](./src/0017.jpg)
+
+**什么是udev？**
+
+udev是 Linux 系统中负责管理设备文件系统的工具，它会根据内核发送的设备事件（uevent）和预定义的规则来自动创建设备文件。下面列举了udev自动创建按设备的几种常见情况：
+
+1. 使用标准linux设备模型(class_create和device_create)
+
+	+ `class_create`函数：在`/sys/class/`下创建设备类目录，如`/sys/class/my_class`
+	+ `device_create`函数：在`/sys/class/my_class`下创建设备属性文件(如设备号)，并触发uevent事件
+
+2. 热插拔设备
+
+	+ 当有热插拔设备(SD卡 USB)插入系统时，内核会检测到设备的变化，发送uevent事件。udev会根据设备的属性(如厂商ID 产品ID)来创建设备文件
+
+**内核生成uevent事件**
+
+当`device_create`被调用时：
+
+1. sysfs更新：
+	
+	+ 内核在/sys/class/my_class/my_device下生成设备属性文件(如dev、uenent)
+	+ dev文件包含设备号
+
+2. 触发uevent：
+
+	内核向用户空间发送`uevent`事件，内容包括：
+
+	```sh
+	ACTION=add           # 设备添加事件
+	DEVPATH=/sys/class/my_class/my_device  # 设备在 sysfs 中的路径
+	SUBSYSTEM=my_class   # 设备所属子系统
+	MAJOR=254            # 主设备号
+	MINOR=0              # 次设备号
+	DEVNAME=my_device    # 设备名称
+	```
+
+下面是一个`mem`实例。字符设备在`/sys/class`下面有设备类，设备类下面有设备的属性文件，包括dev和uevent。
+
+其中dev内容就是设备号，event给出了(主设备号+次设备号+设备名称)，这就是前文提到的，手动创建设备文件所需的参数。
+
+![](./src/0018.jpg)
+
+**mdev处理uevent事件**
+
+mdev 作为用户空间守护进程，监听内核的 uevent 事件并响应：
+
+1. 接收uevent事件
+2. 解析设备信息。确定设备类型(字符/块设备)，获取设备号
+3. 根据`DEVNAME`和类型，以及设备号，在`/dev`下创建设备节点
+4. 最终结果
+
+	+ 设备节点生成：`/dev/my_device`被创建
+	+ sysfs关联：`/sys/class/my_class/my_device`下的属性文件，与`/dev/my_device`通过设备号关联
+
+**关键流程图**
+
+```text
+insmod module.ko
+  → 内核加载模块，执行 module_init()
+    → register_chrdev() 注册设备
+    → class_create() 创建 sysfs 类目录
+    → device_create() 创建设备属性文件并触发 uevent
+      → 内核发送 uevent 到用户空间
+        → mdev 解析事件并读取 /sys 信息
+          → 根据 /etc/mdev.conf 规则
+            → 在 /dev 下创建设备节点
+```
+
+### 3.4 Linux标准设备模型函数
+
+**class_create函数 创建类**
+
+头文件：`linux/device.h`
+
+函数原型：`struct class *class_create(struct module *owner, const char *name);`
+
+参数：
+
+	+ `struct module *owner`：拥有该类的模块，通常为THIS_MODULE
+	+ `const char *name`：设备类的名称（字符串），将在 /sys/class/ 下生成同名目录
+
+返回值：返回指向`struct class`的指针。所以我们使用时，要先创建`struct class`类型的指针变量
+
+![](./src/0019.jpg)
+
+**device_create函数 创建设备**
+
+![](./src/0020.jpg)
+
+**device_destroy和class_destroy销毁设备和类**
+
+如果加载驱动模块时，创建了设备类和设备，那卸载模块时就要对应的销毁设备和设备类。
+
+![](./src/0021.jpg)
+
+### 3.5 实测总结
+
+到目前为止，我们学的都还是字符设备的驱动框架，包括：申请设备号，cdev_init(关联fops)、cdev_add(向系统注册字符设备)、class_create创建类、device_create创建设备文件。
+
+真正具体对硬件操作的地方是：`open`、`read`、`write`、`close`这些函数。
+
+```c
+#include <linux/init.h>			/* module_init, module_exit */
+#include <linux/module.h>		/* MODULE_LISENCE, MODULE_AUTHOR */
+#include <linux/moduleparam.h>	/* module_cdev */
+#include <linux/types.h>		/* dev_t */
+#include <linux/kdev_t.h>		/* MAJOR, MINOR, MKDEV */
+#include <linux/fs.h>			/* alloc_chrdev_region, unregister_chrdev_region */
+#include <linux/cdev.h>			/* struct cdev, cdev_init, cdev_add */
+#include <linux/device.h>		/* class_create, device_create */
+
+#define CDEV_NAME		"cdev_test"
+
+static dev_t s_dev_num;
+static struct cdev s_cdev;
+static struct class *s_class;
+static struct device *s_device;
+
+static int module_cdev_open(struct inode *inode, struct file *filp)
+{
+	printk("module_cdev_open\n");
+	return 0;
+}
+
+static ssize_t module_cdev_read(struct file *filp, char __user *buf, size_t size, loff_t *ppos)
+{
+	printk("module_cdev_read\n");
+	return 0;
+}
+
+static ssize_t module_cdev_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+	printk("module_cdev_write\n");
+	return 0;
+}
+
+static int module_cdev_release(struct inode *inode, struct file *filp)
+{
+	printk("module_cdev_release\n");
+	return 0;
+}
+
+static struct file_operations cdev_test_ops = {
+	.owner		= THIS_MODULE,
+	.open		= module_cdev_open,
+	.read 		= module_cdev_read,
+	.write		= module_cdev_write,
+	.release	= module_cdev_release,
+};
+
+static __init int module_cdev_init(void)
+{
+	alloc_chrdev_region(&s_dev_num, 0, 1, CDEV_NAME);
+	printk("alloc_chrdev_region OK\n");
+	printk("major:%d, minor:%d\n", MAJOR(s_dev_num), MINOR(s_dev_num));
+
+	/* 先初始化再设置. 因为初始化会清空结构体 */
+	cdev_init(&s_cdev, &cdev_test_ops);
+	s_cdev.owner = THIS_MODULE;
+	cdev_add(&s_cdev, s_dev_num, 1);
+
+	s_class = class_create(THIS_MODULE, CDEV_NAME);
+	s_device = device_create(s_class, NULL, s_dev_num, NULL, CDEV_NAME);
+
+	return 0;
+}
+
+static __exit void module_cdev_exit(void)
+{
+	device_destroy(s_class, s_dev_num);
+	class_destroy(s_class);
+
+	cdev_del(&s_cdev);
+	unregister_chrdev_region(s_dev_num, 1);
+
+	printk("exit\n");
+}
+
+module_init(module_cdev_init);
+module_exit(module_cdev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+下面是测试结果：
+
+1. 执行`insmod`命令后，首先申请了设备号
+
+![](./src/0022.jpg)
+
+2. 在`/sys/class`下生成了`cdev_test`类。`cdev_test`类下面还有`cdev_test`设备
+
+3. 在`/dev`下生成了设备节点`/dev/cdev_test`
+
+![](./src/0023.jpg)
+
+4. 应用程序能够正常访问设备节点`/dev/cdev_test`
+
+![](./src/0024.jpg)
+
+## 第4章 内核空间与用户空间
+
+### 4.1 为什么要区分用户态与内核态
+
+Linux系统将可访问的内存空间分为了两部分：用户空间和内核空间。操纵系统和驱动程序运行在内核空间(内核态)，应用程序运行在用户空间(用户态)
+
+为什么要区分用户空间和内核空间呢？
+
+内核空间中的代码控制了硬件资源，用户空间中的代码智能通过内核暴露的系统调用接口，来使用系统中的硬件资源。这样的设计可以保证操作系统自身的安全性和稳定性。
+
+另一方面，内核空间的代码更偏向于系统管理，而用户空间的代码更偏重于业务逻辑实现。
+
+### 4.2 arm linux中的特权指令集
+
+DeepSeek给出了arm架构的特权指令集。用户态(User Mode)执行这些指令会触发`Undef`异常，Linux内核会捕获此异常并终止违规进程(通过SIGILL信号)，产生core dump。
+
+特权指令集总结分为：
+
+1. 读写程序状态寄存器CPSR、SPSR
+2. 内存管理单元MMU控制，页表和快表操作
+3. 协处理器CP15操作，缓存，MMU配置
+4. 修改中断状态(使能、禁用)
+
+![](./src/0025.jpg)
+
+![](./src/0026.jpg)
+
+### 4.3 arm linux上电默认启动的模式
+
+imx6ull芯片上电启动时，默认运行在管理模式(SVC模式)，而非用户模式。
+
+因为boot和内核要操作硬件：中断、MMU、Cache等。所以只能运行在特权模式。等内核初始化加载完成后，再切换到用户模式。
+
+![](./src/0027.jpg)
+
+### 4.4 用户态和内核态的切换，及权限管理
+
+![](./src/0028.jpg)
+
+![](./src/0029.jpg)
+
+### 4.5 用户空间和内核空间的数据交换
+
+用户空间和内核空间的数据交换，不能直接通过简单的内存拷贝(rumemcpy)交换数据，而必须使用`copy_to_user`和`copy_from_user`来实现。原因是为了权限控制和系统安全。
+
+![](./src/0030.jpg)
+
+### 4.6 数据拷贝函数
+
+`linux/include/arm-asm/uaccess.h`，定义了`copy_to_user`和`copy_from_user`这两个函数。
+
+函数定义与基本作用：
+
+![](./src/0031.jpg)
+
+实现原理：
+
+![](./src/0032.jpg)
+
+### 4.7 软件实测
+
+`驱动程序.c`
+
+```c
+#include <linux/init.h>			/* module_init, module_exit */
+#include <linux/module.h>		/* MODULE_LISENCE, MODULE_AUTHOR */
+#include <linux/moduleparam.h>	/* module_cdev */
+#include <linux/types.h>		/* dev_t */
+#include <linux/kdev_t.h>		/* MAJOR, MINOR, MKDEV */
+#include <linux/fs.h>			/* alloc_chrdev_region, unregister_chrdev_region */
+#include <linux/cdev.h>			/* struct cdev, cdev_init, cdev_add */
+#include <linux/device.h>		/* class_create, device_create */
+#include <linux/uaccess.h>
+
+#define CDEV_NAME		"cdev_test"
+
+static dev_t s_dev_num;
+static struct cdev s_cdev;
+static struct class *s_class;
+static struct device *s_device;
+
+static int module_cdev_open(struct inode *inode, struct file *filp)
+{
+	printk("module_cdev_open\n");
+	return 0;
+}
+
+static ssize_t module_cdev_read(struct file *filp, char __user *buf, size_t size, loff_t *ppos)
+{
+	char kbuf[32] = "This is cdev_test read";
+	if (copy_to_user(buf, kbuf, strlen(kbuf)) != 0) {
+		printk("copy_to_user error\n");
+		return -1;
+	}
+	printk("module_cdev_read\n");
+	return 0;
+}
+
+static ssize_t module_cdev_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+	char kbuf[32] = {0};
+	if (copy_from_user(kbuf, buf, size) != 0) {
+		printk("copy_from_user error\n");
+		return -1;
+	}
+	printk("kbuf: %s\n", kbuf);
+	printk("module_cdev_write\n");
+	return 0;
+}
+
+static int module_cdev_release(struct inode *inode, struct file *filp)
+{
+	printk("module_cdev_release\n");
+	return 0;
+}
+
+static struct file_operations cdev_test_ops = {
+	.owner		= THIS_MODULE,
+	.open		= module_cdev_open,
+	.read 		= module_cdev_read,
+	.write		= module_cdev_write,
+	.release	= module_cdev_release,
+};
+
+static __init int module_cdev_init(void)
+{
+	alloc_chrdev_region(&s_dev_num, 0, 1, CDEV_NAME);
+	printk("alloc_chrdev_region OK\n");
+	printk("major:%d, minor:%d\n", MAJOR(s_dev_num), MINOR(s_dev_num));
+
+	/* 先初始化再设置. 因为初始化会清空结构体 */
+	cdev_init(&s_cdev, &cdev_test_ops);
+	s_cdev.owner = THIS_MODULE;
+	cdev_add(&s_cdev, s_dev_num, 1);
+
+	s_class = class_create(THIS_MODULE, CDEV_NAME);
+	s_device = device_create(s_class, NULL, s_dev_num, NULL, CDEV_NAME);
+
+	return 0;
+}
+
+static __exit void module_cdev_exit(void)
+{
+	device_destroy(s_class, s_dev_num);
+	class_destroy(s_class);
+
+	cdev_del(&s_cdev);
+	unregister_chrdev_region(s_dev_num, 1);
+
+	printk("exit\n");
+}
+
+module_init(module_cdev_init);
+module_exit(module_cdev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+`应用程序.c`
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>		/* close函数 */
+#include <sys/types.h>	/* open函数要使用以下3个头文件 */
+#include <sys/stat.h>
+#include <fcntl.h>
+
+int main(int argc, char *argv[])
+{
+	int fd;
+	char buf[32] = {0};
+	const char str[] = "app_write_test";
+
+	if (argc < 2) {
+		fprintf(stderr, "Usage: %s /dev/xxx\n", argv[0]);
+		return -1;
+	}
+	fd = open(argv[1], O_RDWR);
+	if (fd < 0) {
+		printf("open %s error\n", argv[1]);
+		return fd;
+	}
+	read(fd, buf, sizeof(buf));
+	printf("read buf: %s\n", buf);
+	write(fd, str, strlen(str));
+	close(fd);
+
+	return 0;
+}
+```
+
+实测结果：
+
+![](./src/0033.jpg)
+
