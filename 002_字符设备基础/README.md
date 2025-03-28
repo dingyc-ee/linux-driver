@@ -809,3 +809,435 @@ int main(int argc, char *argv[])
 
 ![](./src/0033.jpg)
 
+## 第5章 文件私有数据
+
+在Linux设备驱动中，`private_data`是`struct file`中的一个成员(void *指针)，文件私有数据就是将私有数据`private_data`指向设备结构体。
+
+![](./src/0034.jpg)
+
+### 5.1 printf缓冲输出打印
+
+`驱动程序.c`如下，每行打印前面都有`[KERN]`，表示这是内核的日志
+
+```c
+#include <linux/init.h>			/* module_init, module_exit */
+#include <linux/module.h>		/* MODULE_LISENCE, MODULE_AUTHOR */
+#include <linux/moduleparam.h>	/* module_cdev */
+#include <linux/types.h>		/* dev_t */
+#include <linux/kdev_t.h>		/* MAJOR, MINOR, MKDEV */
+#include <linux/fs.h>			/* alloc_chrdev_region, unregister_chrdev_region */
+#include <linux/cdev.h>			/* struct cdev, cdev_init, cdev_add */
+#include <linux/device.h>		/* class_create, device_create */
+#include <linux/uaccess.h>		/* copy_to_user, copy_from_user */
+
+#define CDEV_NAME			"cdev_test"
+#define PRINTK(fmt, ...)	printk("[KERN] " fmt, ##__VA_ARGS__)
+
+struct cdev_dev {
+	dev_t dev_num;
+	struct cdev cdev;
+	struct class *class;
+	struct device *device;
+	char kbuf[32];
+};
+
+struct cdev_dev dev1;
+
+static int module_cdev_open(struct inode *inode, struct file *filp)
+{
+	PRINTK("module_cdev_open\n");
+	filp->private_data = &dev1;
+	return 0;
+}
+
+static ssize_t module_cdev_read(struct file *filp, char __user *buf, size_t size, loff_t *ppos)
+{
+	struct cdev_dev *dev = (struct cdev_dev *)filp->private_data;
+
+	strcpy(dev->kbuf, "helloworld\n");
+	if (copy_to_user(buf, dev->kbuf, strlen(dev->kbuf)) != 0) {
+		PRINTK("copy_to_user error\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static ssize_t module_cdev_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+	struct cdev_dev *dev = (struct cdev_dev *)filp->private_data;
+
+	if (copy_from_user(dev->kbuf, buf, size) != 0) {
+		PRINTK("copy_from_user error\n");
+		return -1;
+	}
+	PRINTK("kbuf:%s\n", dev->kbuf);
+	return 0;
+}
+
+static int module_cdev_release(struct inode *inode, struct file *filp)
+{
+	PRINTK("module_cdev_close\n");
+	return 0;
+}
+
+static struct file_operations cdev_test_ops = {
+	.owner		= THIS_MODULE,
+	.open		= module_cdev_open,
+	.read 		= module_cdev_read,
+	.write		= module_cdev_write,
+	.release	= module_cdev_release,
+};
+
+static __init int module_cdev_init(void)
+{
+	alloc_chrdev_region(&dev1.dev_num, 0, 1, CDEV_NAME);
+	PRINTK("alloc_chrdev_region OK\n");
+	PRINTK("major:%d, minor:%d\n", MAJOR(dev1.dev_num), MINOR(dev1.dev_num));
+
+	/* 先初始化再设置. 因为初始化会清空结构体 */
+	cdev_init(&dev1.cdev, &cdev_test_ops);
+	dev1.cdev.owner = THIS_MODULE;
+	cdev_add(&dev1.cdev, dev1.dev_num, 1);
+
+	dev1.class = class_create(THIS_MODULE, CDEV_NAME);
+	dev1.device = device_create(dev1.class, NULL, dev1.dev_num, NULL, CDEV_NAME);
+
+	return 0;
+}
+
+static __exit void module_cdev_exit(void)
+{
+	device_destroy(dev1.class, dev1.dev_num);
+	class_destroy(dev1.class);
+
+	cdev_del(&dev1.cdev);
+	unregister_chrdev_region(dev1.dev_num, 1);
+
+	PRINTK("exit\n");
+}
+
+module_init(module_cdev_init);
+module_exit(module_cdev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+`测试应用程序.c`，可以看到，输出的换行符跟我们预期的顺序并不完全一致。
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>		/* close函数 */
+#include <sys/types.h>	/* open函数要使用以下3个头文件 */
+#include <sys/stat.h>
+#include <fcntl.h>
+
+int main(int argc, char *argv[])
+{
+	int fd;
+	char buf[32] = {0};
+	const char str[] = "app_write_test";
+
+	if (argc < 2) {
+		fprintf(stderr, "Usage: %s /dev/xxx\n", argv[0]);
+		return -1;
+	}
+	fd = open(argv[1], O_RDWR);
+	if (fd < 0) {
+		printf("open %s error\n", argv[1]);
+		return fd;
+	}
+	read(fd, buf, sizeof(buf));
+	printf("read buf:%s\n", buf);
+	write(fd, str, strlen(str));
+	close(fd);
+
+	return 0;
+}
+```
+
+测试结果：
+
+![](./src/0035.jpg)
+
+可以看到，应用程序的换行符没有立即打印，而是被缓冲了。反而是内核的日志优先打印。DeepSeek给出了解释：
+
+![](./src/0036.jpg)
+
+### 5.2 一个驱动兼容不同设备
+
+文件私有数据的典型使用场景是，支持主设备号相同，次设备号不同的多个设备。
+
+我们准备设计这样的一个驱动程序：
+
+1. 5个设备，主设备号相同，次设备号递增
+2. 5个设备的设备节点分别为：/dev/cdev_test0, /dev/cdev_test1, ..., /dev/cdev_test4
+3. private_data指针，指向设备结构体
+
+现在考虑下，我们的设备驱动应该怎么写，接下来是思考的部分：
+
+1. 大家共用主设备号，所以只需要一个主设备号变量major
+2. 大家共同一个设备类，所以只需要一个设备类变量class
+3. 次设备号每个都不同，所以设备结构体需要minor
+4. cdev设备结构体，由设备号(major + minor)组成。所以也是每个都不同，设备结构体需要cdev
+5. 每个设备都要创建设备指针`device`
+6. 申请设备号时，指定要申请5个连续的设备
+7. 申请到设备号dev之后，可以紧接着创建设备类class。这是共用的
+8. 一个循环，遍历初始化cdev，minor和设备指针
+9. open函数中，一个参数是i_node，这个结构体包含了`dev_t`的设备号，从中根据次设备号可以获取对应设备
+
+完整的驱动代码如下：
+
+```c
+#include <linux/init.h>			/* module_init, module_exit */
+#include <linux/module.h>		/* MODULE_LISENCE, MODULE_AUTHOR */
+#include <linux/moduleparam.h>	/* module_cdev */
+#include <linux/types.h>		/* dev_t */
+#include <linux/kdev_t.h>		/* MAJOR, MINOR, MKDEV */
+#include <linux/fs.h>			/* alloc_chrdev_region, unregister_chrdev_region */
+#include <linux/cdev.h>			/* struct cdev, cdev_init, cdev_add */
+#include <linux/device.h>		/* class_create, device_create */
+#include <linux/uaccess.h>		/* copy_to_user, copy_from_user */
+
+#define DEVICE_NAME		"cdev_test"
+#define DEVICE_NUM		(5)
+
+#define PRINTK(fmt, ...)	printk("[KERN] " fmt, ##__VA_ARGS__)
+
+struct cdev_dev {
+	int minor;
+	struct cdev cdev;
+	struct device *device;
+	char kbuf[64];
+};
+
+static int major;
+static struct class *class;
+static struct cdev_dev devices[DEVICE_NUM];
+
+static int module_cdev_open(struct inode *inode, struct file *filp)
+{
+	int minor = iminor(inode);
+
+	filp->private_data = &devices[minor];
+	PRINTK("Device %d opened\n", minor);
+
+	return 0;
+}
+
+static ssize_t module_cdev_read(struct file *filp, char __user *buf, size_t size, loff_t *ppos)
+{
+	struct cdev_dev *dev = (struct cdev_dev *)filp->private_data;
+
+	sprintf(dev->kbuf, "Device %d read\n", dev->minor);
+	if (copy_to_user(buf, dev->kbuf, strlen(dev->kbuf)) != 0) {
+		PRINTK("copy_to_user error\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static ssize_t module_cdev_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+	struct cdev_dev *dev = (struct cdev_dev *)filp->private_data;
+
+	if (copy_from_user(dev->kbuf, buf, size) != 0) {
+		PRINTK("copy_from_user error\n");
+		return -1;
+	}
+	PRINTK("Device %d write:%s\n", dev->minor, dev->kbuf);
+	return 0;
+}
+
+static int module_cdev_release(struct inode *inode, struct file *filp)
+{
+	int minor = iminor(inode);
+	PRINTK("Device %d closed\n", minor);
+	return 0;
+}
+
+static struct file_operations cdev_test_ops = {
+	.owner		= THIS_MODULE,
+	.open		= module_cdev_open,
+	.read 		= module_cdev_read,
+	.write		= module_cdev_write,
+	.release	= module_cdev_release,
+};
+
+static __init int module_cdev_init(void)
+{
+	int i;
+	dev_t dev;
+	
+	PRINTK("Initializing...\n");
+	alloc_chrdev_region(&dev, 0, DEVICE_NUM, DEVICE_NAME);
+	major = MAJOR(dev);
+	class = class_create(THIS_MODULE, DEVICE_NAME);
+	for (i = 0; i < DEVICE_NUM; i++) {
+		devices[i].minor = i;
+		cdev_init(&devices[i].cdev, &cdev_test_ops);		
+		devices[i].cdev.owner = THIS_MODULE;
+		cdev_add(&devices[i].cdev, MKDEV(major, i), 1);
+		devices[i].device = device_create(class, NULL, MKDEV(major, i), NULL, "%s%d", DEVICE_NAME, i);
+	}
+
+	return 0;
+}
+
+static __exit void module_cdev_exit(void)
+{
+	int i;
+
+	for (i = 0; i < DEVICE_NUM; i++) {
+		device_destroy(class, MKDEV(major, i));
+		cdev_del(&devices[i].cdev);
+	}
+	class_destroy(class);
+	unregister_chrdev_region(MKDEV(major, 0), DEVICE_NUM);
+
+	PRINTK("Cleanup completed\n");
+}
+
+module_init(module_cdev_init);
+module_exit(module_cdev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果如下：
+
+![](./src/0037.jpg)
+
+## 第6章 杂项设备驱动
+
+在Linux内核中，把无法归类的五花八门的设备定义成杂项设备。**相对于字符设备来说，杂项设备的主设备号固定为10**。而字符设备不管是动态分配还是静态分配设备号，都会消耗一个主设备号，比较浪费。
+
+杂项设备是字符设备的一种，他简化了操作流程和难度，会自己调用`class_create`和`device_create`来自动创建设备节点。
+
+下面是杂项设备的关键数据结构：
+
+![](./src/0038.jpg)
+
+下面是DeepSeek给出的，杂项设备驱动的操作流程：
+
+`include/linux/miscdevice.h`
+
+```c
+struct miscdevice  {
+	int minor;
+	const char *name;
+	const struct file_operations *fops;
+	// ...
+};
+```
+
+上面是杂项设备的结构体。对于杂项设备，我们只需要关注前3个成员的初始化：
+
+1. `minor`: 次设备号。如果设为`MISC_DYNAMIC_MINOR`，则由内核自动分配次设备号
+2. `char *name`: 设备名。用于生成设备节点`/dev/name`
+3. `file_operations *fops`：文件操作函数集
+
+**注册函数：`int misc_register(struct miscdevice *misc)`**
+
+	定义一个miscdevice结构体变量，先初始化前3个成员，然后注册。此时会自动生成设备节点
+
+**卸载函数：`int misc_deregister(struct miscdevice *misc)`**
+
+	调用卸载函数后，会自动删除设备节点
+
+下面是杂项设备的测试代码。值得注意的是，我们在`read`和`write`函数中，从`filp->f_inode`获取了inode节点，然后继续从`inode->i_rdev`获取到了设备号。
+
+`测试代码.c`
+
+```c
+#include <linux/init.h>			/* module_init, module_exit */
+#include <linux/module.h>		/* MODULE_LISENCE, MODULE_AUTHOR */
+#include <linux/moduleparam.h>	/* module_cdev */
+#include <linux/types.h>		/* dev_t */
+#include <linux/kdev_t.h>		/* MAJOR, MINOR, MKDEV */
+#include <linux/fs.h>			/* alloc_chrdev_region, unregister_chrdev_region */
+#include <linux/cdev.h>			/* struct cdev, cdev_init, cdev_add */
+#include <linux/device.h>		/* class_create, device_create */
+#include <linux/uaccess.h>		/* copy_to_user, copy_from_user */
+#include <linux/miscdevice.h>	/* misc_register */
+
+#define DEVICE_NAME		"misc_test"
+
+#define PRINTK(fmt, ...)	printk("[KERN] " fmt, ##__VA_ARGS__)
+
+static int module_cdev_open(struct inode *inode, struct file *filp)
+{
+	int major = imajor(inode);
+	int minor = iminor(inode);
+	PRINTK("Device (%d,%d) opened\n", major, minor);
+
+	return 0;
+}
+
+static ssize_t module_cdev_read(struct file *filp, char __user *buf, size_t size, loff_t *ppos)
+{
+	return 0;
+}
+
+static ssize_t module_cdev_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+	char kbuf[64] = {0};
+	dev_t dev = filp->f_inode->i_rdev;
+
+	if (copy_from_user(kbuf, buf, size) != 0) {
+		PRINTK("copy_from_user error\n");
+		return -1;
+	}
+	PRINTK("Device (%d,%d) write:%s\n", MAJOR(dev), MINOR(dev), kbuf);
+	return 0;
+}
+
+static int module_cdev_release(struct inode *inode, struct file *filp)
+{
+	int major = imajor(inode);
+	int minor = iminor(inode);
+	PRINTK("Device (%d,%d) closed\n", major, minor);
+	return 0;
+}
+
+static struct file_operations cdev_test_ops = {
+	.owner		= THIS_MODULE,
+	.open		= module_cdev_open,
+	.read 		= module_cdev_read,
+	.write		= module_cdev_write,
+	.release	= module_cdev_release,
+};
+
+static struct miscdevice device = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name  = DEVICE_NAME,
+	.fops  = &cdev_test_ops,
+};
+
+static __init int module_cdev_init(void)
+{
+	PRINTK("Initializing...\n");
+	misc_register(&device);
+	return 0;
+}
+
+static __exit void module_cdev_exit(void)
+{
+	misc_deregister(&device);
+	PRINTK("Removed!\n");
+}
+
+module_init(module_cdev_init);
+module_exit(module_cdev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果如下：
+
+![](./src/0039.jpg)
