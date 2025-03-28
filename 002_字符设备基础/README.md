@@ -1241,3 +1241,428 @@ MODULE_AUTHOR("ding");
 测试结果如下：
 
 ![](./src/0039.jpg)
+
+## 第7章 Linux驱动错误处理
+
+在前面的代码中，我们为了简单起见抓住重点，都是直接写代码，完全忽略了返回值。但实际上，Linux驱动的返回值错误处理非常重要。
+
+### 7.1 函数返回值`int`类型
+
+当内核函数返回`int`类型时，通常应该遵守如下规则：
+
+1. 成功时返回0
+2. 错误时返回负的错误码(错误码在`linux/errno.h`中定义)
+
+	```c
+	#define	EPERM		 1	/* Operation not permitted */
+	#define	ENOENT		 2	/* No such file or directory */
+	#define	ESRCH		 3	/* No such process */
+	...
+	#define	EAGAIN		11	/* Try again */
+	#define	ENOMEM		12	/* Out of memory */
+	#define	EACCES		13	/* Permission denied */
+	#define	EFAULT		14	/* Bad address */
+	#define	ENOTBLK		15	/* Block device required */
+	#define	EBUSY		16	/* Device or resource busy */
+	#define	EEXIST		17	/* File exists */
+	#define	EXDEV		18	/* Cross-device link */
+	#define	ENODEV		19	/* No such device */
+	```
+
+**关键点：不要直接检查`ret == -INVAL`等，通常直接传递返回值即可。**
+
+### 7.2 函数返回值`指针`类型
+
+**先牢记一点：NULL指针不代表错误(除非某些特定申请内存的函数)，必须用`IS_ERR`来检查指针，而非直接检查NULL。**
+
+当内核函数返回指针时，错误处理略有不同：
+
+1. 成功时返回有效指针（非空）
+2. 错误时返回特殊错误指针，使用 ERR_PTR() 宏封装错误码（例如 ERR_PTR(-ENOMEM)）
+3. 错误指针需要通过 IS_ERR() 和 PTR_ERR() 处理
+
+**关键点：NULL 指针不表示错误， 必须用 IS_ERR() 检测错误指针，而非直接检查 NULL。**
+
+如何理解这个过程？
+
+下面是DeepSeek的解释：
+
+![](./src/0040.jpg)
+
+![](./src/0041.jpg)
+
+![](./src/0042.jpg)
+
+### 7.3 `IS_ERR、ERR_PTR、PTR_ERR`介绍
+
+`ERR_PTR`：强制类型转换，把负值错误码转换成`void *`指针
+
+	`#define ERR_PTR(error) ((void *)((long)(error)))`
+
+`PTR_ERR`: 把指针强制类型转换成数值
+
+	`#define PTR_ERR(ptr) ((long)(ptr))`
+
+![](./src/0043.jpg)
+
+### 7.4 Linux错误处理标准
+
+![](./src/0044.jpg)
+
+![](./src/0045.jpg)
+
+### 7.5 字符设备驱动的正确初始化顺序
+
+**申请到设备号`dev_t`之后，应该先创建设备类`class`，再初始化和添加cdev设备。**
+
+![](./src/0046.jpg)
+
+为什么要先创建设备类`class`，再初始化和添加cdev设备？
+
+1. 方便错误处理
+2. 方便用户空间访问
+
+![](./src/0047.jpg)
+
+
+### 7.6 错误处理实例
+
+以下面的代码为例：
+
+```c
+static __init int module_cdev_init(void)
+{
+	alloc_chrdev_region(&dev1.dev_num, 0, 1, CDEV_NAME);
+	PRINTK("alloc_chrdev_region OK\n");
+
+	dev1.class = class_create(THIS_MODULE, CDEV_NAME);
+	cdev_init(&dev1.cdev, &cdev_test_ops);
+	dev1.cdev.owner = THIS_MODULE;
+	cdev_add(&dev1.cdev, dev1.dev_num, 1);
+
+	dev1.device = device_create(dev1.class, NULL, dev1.dev_num, NULL, CDEV_NAME);
+
+	return 0;
+}
+```
+
+我们添加完错误处理代码后，会变成现在的样子：
+
+`增加错误处理.c`
+
+```c
+static __init int module_cdev_init(void)
+{
+	int ret; 
+
+	ret = alloc_chrdev_region(&dev1.dev_num, 0, 1, CDEV_NAME);
+	if (ret < 0) {
+		goto err_alloc_chrdev;
+	}
+	dev1.class = class_create(THIS_MODULE, CDEV_NAME);
+	if (IS_ERR(dev1.class)) {
+		ret = PTR_ERR(dev1.class);
+		goto err_class_create;
+	}
+	cdev_init(&dev1.cdev, &cdev_test_ops);
+	dev1.cdev.owner = THIS_MODULE;
+	ret = cdev_add(&dev1.cdev, dev1.dev_num, 1);
+	if (ret < 0) {
+		goto err_cdev_add;
+	}
+	dev1.device = device_create(dev1.class, NULL, dev1.dev_num, NULL, CDEV_NAME);
+	if (IS_ERR(dev1.device)) {
+		ret = PTR_ERR(dev1.device);
+		goto err_device_create;
+	}
+	PRINTK("Initializing...\n");
+	return 0;
+
+err_device_create:
+	cdev_del(&dev1.cdev);
+err_cdev_add:
+	class_destroy(dev1.class);
+err_class_create:
+	unregister_chrdev_region(dev1.dev_num, 1);
+err_alloc_chrdev:
+	return ret;
+}
+```
+
+## 第8章 点亮LED设备
+
+我们使用的是正点原子`imx6ull`开发板。LED灯的原理图如下:
+
+### 8.1 硬件操作流程
+
+**LED的引脚为GPIO1_IO03 输出低电平时点亮LED灯**
+
+![](./src/0049.jpg)
+
+![](./src/0048.jpg)
+
+对于imx6ull操作GPIO来说，需要有以下步骤：
+
+1. 配置IO复用功能
+   
+![](./src/0050.jpg)
+
+2. 配置IO的电气属性
+
+![](./src/0051.jpg)
+
+3. 配置IO方向
+
+![](./src/0052.jpg)
+
+4. 拉高/拉低输出电平
+
+![](./src/0053.jpg)
+
+### 8.2 寄存器映射`ioremap`和`iounmap`
+
+由于arm linux使用的是虚拟地址。要访问物理寄存器时，需要先通过`ioremap`把寄存器地址映射成虚拟地址。
+
+使用完成后，要通过`iounmap`释放映射的虚拟地址。
+
+![](./src/0054.jpg)
+
+![](./src/0055.jpg)
+
+### 8.3 寄存器的读写`readl`和`weitel`
+
+ioremap得到寄存器虚拟地址后，不能直接读写虚拟地址，而是要通过`readl`和`writel`函数。
+
+否则可能由于内存屏障，或编译器优化，造成未知的问题。下面是DeepSeek的解释：
+
+![](./src/0056.jpg)
+
+![](./src/0057.jpg)
+
+`readl`和`writel`函数的使用方式：
+
+![](./src/0058.jpg)
+
+### 8.4 LED驱动代码
+
+关键点：
+
+1. 在`module_init`或`probe`阶段，执行`ioremap`
+2. 在`open`阶段，给寄存器赋值
+3. 在`write`阶段，兼容了数值和字符串。分别用于应用程序和shll来操作
+
+
+```c
+#include <linux/init.h>			/* module_init, module_exit */
+#include <linux/module.h>		/* MODULE_LISENCE, MODULE_AUTHOR */
+#include <linux/moduleparam.h>	/* module_cdev */
+#include <linux/types.h>		/* dev_t */
+#include <linux/kdev_t.h>		/* MAJOR, MINOR, MKDEV */
+#include <linux/fs.h>			/* alloc_chrdev_region, unregister_chrdev_region */
+#include <linux/cdev.h>			/* struct cdev, cdev_init, cdev_add */
+#include <linux/device.h>		/* class_create, device_create */
+#include <linux/uaccess.h>		/* copy_to_user, copy_from_user */
+#include <linux/errno.h>		/* IS_ERR, PTR_ERR */
+#include <linux/io.h>			/* ioremap,  */
+
+#define CLASS_NAME			"imx6ull"
+#define CDEV_NAME			"led"
+#define PRINTK(fmt, ...)	printk("[KERN] " fmt, ##__VA_ARGS__)
+
+#define MUX_CTL_PAD_GPIO1_IO03	(0x020E0068)
+#define PAD_CTL_PAD_GPIO1_IO03	(0x020E02F4)
+#define GPIO1_GDIR	(0x0209C004)
+#define GPIO1_DR	(0x0209C000)
+
+struct cdev_dev {
+	dev_t  dev;
+	struct class *class;
+	struct cdev cdev;
+	struct device *device;
+	char   val;
+};
+
+struct gpio_reg {
+	unsigned int *vir_mux;
+	unsigned int *vir_pad;
+	unsigned int *vir_gpio_gdir;
+	unsigned int *vir_gpio_dr;
+};
+
+struct led_dev {
+	struct cdev_dev cdev;
+	struct gpio_reg gpio;
+};
+
+static struct led_dev led;
+
+static int module_cdev_open(struct inode *inode, struct file *filp)
+{
+	PRINTK("LED Open\n");
+	filp->private_data = &led;
+
+	writel(0x5, led.gpio.vir_mux);
+	writel(0x10b0, led.gpio.vir_pad);
+	writel((1 << 3), led.gpio.vir_gpio_gdir);
+	writel(0x0, led.gpio.vir_gpio_dr);
+
+	return 0;
+}
+
+static ssize_t module_cdev_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+	u32 val;
+	struct led_dev *dev = (struct led_dev *)filp->private_data;
+
+	if (copy_from_user(&dev->cdev.val, buf, 1)) 
+		return -EFAULT;
+	
+	if (dev->cdev.val == 1 || dev->cdev.val == '1') {
+		PRINTK("LED ON\n");
+		val = readl(dev->gpio.vir_gpio_dr);
+		val &= ~(1 << 3);
+		writel(val, dev->gpio.vir_gpio_dr);
+	}
+	else if (dev->cdev.val == 0 || dev->cdev.val == '0') {
+		PRINTK("LED OFF\n");
+		val = readl(dev->gpio.vir_gpio_dr);
+		val |= (1 << 3);
+		writel(val, dev->gpio.vir_gpio_dr);
+	}
+
+	return 1;
+}
+
+static int module_cdev_release(struct inode *inode, struct file *filp)
+{
+	PRINTK("LED Close\n");
+	return 0;
+}
+
+static struct file_operations cdev_ops = {
+	.owner		= THIS_MODULE,
+	.open		= module_cdev_open,
+	.write		= module_cdev_write,
+	.release	= module_cdev_release,
+};
+
+static __init int module_cdev_init(void)
+{
+	int ret;
+
+	ret = alloc_chrdev_region(&led.cdev.dev, 0, 1, CDEV_NAME);
+	if (ret < 0) {
+		goto err_alloc_chrdev;
+	}
+	led.cdev.class = class_create(THIS_MODULE, CLASS_NAME);
+	if (IS_ERR(led.cdev.class)) {
+		ret = PTR_ERR(led.cdev.class);
+		goto err_class_create;
+	}
+	cdev_init(&led.cdev.cdev, &cdev_ops);
+	led.cdev.cdev.owner = THIS_MODULE;
+	ret = cdev_add(&led.cdev.cdev, led.cdev.dev, 1);
+	if (ret < 0) {
+		goto err_cdev_add;
+	}
+	led.cdev.device = device_create(led.cdev.class, NULL, led.cdev.dev, NULL, CDEV_NAME);
+	if (IS_ERR(led.cdev.device)) {
+		ret = PTR_ERR(led.cdev.device);
+		goto err_device_create;
+	}
+	
+	led.gpio.vir_mux = ioremap(MUX_CTL_PAD_GPIO1_IO03, 4);
+	if (IS_ERR(led.gpio.vir_mux)) {
+		ret = PTR_ERR(led.gpio.vir_mux);
+		goto err_ioremap1;
+	}
+	led.gpio.vir_pad = ioremap(PAD_CTL_PAD_GPIO1_IO03, 4);
+	if (IS_ERR(led.gpio.vir_pad)) {
+		ret = PTR_ERR(led.gpio.vir_pad);
+		goto err_ioremap2;
+	}
+	led.gpio.vir_gpio_gdir = ioremap(GPIO1_GDIR, 4);
+	if (IS_ERR(led.gpio.vir_gpio_gdir)) {
+		ret = PTR_ERR(led.gpio.vir_gpio_gdir);
+		goto err_ioremap3;
+	}
+	led.gpio.vir_gpio_dr = ioremap(GPIO1_DR, 4);
+	if (IS_ERR(led.gpio.vir_gpio_dr)) {
+		ret = PTR_ERR(led.gpio.vir_gpio_dr);
+		goto err_ioremap4;
+	}
+	PRINTK("LED driver initializing...\n");
+
+	return 0;
+
+err_ioremap4:
+	iounmap(led.gpio.vir_gpio_gdir);
+err_ioremap3:
+	iounmap(led.gpio.vir_pad);
+err_ioremap2:
+	iounmap(led.gpio.vir_mux);
+err_ioremap1:
+	device_destroy(led.cdev.class, led.cdev.dev);
+err_device_create:
+	cdev_del(&led.cdev.cdev);
+err_cdev_add:
+	class_destroy(led.cdev.class);
+err_class_create:
+	unregister_chrdev_region(led.cdev.dev, 1);
+err_alloc_chrdev:
+	return ret;
+}
+
+static __exit void module_cdev_exit(void)
+{
+	iounmap(led.gpio.vir_gpio_dr);
+	iounmap(led.gpio.vir_gpio_gdir);
+	iounmap(led.gpio.vir_pad);
+	iounmap(led.gpio.vir_mux);
+
+	device_destroy(led.cdev.class, led.cdev.dev);
+	cdev_del(&led.cdev.cdev);
+	class_destroy(led.cdev.class);
+	unregister_chrdev_region(led.cdev.dev, 1);
+
+	PRINTK("LED Driver removed\n");
+}
+
+module_init(module_cdev_init);
+module_exit(module_cdev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+### 8.5 应用测试程序
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>		/* atoi函数 */
+#include <unistd.h>		/* close函数 */
+#include <sys/types.h>	/* open函数要使用以下3个头文件 */
+#include <sys/stat.h>
+#include <fcntl.h>
+
+int main(int argc, char *argv[])
+{
+	int fd, val;
+
+	fd = open(argv[1], O_RDWR);
+	if (fd < 0) {
+		printf("open %s error\n", argv[1]);
+		return fd;
+	}
+	val = atoi(argv[2]);
+	write(fd, &val, sizeof(val));
+	close(fd);
+
+	return 0;
+}
+```
+
+### 8.5 测试结果
+
+![](./src/0059.jpg)
