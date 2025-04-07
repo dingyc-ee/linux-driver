@@ -229,3 +229,102 @@ int main(int argc, char *argv[])
 
 ![](./src/0001.jpg)
 
+## 第2章 自旋锁
+
+什么是自旋锁？
+
+*自旋锁是为了实现保护共享资源提出的一种锁机制。自旋锁以原地等待的方式来解决资源冲突。在多核CPU当中，当线程A获取到自旋锁以后，此时线程B也想获取自旋锁但是获取不到，只能原地打转(类似于while (1)一直占用CPU不会休眠)。*
+
+**作为比较，如果是使用互斥锁，那么线程B请求锁时会挂起，内核把线程B所在的CPU调度到其他线程，这会带来上下文切换的开销。我们之所以使用自旋锁，就是希望能够快进快出，使原地自旋的开销 < 线程切换的开销。**
+
+可以看到，自旋锁的开销在纳秒~微秒级，而互斥锁的开销在毫秒级以上。所以如果对时延要求严格(如中断)的场所，使用自旋锁，否则互斥锁更好。
+
+![](./src/0002.jpg)
+
+### 2.1 自旋锁的API函数
+
+| 函数原型 | 作用描述 |
+| ------- | ------- |
+| `DEFINE_SPINLOCK(spinlock_t lock)` | 定义并初始化一个自旋锁 |
+| `int spin_lock_init(spinlock_t *lock)` | 初始化自旋锁 |
+| `void spin_lock(spinlock_t *lock)` | 获取自旋锁，也叫做加锁 |
+| `void spin_unlock(spinlock_t *lock)` | 释放自旋锁，也叫做解锁 |
+| `int spin_trylock(spinlock_t *lock)` | 尝试获取自旋锁，如果没有获取到就返回0 |
+| `int spin_is_locked(spinlock_t *lock)` | 检查自旋锁是否被获取，如果没有被获取就返回非0，否则返回0 |
+
+使用自旋锁，通常是用来保护快进快出非常简短的代码。如下所示：
+
+```c
+static struct cdev_dev dev;
+static int flag = 1;
+DEFINE_SPINLOCK(lock);
+
+static int module_cdev_open(struct inode *inode, struct file *filp)
+{
+	spin_lock(&lock);
+	if (!flag) {
+		spin_unlock(&lock);
+		return -EBUSY;
+	}
+	flag = 0;
+	spin_unlock(&lock);
+	filp->private_data = &dev;
+	PRINTK("Char device open\n");
+	return 0;
+}
+```
+
+与中断相关的自旋锁API函数：
+
+| 函数原型 | 作用描述 |
+| ------- | ------- |
+| `void spin_lock_irq(spinlock_t *lock)` | 关闭中断，并获取自旋锁 |
+| `void spin_unlock_irq(spinlock_t *lock)` | 打开中断，并释放自旋锁 |
+| `void spin_lock_irqsave(spinlock_t *lock, unsigned long flags)` | 保存中断状态，关闭中断，并获取自旋锁 |
+| `void spin_unlock_irqrestore(spinlock_t *lock, unsigned long flags)` | 恢复之前保存的中断状态，打开中断并释放自旋锁 |
+
+下面是这几种自旋锁API的典型使用场景：**不涉及中断使用`spin_lock`，涉及中断使用`spin_lock_irqsave`**
+
+![](./src/0003.jpg)
+
+### 2.2 关闭内核抢占
+
+使用自旋锁会禁止抢占。禁止抢占的行为是，CPU会一直执行当前任务，不会调度其他任务(即使其他任务有更高优先级)。可以响应中断，但中断处理完成后，还是会回到前任任务来执行。
+
+关闭内核抢占的原理：
+
+![](./src/0004.jpg)
+
+关闭抢占后，当前任务会独占CPU。直到主动调用`preempt_enable()`打开抢占，或者手动触发调度`schedule()`
+
+![](./src/0005.jpg)
+
+### 2.3 自旋锁的死锁
+
+*在多核CPU或支持抢占的单核CPU中，被自旋锁保护的临界区不能调用任何能够引起睡眠或者阻塞的函数，否则可能会发生死锁。*
+
+一个死锁的实例：在单核CPU下，A进程获取到自旋锁(隐式的关闭了内核抢占)，如果A进程此时进入了休眠状态，B进程此时也想获取到自旋锁，但由于是单核CPU被禁止抢占，进程B无法调度出去执行，只能原地等锁释放。但进程A休眠了无法执行，所以就产生了死锁。
+
+*多核CPU不会发生上面的情况，因为其他的核会调度其他进程。*
+
+另一个死锁的实例：进程A获取到自旋锁，如果产生了中断，并且在中断里面也要访问共享资源，此时中断里面无法获取到自旋锁，只能原地旋转产生死锁。为了避免这种情况，可以在进程A中使用`spin_lock_irqsave`来禁止中断并获取自旋锁。
+
+## 第3章 信号量
+
+为什么要引入信号量？
+
+前面介绍的自旋锁，是通过原地等待的方式来处理并发与竞争的，所以被保护的临界区不能太长，以免造成对CPU资源的浪费。但有些情况下，我们要长时间对一些资源进行保护，这时就可以使用信号量。
+
+信号量会引起调用者睡眠，所以信号量也叫睡眠锁。
+
+### 3.1 信号量的API函数
+
+| 函数原型 | 作用描述 |
+| ------- | ------- |
+| `DEFINE_SEMAPHORE(name)` | 定义信号量，并设置信号量的值为1 |
+| `void sema_init(struct semaphore *sem, int val)` | 初始化信号量sem，并设置信号量的值为val |
+| `void down(struct semaphore *sem)` | 获取信号量，不能被信号打断，如ctrl+c |
+| `int  down_interruptible(struct semaphore *sem)` | 获取信号量，能被信号打断，如ctrl+c |
+| `void up(struct semaphore *sem)` | 释放信号量 |
+| `int down_trylock(struct semaphore *sem)` | 尝试获取信号量。如果获取到就返回0，获取不到返回非0 |
+
