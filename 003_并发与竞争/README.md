@@ -328,3 +328,207 @@ static int module_cdev_open(struct inode *inode, struct file *filp)
 | `void up(struct semaphore *sem)` | 释放信号量 |
 | `int down_trylock(struct semaphore *sem)` | 尝试获取信号量。如果获取到就返回0，获取不到返回非0 |
 
+信号量挂起进程的原理是，把进程加入到信号量的等待列表中，然后把进程状态设为睡眠，调度其他进程运行。
+
+信号量唤醒的原理是，当有人释放信号量时，检查这个信号量的等待列表，从头部取出最先请求休眠的进程，调度运行。
+
+![](./src/0006.jpg)
+
+信号量睡眠可以被信号sig唤醒：
+
+![](./src/0007.jpg)
+
+`信号量测试代码.c`
+
+```c
+#include <linux/init.h>			/* module_init, module_exit */
+#include <linux/module.h>		/* MODULE_LISENCE, MODULE_AUTHOR */
+#include <linux/moduleparam.h>	/* module_cdev */
+#include <linux/types.h>		/* dev_t */
+#include <linux/kdev_t.h>		/* MAJOR, MINOR, MKDEV */
+#include <linux/fs.h>			/* alloc_chrdev_region, unregister_chrdev_region */
+#include <linux/cdev.h>			/* struct cdev, cdev_init, cdev_add */
+#include <linux/device.h>		/* class_create, device_create */
+#include <linux/uaccess.h>		/* copy_to_user, copy_from_user */
+#include <linux/errno.h>		/* IS_ERR, PTR_ERR */
+#include <linux/io.h>			/* ioremap, iounmap */
+#include <linux/semaphore.h>
+
+#define CLASS_NAME			"cdev_test"
+#define CDEV_NAME			"cdev_test"
+#define PRINTK(fmt, ...)	printk("[KERN] " fmt, ##__VA_ARGS__)
+
+struct cdev_dev {
+	dev_t  dev;
+	struct class *class;
+	struct cdev cdev;
+	struct device *device;
+};
+
+static struct cdev_dev dev;
+struct semaphore sem;
+
+static int module_cdev_open(struct inode *inode, struct file *filp)
+{
+	if (down_interruptible(&sem)) {
+		return -EINTR;
+	}
+	filp->private_data = &dev;
+	PRINTK("Char device open\n");
+	return 0;
+}
+
+ssize_t module_cdev_read(struct file *filp, char __user *buf, size_t size, loff_t *ppos)
+{
+	return 0;
+}
+
+static ssize_t module_cdev_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+	return 0;
+}
+
+static int module_cdev_release(struct inode *inode, struct file *filp)
+{
+	up(&sem);
+	PRINTK("Char device close\n");
+	return 0;
+}
+
+static struct file_operations cdev_ops = {
+	.owner		= THIS_MODULE,
+	.open		= module_cdev_open,
+	.read		= module_cdev_read,
+	.write		= module_cdev_write,
+	.release	= module_cdev_release,
+};
+
+static __init int module_cdev_init(void)
+{
+	int ret;
+
+	sema_init(&sem, 1);
+	ret = alloc_chrdev_region(&dev.dev, 0, 1, CDEV_NAME);
+	if (ret < 0) {
+		goto err_alloc_chrdev;
+	}
+	dev.class = class_create(THIS_MODULE, CLASS_NAME);
+	if (IS_ERR(dev.class)) {
+		ret = PTR_ERR(dev.class);
+		goto err_class_create;
+	}
+	cdev_init(&dev.cdev, &cdev_ops);
+	dev.cdev.owner = THIS_MODULE;
+	ret = cdev_add(&dev.cdev, dev.dev, 1);
+	if (ret < 0) {
+		goto err_cdev_add;
+	}
+	dev.device = device_create(dev.class, NULL, dev.dev, NULL, CDEV_NAME);
+	if (IS_ERR(dev.device)) {
+		ret = PTR_ERR(dev.device);
+		goto err_device_create;
+	}
+	
+	PRINTK("Char device initializing...\n");
+
+	return 0;
+
+err_device_create:
+	cdev_del(&dev.cdev);
+err_cdev_add:
+	class_destroy(dev.class);
+err_class_create:
+	unregister_chrdev_region(dev.dev, 1);
+err_alloc_chrdev:
+	return ret;
+}
+
+static __exit void module_cdev_exit(void)
+{
+	device_destroy(dev.class, dev.dev);
+	cdev_del(&dev.cdev);
+	class_destroy(dev.class);
+	unregister_chrdev_region(dev.dev, 1);
+
+	PRINTK("Char device removed\n");
+}
+
+module_init(module_cdev_init);
+module_exit(module_cdev_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果：
+
+第1个进程后台运行，没关闭文件时，第2个进程被挂起。等到第1个进程结束时，进程2立即被执行。
+
+![](./src/0008.jpg)
+
+## 第4章 互斥锁
+
+### 4.1 非递归互斥锁
+
+Linux内核的互斥锁设计，是标准的互斥锁，而非递归互斥锁。这意味着，我们如果在同一个线程中多次加锁，就会导致死锁。
+
+Linux用户空间的互斥锁`pthread_mutex`，是递归互斥锁设计。
+
+![](./src/0009.jpg)
+
+如果我们一定想要一个递归互斥锁，可以通过以下方式来模拟，但不推荐。
+
+![](./src/0010.jpg)
+
+### 4.2 互斥锁API函数
+
+互斥锁的API函数：
+
+| 函数原型 | 作用描述 |
+| ------- | ------- |
+| `DEFINE_MUTEX(mutexname)` | 定义并初始化一个互斥锁 |
+| `mutex_init(mutex *lock)` | 初始化互斥锁 |
+| `void mutex_lock(struct mutex *lock)` | 上锁 |
+| `void mutex_unlock(struct mutex *lock)` | 解锁 |
+| `int mutex_is_locked(struct mutex *lock)` | 如果锁已经被使用则返回1，否则返回0 |
+
+`测试代码.c`
+
+```c
+static struct mutex lock;
+static int flag = 1;
+
+static int module_cdev_open(struct inode *inode, struct file *filp)
+{
+	mutex_lock(&lock);
+	if (!flag) {
+		mutex_unlock(&lock);
+		return -EBUSY;
+	}
+	flag = 0;
+	mutex_unlock(&lock);
+	filp->private_data = &dev;
+	PRINTK("Char device open\n");
+	return 0;
+}
+
+ssize_t module_cdev_read(struct file *filp, char __user *buf, size_t size, loff_t *ppos)
+{
+	return 0;
+}
+
+static ssize_t module_cdev_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+	return 0;
+}
+
+static int module_cdev_release(struct inode *inode, struct file *filp)
+{
+	mutex_lock(&lock);
+	flag = 1;
+	mutex_unlock(&lock);
+	PRINTK("Char device close\n");
+	return 0;
+}
+```
+
