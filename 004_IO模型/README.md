@@ -314,3 +314,187 @@ Linux内核对惊群效应的解决方案：
 前面介绍了等待队列，休眠和唤醒的API和实现原理。下面是一个常用的按键驱动程序：
 
 ![](./src/0009.jpg)
+
+### 2.4 按键阻塞驱动代码
+
+```c
+#include <linux/init.h>     /* module_init */
+#include <linux/module.h>   /* MODULE_LICENSE */
+#include <linux/types.h>    /* dev_t */
+#include <linux/fs.h>       /* alloc_chrdev_region */
+#include <linux/cdev.h>     /* cdev_init */
+#include <linux/device.h>   /* class_create, device_create */
+#include <linux/io.h>
+#include <asm/io.h>         /* ioremap */
+#include <linux/uaccess.h>
+#include <asm/uaccess.h>    /* copy_from_user */
+#include <linux/sched.h>
+#include <linux/wait.h>
+#include <linux/atomic.h>
+#include <linux/timer.h>
+#include <linux/jiffies.h>
+
+#define PRINTF(fmt, ...)    printk("[KERN] " fmt, ##__VA_ARGS__)
+
+#define DEVICE_NAME     "key"
+#define CLASS_NAME      "cdev_test"
+
+// KEY -> SNVS_TAMPER0 -> GPIO5_IO00
+#define MUX_GPIO5_IO00  0x02290008
+#define PAD_GPIO5_IO00  0x0229004C
+
+#define GPIO5_GDIR  0x020AC004
+#define GPIO5_DR    0x020AC000
+
+struct cdev_device {
+    int minor;
+    struct cdev cdev;
+    struct device *device;
+};
+
+static int major;
+static struct class *class;
+static struct cdev_device dev;
+
+static atomic_t v = ATOMIC_INIT(-1);
+static struct timer_list timer;
+static DECLARE_WAIT_QUEUE_HEAD(wq_head);
+
+static void __iomem *mux_gpio5_io00;
+static void __iomem *pad_gpio5_io00;
+static void __iomem *gpio5_gdir;
+static void __iomem *gpio5_dr;
+
+static u8 last_val, this_val;
+
+static void s_key_init(void)
+{
+    u32 reg_val;
+
+    writel(0b101, mux_gpio5_io00);
+    writel(0x10b0, pad_gpio5_io00);
+
+    reg_val = readl(gpio5_gdir);
+    reg_val &= ~((u32)1 << 0);
+    writel(reg_val, gpio5_gdir);
+}
+
+static u8 s_key_get(void)
+{
+    u32 reg_val = readl(gpio5_dr);
+    u8 level = reg_val & 0b1;
+
+    return level;
+}
+
+static void timer_callback(unsigned long data)
+{
+    this_val = s_key_get();
+    if (last_val == 1 && this_val == 0)  {
+        // key down
+        atomic_set(&v, 0);
+        wake_up_interruptible(&wq_head);
+    }
+    else if (last_val == 0 && this_val == 1) {
+        atomic_set(&v, 1);
+        wake_up_interruptible(&wq_head);
+    }
+    else {
+        atomic_set(&v, -1);
+    }
+    last_val = this_val;
+    mod_timer(&timer, jiffies + msecs_to_jiffies(10));
+}
+
+static int cdev_module_open(struct inode *inode, struct file *filp)
+{
+    s_key_init();
+    last_val = s_key_get();
+    setup_timer(&timer, timer_callback, 0);
+    mod_timer(&timer, jiffies + msecs_to_jiffies(10));
+    atomic_set(&v, -1);
+
+    filp->private_data = &dev;
+    PRINTF("KEY open\n");
+
+    return 0;
+}
+
+static ssize_t cdev_module_read(struct file *filp, char __user *buf , size_t size, loff_t *ppos)
+{
+    int ato_val;
+    u8  key_val;
+
+    if (wait_event_interruptible(wq_head, ((ato_val = atomic_read(&v)) >= 0))) {
+        return -EINTR;
+    }
+    key_val = ato_val;
+    if (copy_to_user(buf, &key_val, 1)) {
+        return -EFAULT;
+    }
+    atomic_set(&v, -1);
+
+    return 1;
+}
+
+static int cdev_module_release(struct inode *inode, struct file *filp)
+{
+    del_timer(&timer);
+    PRINTF("KEY close\n");
+    return 0;
+}
+
+const struct file_operations cdev_fops = {
+    .owner   = THIS_MODULE,
+    .open    = cdev_module_open,
+    .read    = cdev_module_read,
+    .release = cdev_module_release,
+};
+
+static int cdev_module_init(void)
+{
+    dev_t dev_num;
+
+    alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
+    class = class_create(THIS_MODULE, CLASS_NAME);
+    major = MAJOR(dev_num);
+    dev.minor = 0;
+    cdev_init(&dev.cdev, &cdev_fops);
+    dev.cdev.owner = THIS_MODULE;
+    cdev_add(&dev.cdev, dev_num, 1);
+    dev.device = device_create(class, NULL, dev_num, NULL, DEVICE_NAME);
+
+    mux_gpio5_io00 = ioremap(MUX_GPIO5_IO00, 4);
+    pad_gpio5_io00 = ioremap(PAD_GPIO5_IO00, 4);
+    gpio5_gdir = ioremap(GPIO5_GDIR, 4);
+    gpio5_dr   = ioremap(GPIO5_DR, 4);
+
+    PRINTF("KEY driver init(major:%d minor:%d)\n", major, 0);
+
+    return 0;
+}
+
+static void cdev_module_exit(void)
+{
+    iounmap(gpio5_dr);
+    iounmap(gpio5_gdir);
+    iounmap(pad_gpio5_io00);
+    iounmap(mux_gpio5_io00);
+
+    device_destroy(class, MKDEV(major, dev.minor));
+    cdev_del(&dev.cdev);
+    class_destroy(class);
+    unregister_chrdev_region(MKDEV(major, dev.minor), 1);
+    PRINTF("KEY driver exit\n");
+}
+
+MODULE_LICENSE("GPL");
+
+module_init(cdev_module_init);
+module_exit(cdev_module_exit);
+```
+
+## 第3章 非阻塞IO
+
+
+
