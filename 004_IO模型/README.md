@@ -496,5 +496,82 @@ module_exit(cdev_module_exit);
 
 ## 第3章 非阻塞IO
 
+前面介绍了使用等待队列来实现阻塞IO。阻塞IO的特点是，当应用程序调用`read()`接口读取数据时，如果数据没准备好，应用程序会进入休眠。
 
+阻塞IO最大的好处就是，应用程序不用一直轮询了，降低了CPU使用率。但问题在于，这不一定能够满足所有的应用场景。
 
+考虑以下情况：应用程序希望读取3个数据值。读到第1个时进入休眠了，导致无法读取后面2个数据。如何解决？
+
+最简单的方案是：非阻塞IO。基本思路是：
+
+1. 应用程序调用`open(xxx, O_RDWR | O_NONBLOCK)`时设置`O_NONBLOCK`，表示希望以非阻塞IO来操作文件
+2. 应用程序调用`read(fd, buf, size)`读取数据时，驱动程序先读取`O_NONBLOCK`判断是非阻塞IO，如果没有数据就返回`-EAGAIN`错误码
+
+本质上，驱动程序不再阻塞应用程序了，所以应用可以简单的轮询多个设备。
+
+### 3.1 非阻塞IO驱动程序
+
+我们已经有一个等待队列阻塞IO驱动了，只需要很少的改动，就能改成支持非阻塞IO。思考一下该怎么做
+
+1. 检查用户是否以非阻塞模式打开设备，这可以通过检查`file->f_flags`中的`O_NONBLOCK`位来实现。在驱动的`read`函数中，当没有数据可读时，如果用户设置了`O_NONBLOCK`直接返回`-EAGAIN`，否则让进程休眠等待
+2. 现有的阻塞逻辑是在等待队列中休眠。当按键事件发生时，调用可以调用`wake_up_interruplible`唤醒进程
+
+所以，我们的按键驱动应该只需要修改`read()`函数。总结如下：
+
+1. 非阻塞检查：在`read()`函数中，通过`file->f_flags & O_NONBLOCK`判断是否是非阻塞模式。若数据不可读，直接返回`-EAGAIN`
+2. 等待队列处理：使用`wait_event_interruptible`让进程在阻塞模式下休眠，直到按键事件触发唤醒
+3. 数据同步：使用`key_pressed`标志确保数据可用状态的正确性，避免竞态条件
+4. 中断处理：在按键中断中更新按键数据并唤醒等待队列，确保阻塞进程及时响应
+
+修改的驱动代码：
+
+```c
+static ssize_t cdev_module_read(struct file *filp, char __user *buf , size_t size, loff_t *ppos)
+{
+    int ato_val;
+    struct cdev_device *device = (struct cdev_device *)filp->private_data;
+
+    // 非阻塞IO
+    if (filp->f_flags & O_NONBLOCK) {
+        if ((ato_val = atomic_read(&device->v)) < 0) {
+            return -EAGAIN;
+        }
+    }
+    else {
+        if (wait_event_interruptible(wq_head, ((ato_val = atomic_read(&device->v)) >= 0))) {
+            return -EINTR;
+        }
+    }
+
+    if (copy_to_user(buf, &ato_val, 1)) {
+        return -EFAULT;
+    }
+    atomic_set(&device->v, -1);
+    
+    return 1;
+}
+```
+
+### 3.2 非阻塞IO应用程序
+
+应用程序改为，在打开文件时设置`O_NONBLOCK`标志位。
+
+阻塞IO应用程序示例：
+
+```c
+fd = open("/dev/key", O_RDWR);
+if (fd < 0) {
+    printf("Open fail\n");
+    return fd;
+}
+```
+
+非阻塞IO应用程序实例：
+
+```c
+fd = open("/dev/key", O_RDWR | O_NONBLOCK);
+if (fd < 0) {
+    printf("Open fail\n");
+    return fd;
+}
+```
