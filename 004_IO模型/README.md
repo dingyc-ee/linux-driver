@@ -575,3 +575,329 @@ if (fd < 0) {
     return fd;
 }
 ```
+
+## 第4章 理解文件描述符fd、位图bitmap、标准输入/输出/错误、文件打开、关闭、Linux一切皆文件理解、进程与文件的关系
+
+[参考链接](https://blog.csdn.net/qq_51216031/article/details/141030796)
+
+### 4.1 理解文件
+
+如何理解文件？
+
+1. 操作文件：本质是进程在控制文件。强调的是进程和文件的关系
+2. 用户打开文件，实际执行的动作：`找到对应磁盘->但磁盘是外部设备->把文件向磁盘写入`。本质是向硬件中写入
+3. 但用户没有权力直接写入底层硬件，因为硬件由操作系统直接管理。所以，要通过操作系统接口（`系统调用`），提供给用户进行和底层数据的控制交互
+
+*总之，操作文件就是进程控制文件，所以进程描述符中，应该有他控制的文件信息。*
+
+### 4.2 系统调用
+
+#### 4.2.1 `open`接口
+
+open接口：`int open(const char *pathname, int flags);`
+
+1. `pathname`：一个字符串，表示要打开的文件路径
+2. `flags`：打开文件的标志位，本质上是一个位图（bitmap）。例如 O_RDONLY（只读）、O_RDWR（读写）
+
+#### 4.2.2 位图（bitmap）
+
+***什么是位图？***
+
+**一个整数有32位，每个bit都可以进行标记位传递。这些标记位都是一个一个的宏，每个宏都只有一个1**。
+
+下面是一个最简单的位图设计方案：
+
+```c
+#include<stdio.h>
+
+#define ONE     1
+#define TWO     ONE << 1
+#define THREE   TWO << 1
+#define FOUR    THREE << 1
+ 
+void func(int flag)
+{
+    if (flag == ONE) {
+        printf("NOE\n");
+    }
+    else if (flag == (TWO | ONE)) {
+        printf("TWO and NOE\n");
+    }
+    else if (flag == (THREE | TWO)) {
+        printf("THREE and TWO\n");  
+    }
+    else if (flag == (FOUR | THREE)) {
+        printf("FOUR and THREE\n");  
+    }
+    else {
+    }
+}
+
+int main()
+{
+    func(ONE);
+    func(ONE | TWO);
+    func(FOUR | THREE); 
+ 
+    return 0;
+}
+```
+
+上面的代码中，`ONE`、`TWO`、`THREE`等都是标记位，这就是位图设计模式。
+
+有了这种设计模式后，当一个函数需要传参时，我们就不需要笨重的写多个参数，而是直接使用标记位模式，设计宏，设计代码。
+
+根据上述的理解，现在我们来理解`open`函数的第二个参数：这些参数就是一些宏，每个宏只有一个比特位为1，对应不同的选项。当两个不通过的选项（宏）用按位或 | 结合起来时
+就会将之不同的选项功能结合起来。
+
+下表是`open`函数的位图宏参数列表：
+
+| 位图宏参数 | 参数值 | 功能描述 |
+| - | - | - |
+| O_RDONLY | 00000000 | 只读打开文件 |
+| O_WRONLY | 00000001 | 只写打开文件 |
+| O_RDWR | 00000002 | 读写打开文件 |
+| O_CREAT | 00000100 | 如果文件不存在，则创建文件 |
+| O_APPEND | 00002000 | 追加写入文件末尾 |
+
+考虑一下C语言的`fopen`函数。如果我们以`w`方式打开文件，实际上执行的就是下列代码：
+
+*本质上，就是执行open系统调用，O_WRONLY和O_CREAT的组合。*
+
+```c
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+ 
+int main() 
+{
+    int fd;
+    fd = open("file.txt", O_WRONLY | O_CREAT, 0644);
+    if (fd == -1) {
+        perror("Failed to open file");
+        return 1;
+    }
+    close(fd);
+    return 0;
+}
+```
+
+#### 4.2.3 `close`接口
+
+关闭文件描述符，`int fd`就是文件描述符
+
+```c
+#include <unistd.h>
+int close(int fd);
+```
+
+#### 4.2.4 `write`接口
+
+向文件中写入数据，`int fd`就是文件描述符
+
+```c
+#include <unistd.h>
+ssize_t write(int fd, const void *buf, size_t count);
+```
+
+### 4.3 文件描述符
+
+系统调用`open`、`read`、`write`、`close`这几个函数中，整数`int fd`就是文件描述符。
+
+文件描述符`fd`的本质是什么？**`fd`就是一个数组的下标。**
+
+我们梳理一下，截止目前我们获取了哪些信息：
+
+1. 操作系统运行时，会有很多进程在运行。同时，也会打开很多文件
+2. 在文件没有被打开之前，文件是存在磁盘中的。那么，打开文件，是谁打开的呢？
+
+    ***是进程打开的***
+
+3. 当要打开一个文件时，进程将文件的数据加载到文件内核级的缓存块中（实际上打开时不会加载数据，而是读写时加载数据）
+
+    ***因此，打开文件：本质是进程打开文件***
+
+4. 而一个进程能打开很多文件。同时，系统当中可以存在许多进程。所以，在操作系统内部存在大量的文件
+
+**问题来了：操作系统如何对这些大量的文件进行管理？**
+
+1. 这个文件是那个进程打开的？
+2. 以什么方式打开的？
+3. 什么时候打开，什么时候关闭？
+4. 谁来关闭？
+
+要回答这些问题，我们就要进入到linux内核源码：
+
+```c
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## 第5章 IO多路复用`select`
+
+### 5.1 `select`接口
+
+IO多路复用比较复杂。我们先详细分析`select`，把这个搞清楚之后，再去分析`poll`和`epoll`。
+
+```c
+#include <sys/select.h>
+#include <sys/time.h>
+
+#undef __FD_SETSIZE
+#define __FD_SETSIZE	1024
+
+typedef struct {
+	unsigned long fds_bits[__FD_SETSIZE / (8 * sizeof(long))];
+} fd_set;
+
+struct timeval {
+	long    tv_sec;		/* seconds */
+	long	tv_usec;	/* microseconds */
+};
+
+int select(
+    int nfds,                 // 监控的最大文件描述符 + 1（FD范围：0~nfds-1）
+    fd_set *readfds,          // 监控可读事件的FD集合
+    fd_set *writefds,         // 监控可写事件的FD集合
+    fd_set *exceptfds,        // 监控异常事件的FD集合
+    struct timeval *timeout   // 超时时间（NULL表示永久阻塞）
+);
+```
+
+#### 5.1.1 `fd_set`
+
+`fd_set`的本质是一个位图(bitmap)，
+
+
+### 5.2 `select`调用过程
+
+
+要分析`select`原理，我们要从应用程序开始，跟着应用程序一步步进入到内核，看清楚整个过程他是怎么运行的。
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/select.h>
+#include <sys/time.h>
+
+#define BUFFER_SIZE 256
+
+const char* DEV_PATH1 = "/dev/char_device0";  // 第一个设备路径
+const char* DEV_PATH2 = "/dev/char_device1";  // 第二个设备路径
+const char* DEV_PATH3 = "/dev/char_device2";  // 第三个设备路径
+
+int main() 
+{
+    int fd1, fd2, fd3;
+    fd_set read_fds;
+    struct timeval timeout;
+    int max_fd, ready_fds;
+    char buffer[BUFFER_SIZE];
+
+    // 1. 打开字符设备文件
+    fd1 = open(DEV_PATH1, O_RDONLY);
+    fd2 = open(DEV_PATH2, O_RDONLY);
+    fd3 = open(DEV_PATH3, O_RDONLY);
+
+    if (fd1 < 0) {
+        perror("open device1 failed");
+        return -1;
+    }
+    if (fd2 < 0) {
+        perror("open device2 failed");
+        return -1;
+    }
+    if (fd3 < 0) {
+        perror("open device3 failed");
+        return -1;
+    }
+
+    // 2. 确定最大文件描述符
+    max_fd = fd1;
+    if (fd2 > max_fd) max_fd = fd2;
+    if (fd3 > max_fd) max_fd = fd3;
+
+    // 3. select事件循环
+    while (1) {
+        // 设置位图bitmap
+        FD_ZERO(&read_fds);
+        FD_SET(fd1, &read_fds);
+        FD_SET(fd2, &read_fds);
+        FD_SET(fd3, &read_fds);
+
+        // 设置5秒超时
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+
+        ready_fds = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
+        if (ready_fds == -1) {
+            perror("select error");
+            break;
+        } else if (ready_fds == 0) {
+            printf("Select timeout (5 seconds)\n");
+            continue;
+        }
+
+        // 检查第一个设备
+        if (FD_ISSET(fd1, &read_fds)) {
+            ssize_t bytes = read(fd1, buffer, BUFFER_SIZE - 1);
+            if (bytes > 0) {
+                buffer[bytes] = '\0';
+                printf("Device 1: %s\n", buffer);
+            } else if (bytes == 0) {
+                printf("Device 1 closed\n");
+                break;
+            } else {
+                perror("Read from device 1 failed");
+            }
+        }
+        // 检查第二个设备
+        if (FD_ISSET(fd2, &read_fds)) {
+            ssize_t bytes = read(fd2, buffer, BUFFER_SIZE - 1);
+            if (bytes > 0) {
+                buffer[bytes] = '\0';
+                printf("Device 2: %s\n", buffer);
+            } else if (bytes == 0) {
+                printf("Device 2 closed\n");
+                break;
+            } else {
+                perror("Read from device 2 failed");
+            }
+        }
+        // 检查第三个设备
+        if (FD_ISSET(fd3, &read_fds)) {
+            ssize_t bytes = read(fd3, buffer, BUFFER_SIZE - 1);
+            if (bytes > 0) {
+                buffer[bytes] = '\0';
+                printf("Device 3: %s\n", buffer);
+            } else if (bytes == 0) {
+                printf("Device 3 closed\n");
+                break;
+            } else {
+                perror("Read from device 3 failed");
+            }
+        }
+    }
+
+    close(fd1);
+    close(fd2);
+    close(fd3);
+    printf("Program exited cleanly\n");
+    return 0;
+}
+```
