@@ -726,25 +726,145 @@ ssize_t write(int fd, const void *buf, size_t count);
 3. 什么时候打开，什么时候关闭？
 4. 谁来关闭？
 
-要回答这些问题，我们就要进入到linux内核源码：
+要回答这些问题，我们就要进入到linux内核源码。
+
+*为了更好的管理文件，Linux系统对所有被打开的文件，都创建一个结构体`struct file`。定义如下：*
+
+`fs.h`
 
 ```c
+struct file {
+    union {
+		struct llist_node	fu_llist;
+		struct rcu_head 	fu_rcuhead;
+	} f_u;
+	struct path     f_path;
+	struct inode   *f_inode;
+	const struct file_operations *f_op;
 
+	atomic_long_t   f_count;
+	unsigned int    f_flags;
+	fmode_t         f_mode;
+	loff_t			f_pos;
+
+	void			*private_data;
+};
 ```
 
+Linux内核`file`结构体成员介绍：
 
+1. `f_path`: 描述文件在文件系统中的路径信息
+2. `f_inode`: 直接指向文件的`inode`对象，包含文件的元数据（权限、大小、时间戳等）和底层文件系统的操作函数集
+3. `f_op`: 指向文件操作函数集的指针，定义了针对该文件的具体操作（如读、写、定位等）
+   
+    + 普通文件：ext4_file_operations
+    + 字符设备：驱动自定义的 mydev_fops
+    + 套接字：socket_file_ops
 
+4. `f_count`: 引用计数器，表示当前`struct file`被引用的次数。每当文件描述符复制（如 dup()）或通过 fork() 继承时，计数增加。当计数归零时，内核释放该对象
+5. `f_flags`: 存储用户调用`open()`时传递的标志，如`O_NONBLOCK`（非阻塞模式）、`O_APPEND`（追加模式）、`O_CLOEXEC`（执行时关闭）等
+6. `f_mode`: 描述文件的访问模式，由用户调用`open()`时传入的标志（如`O_RDONLY`、`O_WRONLY`、`O_RDWR`）决定
+7. `f_pos`: 记录当前文件的读写位置（即用户空间的“文件指针”）。每次`read()/write()`后自动更新，也可通过`lseek()`显式修改
+8. `private_data`: 通常指向设备私有数据（如寄存器地址、缓冲区）
 
+我们说过，`文件 = 属性 + 内容`。
 
+而这个`struct file`结构体对象，就是用来描述一个个被打开的文件。这些被打开的文件结构体对象，就被操作系统用双向链表组织起来，成为一个双向链表。于是，操作系统对被打开文件的管理，就变成了对一个双向链表的增删查改。
 
+可是，这只解决了对文件的管理。对于文件和进程之间的从属关系，如何描述组织呢？
 
+**所以，我们的进程还必须有一条项目，能够记录当前进程打开的文件列表。**
 
+在进程的PCB `task_struct`结构体对象中，存在一个指针变量：`struct files_struct *file`，这个指针变量指向一个数组：`struct file* fd_array[64]`。我们这样理解：
 
+1. 进程PCB`task_struct`结构体成员`files`指向了一个保存64个文件的`file`数组
+2. 我们打开一个文件，Linux系统会创建`file`结构体指针，保存在`fd_array`数组中。返回数组下标，这就是文件描述符`fd`
+3. 用户想要访问一个进程下的文件，就可以通过文件描述符`fd`来找到文件对象
 
+```c
+#define NR_OPEN_DEFAULT 64
+/*
+ * Open file table structure
+ */
+struct files_struct {
+	atomic_t count;
 
+	struct file *fd_array[NR_OPEN_DEFAULT];
+};
 
+struct task_struct {
+	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
+	void *stack;
 
+/* open file information */
+	struct files_struct *files;
+}
+```
 
+进程PCB关联的文件结构，如下图所示
+
+![](./src/0010.jpg)
+
+还有个问题：既然`fd_array[]`数组的默认大小是64，那么进程最多只能打开64个文件吗？
+
+*早期的Linux确实是这样的。但2.6以后的内核都支持动态扩展fdtable表，如果超过了64，fatable会扩大一倍。*
+
+### 4.4 文件读写`ops`映射
+
+我们调用`open()`打开文件得到`fd`后，读写文件`read()`、`write()`就会执行`struct file`结构体中的`f_op`函数操作集中的函数指针，来实现对文件的读写。
+
+1. 设备文件：如果文件类型的字符设备文件，`f_op`中的`read`、`write`最终会调用到我们的设备驱动
+2. 磁盘文件：如果文件类型是磁盘文件，`f_op`中的`read`、`write`最终会调用到文件系统的读写接口
+
+![](./src/0011.jpg)
+
+以读写磁盘文件为例：
+
+![](./src/0012.jpg)
+
+### 4.5 文件操作
+
+前面其实已经介绍了文件描述符的原理。我们来系统的整理一下流程。
+
+#### 4.5.1 打开文件
+
+所以，当open一个文件时，到底在干什么？
+
+1. 创建`file文件结构体`
+2. 开辟文件缓存区的空间，加载文件数据（从磁盘中加载，有可能延后）
+3. 查看进程的`文件描述符表`
+4. 将`file`文件地址，填入对应的表下标中
+5. 返回下标，即`fd`
+
+#### 4.5.2 标准输入、输出、错误
+
+当我们理解了上述的陈述之后，我们再接着来理解这三个东西：
+
+0. 标注输入 键盘
+1. 标准输出 显示器
+2. 标准错误 显示器
+
+当我们打开进程下面只有一个文件时，我们查看该文件的fd，按理来说，一个进程下只有一个我们创建的文件，因此，进程的文件描述符号表对应的，只有一个文件，数组中文件的下标应为0，所以文件的fd应该是0，但是实际上却不是，而是3。
+
+所以，为什么是3呢？也就是说前面还有0、1、2三个文件，这三个文件是什么？
+
+![](./src/0013.jpg)
+
+对于我们理解来说，标准输入、输出、错误也是文件啊，创建进程时Linux就会创建这3个文件，描述符0~2。标准输入输出错误对应着硬件：键盘、显示器、显示器。接下来是非常重要的概念：
+
+***硬件，也是文件。对于每一个硬件：我们关注2点：属性和操作方法。***
+
+**硬件属性`struct device`**
+
+![](./src/0014.jpg)
+
+**硬件操作方法**
+
+![](./src/0015.jpg)
+
+**设备文件函数指针`f_op`，对硬件操作方法的封装**
+
+![](./src/0016.jpg)
 
 ## 第5章 IO多路复用`select`
 
