@@ -868,8 +868,6 @@ struct task_struct {
 
 ## 第5章 IO多路复用`select`
 
-### 5.1 `select`接口
-
 IO多路复用比较复杂。我们先详细分析`select`，把这个搞清楚之后，再去分析`poll`和`epoll`。
 
 ```c
@@ -897,13 +895,91 @@ int select(
 );
 ```
 
-#### 5.1.1 `fd_set`
+### 5.1 `fd_set`接口
 
-`fd_set`的本质是一个位图(bitmap)，
+#### 5.1.1 `fd_set`原型
 
+`fd_set`的本质是一个位图(bitmap)，即位数组，每个位对应一个文件描述符。最多支持1024位，所以一个进程最多打开1024个文件。
+
+```c
+#define __FD_SETSIZE	1024
+
+typedef struct {
+	unsigned long fds_bits[__FD_SETSIZE / (8 * sizeof(long))];
+} fd_set;
+```
+
+我们看一下这个计算方法：`__FD_SETSIZE / (8 * sizeof(long))`，假设`long`为4字节，这等价于：`1024 / (8 * 4) = 32`。
+
+所以，`fd_set`其实就是一个`unsigned long`类型的数组，数组长度为32。
+
+```c
+typedef struct {
+	unsigned long fds_bits[32];
+} fd_set;
+```
+
+**位数组机制：**
+
+1. 若某位为1，表示该文件描述符被加入监控集合
+2. 若为0，表示不监控
+
+#### 5.1.2 `fd_set`操作函数
+
+Linux 提供一组宏来操作 fd_set，这些宏在 <sys/select.h> 中定义：
+
+1. `FD_ZERO(fd_set *set)`
+
+    + 作用：初始化 fd_set，将所有位清零
+
+    ```c
+    fd_set read_fds;
+    FD_ZERO(&read_fds); // 初始化 read_fds，表示暂时不监控任何文件描述符
+    ```
+
+2. `FD_SET(int fd, fd_set *set)`
+
+    + 作用：将文件描述符 fd 添加到 set 集合中
+
+    ```c
+    FD_SET(socket_fd, &read_fds); // 监控 socket_fd 是否可读
+    ```
+
+3. `FD_CLR(int fd, fd_set *set)`
+
+    + 作用：从 set 集合中移除文件描述符 fd
+
+    ```c
+    FD_CLR(socket_fd, &read_fds); // 停止监控 socket_fd
+    ```
+
+4. `FD_ISSET(int fd, fd_set *set)`
+
+    + 作用：检查 fd 是否在 set 集合中（即对应位是否为 1）
+
+    ```c
+    if (FD_ISSET(socket_fd, &read_fds)) {
+        // socket_fd 已准备好读取数据
+    }
+    ```
+
+#### 5.1.3 `fd_set的限制：1024`
+
+![](./src/0017.jpg)
+
+#### 5.1.4 `fd_set 在 select() 中的使用`
+
+`fd_set`主要用在`select()`函数中，用于同时监控多个文件描述符。
+
+![](./src/0018.jpg)
+
+#### 5.1.5 `fd_set的局限性`
+
+`fd_set`虽然很好用，但是性能并不高，尤其是在需要监控很多个文件描述符的情况时。`select()`每次都要遍历所有文件描述符（直到nfds-1），性能低开销大。
+
+![](./src/0019.jpg)
 
 ### 5.2 `select`调用过程
-
 
 要分析`select`原理，我们要从应用程序开始，跟着应用程序一步步进入到内核，看清楚整个过程他是怎么运行的。
 
