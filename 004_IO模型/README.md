@@ -775,14 +775,14 @@ Linux内核`file`结构体成员介绍：
 
 **所以，我们的进程还必须有一条项目，能够记录当前进程打开的文件列表。**
 
-在进程的PCB `task_struct`结构体对象中，存在一个指针变量：`struct files_struct *file`，这个指针变量指向一个数组：`struct file* fd_array[64]`。我们这样理解：
+在进程的PCB `task_struct`结构体对象中，存在一个指针变量：`struct files_struct *file`，这个指针变量指向一个数组：`struct file* fd_array[32]`。我们这样理解：
 
 1. 进程PCB`task_struct`结构体成员`files`指向了一个保存64个文件的`file`数组
 2. 我们打开一个文件，Linux系统会创建`file`结构体指针，保存在`fd_array`数组中。返回数组下标，这就是文件描述符`fd`
 3. 用户想要访问一个进程下的文件，就可以通过文件描述符`fd`来找到文件对象
 
 ```c
-#define NR_OPEN_DEFAULT 64
+#define NR_OPEN_DEFAULT 32
 /*
  * Open file table structure
  */
@@ -981,6 +981,8 @@ Linux 提供一组宏来操作 fd_set，这些宏在 <sys/select.h> 中定义：
 
 ### 5.2 `select`调用过程
 
+#### 5.2.1 `select()`应用程序
+
 要分析`select`原理，我们要从应用程序开始，跟着应用程序一步步进入到内核，看清楚整个过程他是怎么运行的。
 
 ```c
@@ -1097,3 +1099,142 @@ int main()
     return 0;
 }
 ```
+
+#### 5.2.2 `select`调用`sys_select`系统调用
+
+`select`调用过程分析：
+
+```c
+FD_ZERO(&read_fds);
+FD_SET(fd1, &read_fds);
+FD_SET(fd2, &read_fds);
+FD_SET(fd3, &read_fds);
+
+// 设置5秒超时
+timeout.tv_sec = 5;
+timeout.tv_usec = 0;
+
+ready_fds = select(max_fd + 1, &read_fds, NULL, NULL, &timeout);
+```
+
+#### 5.2.3 `sys_select()`调用`core_sys_select()`内核函数
+
+`sys_select()`系统调用做了以下事情：
+
+1. 用户态的`timeout`，安全复制到内核态，然后把超时参数转换成内核时间格式`end_time`，保存在`to`指针
+2. 调用内核函数`core_sys_select`：真正执行`select`逻辑
+
+```c
+long sys_select(int n/*max_fd + 1*/, fd_set __user *inp/*read_fds*/, fd_set __user *outp/*NULL*/,
+			fd_set __user *exp/*NULL*/, struct timeval __user *tvp/*timeout*/)
+{
+    struct timespec end_time, *to = NULL;
+	struct timeval tv;
+	int ret;
+
+	if (tvp) {
+		if (copy_from_user(&tv, tvp, sizeof(tv)))
+			return -EFAULT;
+
+		to = &end_time;
+		if (poll_select_set_timeout(to,
+				tv.tv_sec + (tv.tv_usec / USEC_PER_SEC),
+				(tv.tv_usec % USEC_PER_SEC) * NSEC_PER_USEC))
+			return -EINVAL;
+	}
+
+	ret = core_sys_select(n, inp, outp, exp, to);
+	ret = poll_select_copy_remaining(&end_time, tvp, 1, ret);
+
+	return ret;
+}
+```
+
+#### 5.2.4 `core_sys_select()`内核函数，调用`do_select()`函数
+
+1. 参数校验与修正：检查传入的文件描述符数量 n，确保不超过进程限制
+2. 初始化6个位图指针，输入（in/out/ex）、输出（res_in/res_out/res_ex），指向分配的内存区域的首地址
+3. 数据复制：将用户空间的 fd_set 位图复制到内核空间
+4. 事件监听：调用 do_select 进行事件轮询
+5. 结果回传：将就绪事件的结果位图复制回用户空间
+
+```c
+int core_sys_select(int n/*max_fd + 1*/, fd_set __user *inp/*read_fds*/, fd_set __user *outp/*NULL*/,
+			   fd_set __user *exp/*NULL*/, struct timespec *end_time/*timeout*/)
+{
+    fd_set_bits fds;
+	void *bits;
+	int ret, max_fds;
+	unsigned int size;
+	struct fdtable *fdt;
+	long stack_fds[32]; // 栈缓冲区优化。32这个值与之前每个进程的文件数组fd_array[32]一致，用于默认每个进程默认32个文件描述符
+
+	ret = -EINVAL;
+	if (n < 0)
+		goto out_nofds;
+
+	// 1. 参数校验与修正：检查传入的文件描述符数量 n，确保不超过进程限制
+	rcu_read_lock();
+	fdt = files_fdtable(current->files);
+	max_fds = fdt->max_fds;
+	rcu_read_unlock();
+	if (n > max_fds)
+		n = max_fds;
+
+	// 2. 我们需要6个位图（in、out、ex、res_in、res_out、res_ex）
+	size = FDS_BYTES(n);    // 计算需要的字节数，用于分配内存存放文件描述符集合
+	bits = stack_fds;       // 优先使用栈内存，如果不够再动态分配内存
+
+	if (size > sizeof(stack_fds) / 6) {
+		// 栈不足时分配堆内存
+		ret = -ENOMEM;
+		bits = kmalloc(6 * size, GFP_KERNEL);
+		if (!bits)
+			goto out_nofds;
+	}
+	fds.in      = bits;     // 初始化6个位图指针，输入（in/out/ex）、输出（res_in/res_out/res_ex），指向分配的内存区域的首地址
+	fds.out     = bits +   size;
+	fds.ex      = bits + 2*size;
+	fds.res_in  = bits + 3*size;
+	fds.res_out = bits + 4*size;
+	fds.res_ex  = bits + 5*size;
+
+    // 3. 从用户空间复制文件描述符集合到内核空间，并初始化结果集为0
+	if ((ret = get_fd_set(n, inp, fds.in)) ||
+	    (ret = get_fd_set(n, outp, fds.out)) ||
+	    (ret = get_fd_set(n, exp, fds.ex)))
+		goto out;
+	zero_fd_set(n, fds.res_in);
+	zero_fd_set(n, fds.res_out);
+	zero_fd_set(n, fds.res_ex);
+
+    // 4. 调用do_select执行实际的文件描述符选择操作，并等待就绪事件
+    // do_select 遍历所有文件描述符，调用 vfs_poll 检查事件状态，并阻塞等待事件或超时
+	ret = do_select(n, &fds, end_time);
+
+	if (ret < 0)
+		goto out;
+	if (!ret) {
+		ret = -ERESTARTNOHAND;
+		if (signal_pending(current))
+			goto out;
+		ret = 0;
+	}
+
+    // 5. 通过 copy_to_user 将结果位图（res_in 等）回传用户空间
+    // 大量用户-内核数据拷贝是 select 效率低下的主要原因
+	if (set_fd_set(n, inp, fds.res_in) ||
+	    set_fd_set(n, outp, fds.res_out) ||
+	    set_fd_set(n, exp, fds.res_ex))
+		ret = -EFAULT;
+
+out:
+	if (bits != stack_fds)
+		kfree(bits);
+out_nofds:
+	return ret;
+}
+```
+
+#### 5.2.5 `do_select()`内核函数
+
