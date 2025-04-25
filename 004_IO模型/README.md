@@ -1236,5 +1236,445 @@ out_nofds:
 }
 ```
 
-#### 5.2.5 `do_select()`内核函数
+#### 5.2.5 `do_select()`内核函数的原理介绍
 
+##### 5.2.5.1 初步理解
+
+在上一个函数`core_sys_select()`中，调用了`do_select()`内核函数。我们可以先试想一下，`do_select`函数要做什么，再去分析他的源码。
+
+```c
+core_sys_select()
+{
+    if ((ret = get_fd_set(n, inp, fds.in)) ||
+	    (ret = get_fd_set(n, outp, fds.out)) ||
+	    (ret = get_fd_set(n, exp, fds.ex)))
+		goto out;
+	zero_fd_set(n, fds.res_in);
+	zero_fd_set(n, fds.res_out);
+	zero_fd_set(n, fds.res_ex);
+
+    // 关键函数：执行do_select
+    ret = do_select(n, &fds, end_time);
+    return ret;
+}
+```
+
+1. 参数`n`：这是由空户空间传入的，要监控的最大的文件描述符
+
+    + 为什么要传入这个？为了提高内核效率。我们只需要从0开始遍历到n，而不是便利所有文件描述符
+
+2. 参数`fds`：包括6个参数：输入3个(in、out、execept)拷贝于用户空间，输出3个(in、out、execept)是已经就绪的文件位图
+
+    + 我们的`do_select()`函数，要把就绪的文件描述符，设置给3个输出位图(in、out、execept)
+
+3. 参数`end_time`：用户空间设置的等待超时
+
+    + 当用户调用`select()`函数时，`do_select()`函数从0~n把所有文件描述符检查一遍。有就绪的就要立即返回，没有准备好的，执行可被唤醒的进程休眠。此时用户进程阻塞挂起
+    + 休眠最终一定会醒来，我们要看是什么原因唤醒的。如果是被等待队列唤醒，OK，这说明有文件描述符`fd`就绪了，我们要执行上一步的操作，检查现在有哪些就绪的。每匹配一个计数值+1，全部遍历完返回计数值，这就是我们要的select返回值
+    + 如果是超时时间到了唤醒的，说明等待的时间一直没有准备就绪的文件描述符，我们要返回计数值0
+
+4. 返回值`ret`：这就是`do_select()`函数遍历0~n，统计的准备就绪的文件描述符个数
+
+##### 5.2.5.2 核心机制
+
+在Linux内核的`do_select函数中，`当所有文件描述符（fd）未就绪时进程会进入休眠，被唤醒后必须重新遍历所有fd并再次调用poll_wait检查`。
+
+这一行为是设计上的必然要求，原因如下：
+
+1. 等待队列的临时注册
+
+    + poll_wait的瞬时性：*poll_wait的作用是将当前进程注册到文件的等待队列（通过poll_table_entry），但这种注册是单次生效的。当进程被唤醒后，内核会自动清理所有关联的等待队列条目（poll_table_entry），进程需要重新调用poll_wait才能再次监听文件事件。*
+
+    +  类比场景：*类似于订阅杂志——每次收到一期杂志后，若想继续接收下一期，必须重新订阅。内核不会自动保留订阅状态。*
+
+2. 文件状态动态变化
+
+    + 事件可能随时发生：*进程休眠期间，可能有多个 fd 的状态发生变化。例如：A 事件唤醒进程：进程因 fd A 就绪被唤醒，但休眠期间 fd B 也可能变为就绪。*
+    + 必须重新检查：*为确保不遗漏任何新事件，需重新遍历所有 fd，调用 vfs_poll 获取最新状态（包括重新注册等待队列）。*
+    + **这就是为什么，我们在字符设备的f_ops->poll函数中，要调用poll_wait的原因。因为要重新注册等待队列啊，poll_wait就是用来注册等待队列的。**
+
+3. 水平触发语义
+
+    + 设计原则：*select/poll 是水平触发的，只要 fd 处于就绪状态，调用就会立即返回。例如：如果一个socket可读，但用户未读取所有数据，下一次select仍会报告它可读。*
+    + 依赖最新状态：*必须每次重新检查所有 fd 的当前状态，而不能依赖历史注册信息，否则可能返回过时的结果。*
+
+##### 5.2.5.3 内核代码验证
+
+下面是`do_select()`的原理（代码做了简化）：
+
+1. 外层无限循环（for (;;)）：`进程被唤醒后，必须重新进入循环，再次遍历所有 fd，确保获取最新状态。`
+2. vfs_poll 的重新调用：`每次调用 vfs_poll 时，若文件未就绪，会通过 poll_wait 重新注册等待队列。`
+
+```c
+retval = 0;
+for (;;) {
+    // 每次循环都会重新遍历所有 fd
+    for (i = 0; i < n; i++) {
+        struct fd f = fdget(i);
+        if (f.file) {
+            mask = vfs_poll(f.file, &wait); // 内部调用 poll_wait
+            if (mask & ...) {
+                retval++; // 记录就绪事件
+            }
+        }
+    }
+
+    // 退出条件：有事件、超时或信号中断
+    if (retval || timed_out || signal_pending(current))
+        break;
+
+    // 无事件时休眠
+    if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE, timeout, slack))
+        timed_out = 1;
+}
+```
+
+##### 5.2.5.4 性能影响与优化对比
+
+`select/poll`的性能瓶颈：
+
+1. 时间复杂度 O(n)：每次唤醒后需遍历所有`fd`，对于大并发场景（如数万连接），遍历开销成为瓶颈
+2. 重复注册等待队列：频繁调用`poll_wait`和内存分配（poll_table_entry）增加`CPU`和内存压力
+
+这是`select/poll`在大规模高并发场景下性能低下的根本原因，而`epoll`通过持久化注册和事件反馈机制解决了这一问题。若需高性能`I/O`多路复用，应优先选择`epoll`。
+
+#### 5.2.6 `do_select()`内核函数的源码分析
+
+```c
+int do_select(int n, fd_set_bits *fds, struct timespec *end_time)
+{
+	ktime_t expire, *to = NULL;
+	struct poll_wqueues table;
+	poll_table *wait;
+	int retval, i, timed_out = 0;
+	unsigned long slack = 0;
+	unsigned int busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0;
+	unsigned long busy_end = 0;
+
+	rcu_read_lock();
+	retval = max_select_fd(n, fds);
+	rcu_read_unlock();
+
+	if (retval < 0)
+		return retval;
+	n = retval;
+
+	poll_initwait(&table);
+	wait = &table.pt;
+	if (end_time && !end_time->tv_sec && !end_time->tv_nsec) {
+		wait->_qproc = NULL;
+		timed_out = 1;
+	}
+
+	if (end_time && !timed_out)
+		slack = select_estimate_accuracy(end_time);
+
+	retval = 0;
+	for (;;) {
+		unsigned long *rinp, *routp, *rexp, *inp, *outp, *exp;
+		bool can_busy_loop = false;
+
+		inp = fds->in; outp = fds->out; exp = fds->ex;
+		rinp = fds->res_in; routp = fds->res_out; rexp = fds->res_ex;
+
+		for (i = 0; i < n; ++rinp, ++routp, ++rexp) {
+			unsigned long in, out, ex, all_bits, bit = 1, mask, j;
+			unsigned long res_in = 0, res_out = 0, res_ex = 0;
+
+			in = *inp++; out = *outp++; ex = *exp++;
+			all_bits = in | out | ex;
+			if (all_bits == 0) {
+				i += BITS_PER_LONG;
+				continue;
+			}
+
+			for (j = 0; j < BITS_PER_LONG; ++j, ++i, bit <<= 1) {
+				struct fd f;
+				if (i >= n)
+					break;
+				if (!(bit & all_bits))
+					continue;
+				f = fdget(i);
+				if (f.file) {
+					const struct file_operations *f_op;
+					f_op = f.file->f_op;
+					mask = DEFAULT_POLLMASK;
+					if (f_op->poll) {
+						wait_key_set(wait, in, out,
+							     bit, busy_flag);
+						mask = (*f_op->poll)(f.file, wait);
+					}
+					fdput(f);
+					if ((mask & POLLIN_SET) && (in & bit)) {
+						res_in |= bit;
+						retval++;
+						wait->_qproc = NULL;
+					}
+					if ((mask & POLLOUT_SET) && (out & bit)) {
+						res_out |= bit;
+						retval++;
+						wait->_qproc = NULL;
+					}
+					if ((mask & POLLEX_SET) && (ex & bit)) {
+						res_ex |= bit;
+						retval++;
+						wait->_qproc = NULL;
+					}
+					/* got something, stop busy polling */
+					if (retval) {
+						can_busy_loop = false;
+						busy_flag = 0;
+
+					/*
+					 * only remember a returned
+					 * POLL_BUSY_LOOP if we asked for it
+					 */
+					} else if (busy_flag & mask)
+						can_busy_loop = true;
+
+				}
+			}
+			if (res_in)
+				*rinp = res_in;
+			if (res_out)
+				*routp = res_out;
+			if (res_ex)
+				*rexp = res_ex;
+			cond_resched();
+		}
+		wait->_qproc = NULL;
+		if (retval || timed_out || signal_pending(current))
+			break;
+		if (table.error) {
+			retval = table.error;
+			break;
+		}
+
+		/* only if found POLL_BUSY_LOOP sockets && not out of time */
+		if (can_busy_loop && !need_resched()) {
+			if (!busy_end) {
+				busy_end = busy_loop_end_time();
+				continue;
+			}
+			if (!busy_loop_timeout(busy_end))
+				continue;
+		}
+		busy_flag = 0;
+
+		/*
+		 * If this is the first loop and we have a timeout
+		 * given, then we convert to ktime_t and set the to
+		 * pointer to the expiry value.
+		 */
+		if (end_time && !to) {
+			expire = timespec_to_ktime(*end_time);
+			to = &expire;
+		}
+
+		if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE,
+					   to, slack))
+			timed_out = 1;
+	}
+
+	poll_freewait(&table);
+
+	return retval;
+}
+```
+
+##### 5.2.6.1 初始化等待队列
+
+```c
+poll_table *wait;
+struct poll_wqueues table;
+
+poll_initwait(&table);
+wait = &table.pt;
+```
+
+我们先来看一下这几个结构体：
+
+**`poll_table结构体`**，轮询表。有2个成员：
+
+1. `_qproc`：函数指针
+2. `_key`：用来保存`mask`值
+
+```c
+typedef void (*poll_queue_proc)(struct file *, wait_queue_head_t *, struct poll_table_struct *);
+
+typedef struct poll_table_struct {
+	poll_queue_proc _qproc;
+	unsigned long _key;
+} poll_table;
+```
+
+**`struct poll_table_entry结构体`**，轮询表条目，每个要监控的`fd`对应着这样一条。有4个成员：
+
+1. `struct file *filp`：我们要监控的文件描述符`fd`，它对应的文件指针`filp`
+2. `unsigned long key`：文件`读写就绪`标记位。我们在`do_select()`函数中，不是要检查文件是否`读写就绪`吗？就是检查这个标记位了
+3. `wait_queue_t wait`：等待队列项。这是一个变量而不是指针，这很好理解，每个文件描述符`fd`都需要一个队列项，用于添加到等待队列中进入休眠
+4. `wait_queue_head_t *wait_address`：等待队列头。这是一个指针，意味着等待队列头是由外部传入的，这很好理解，我们检测了多个等待队列项，但只需要一个等待队列头，然后把这些等待队列项添加进去
+    + 等待队列头是一个指针，指向了等待队列头。这个由谁来设置？**后面我们会看到，由我们自己在字符设备驱动框架的`.poll`中设置**
+
+```c
+struct poll_table_entry {
+	struct file *filp;
+	unsigned long key;
+	wait_queue_t wait;
+	wait_queue_head_t *wait_address;
+};
+```
+
+**struct poll_wqueues结构体**，轮询等待队列。关键成员变量介绍：
+
+1. `poll_table pt`：就是`poll_table`结构体
+2. `struct task_struct *polling_task`：调用select/poll接口的进程，通常为`current`
+3. `int inline_index`：当前使用poll监控的文件描述符`fd`个数
+4. `struct poll_table_entry inline_entries[N_INLINE_POLL_ENTRIES]`：轮询表数组。我们所有要监控的`文件描述符fd`相关信息，都保存在这个数组中
+
+```c
+struct poll_wqueues {
+	poll_table pt;  // 轮询表
+	struct poll_table_page *table;
+	struct task_struct *polling_task;
+	int triggered;
+	int error;
+	int inline_index;
+	struct poll_table_entry inline_entries[N_INLINE_POLL_ENTRIES];
+};
+```
+
+**`poll_initwait(&table)`函数，就是初始化了轮询等待队列，然后把轮询表的函数指针设为`__pollwait()`函数**
+
+```c
+static void __pollwait(struct file *filp, wait_queue_head_t *wait_address,
+				poll_table *p)
+{
+	struct poll_wqueues *pwq = container_of(p, struct poll_wqueues, pt);
+	struct poll_table_entry *entry = poll_get_entry(pwq);
+	if (!entry)
+		return;
+	entry->filp = get_file(filp);
+	entry->wait_address = wait_address;
+	entry->key = p->_key;
+	init_waitqueue_func_entry(&entry->wait, pollwake);
+	entry->wait.private = pwq;
+	add_wait_queue(wait_address, &entry->wait);
+}
+
+void poll_initwait(struct poll_wqueues *pwq)
+{
+    pwq->pt._qproc = __pollwait;    // 设置poll_table的函数指针为__pollwait
+    pwq->pt._key = 0;               // 设置poll_table的mask初始值为0
+
+	pwq->polling_task = current;
+	pwq->triggered = 0;
+	pwq->error = 0;
+	pwq->table = NULL;
+	pwq->inline_index = 0;
+}
+```
+
+**`__pollwait()`函数分析**
+
+`__pollwait()`现在是函数指针了。他做了以下事情：
+
+1. 把文件指针`filp`设置给`轮询表项`。文件指针的入参是谁给的？后面将会看到，是`do_select()`遍历要监控的fd时，取出来的文件指针
+2. 把等待队列头`wait_address`设置给`轮询表项`。这个入参是谁给的？是我们的驱动程序给的。驱动程序中定义等待队列头，然后通过`.poll`传给`__pollwait()`函数
+
+    + 驱动程序示例：驱动程序中调用了`poll_wait()`函数
+
+    ```c
+    // 等待队列头
+    static wait_queue_head_t button_wait_queue;
+    // 事件标志
+    static volatile int button_event = 0;
+
+    // poll 方法实现
+    static unsigned int button_poll(struct file *filp, poll_table *wait) {
+        unsigned int mask = 0;
+
+        poll_wait(filp, &button_wait_queue, wait);
+
+        if (button_event) {
+            mask |= POLLIN | POLLRDNORM;
+            button_event = 0;
+        }
+
+        return mask;
+    }
+
+    // 设置文件操作方法
+    fops.poll = button_poll;
+    fops.open = button_open;
+    fops.release = button_release;
+    fops.read = button_read;
+    ```
+
+    + `poll_wait()`函数原型：正好就是调用了我们注册的回调函数指针`__pollwait()`
+
+    ```c
+    static inline void poll_wait(struct file * filp, wait_queue_head_t * wait_address, poll_table *p)
+    {
+        if (p && p->_qproc && wait_address)
+            p->_qproc(filp, wait_address, p);
+    }
+    ```
+
+3. 函数调用流程分析：假设我们现在要监控一个文件描述符`fd`了，看看源码
+
+    + **do_select函数**：根据文件描述符`fd`，获取到文件指针`f.file`。把文件指针`f.file`作为第1个参数，变量轮询表wait（包含了__pollwait函数指针）作为第2个参数，调用了设备驱动的`poll方法`，返回值放在mask变量中
+
+        ```c
+        struct poll_wqueues table;
+
+        poll_initwait(&table);
+	    poll_table *wait = &table.pt;
+
+        f = fdget(fd);
+        if (f.file) {
+            const struct file_operations *f_op;
+            f_op = f.file->f_op;
+            if (f_op->poll) {
+                mask = (*f_op->poll)(f.file, wait);
+            }
+        }
+        ```
+
+    + **设备驱动程序的poll方法**：最终调用`__pollwait()`函数，添加到我们自己的等待队列，然后返回mask
+
+        ```c
+        static unsigned int button_poll(struct file *filp, poll_table *wait) {
+        unsigned int mask = 0;
+
+            // poll_wait就是调用函数指针，等价于__pollwait(filp，&button_wait_queue, wait)
+            poll_wait(filp, &button_wait_queue, wait);
+
+            if (button_event) {
+                mask |= POLLIN | POLLRDNORM;
+                button_event = 0;
+            }
+
+            return mask;
+        }
+        ```
+
+    + **`__pollwait()函数`**：把`do_select`提供的`filp`和`poll_table`，以及`设备驱动poll方法`提供的的`等待队列头`，组合起来。最终效果是，把等待项添加到设备驱动的等待队列头中。注意：只是添加到等待队列，这并不会因此阻塞。只有当队列条件不满足，且执行`schedu()`触发进程调度时，才会阻塞
+
+        ```c
+        static void __pollwait(struct file *filp, wait_queue_head_t *wait_address, poll_table *p)
+        {
+            struct poll_wqueues *pwq = container_of(p, struct poll_wqueues, pt);
+            struct poll_table_entry *entry = poll_get_entry(pwq);
+            if (!entry)
+                return;
+            entry->filp = get_file(filp);
+            entry->wait_address = wait_address;
+            entry->key = p->_key;
+            init_waitqueue_func_entry(&entry->wait, pollwake);
+            entry->wait.private = pwq;
+            add_wait_queue(wait_address, &entry->wait);
+        }
+        ```
+
+##### 5.2.6.2 遍历输入文件描述符
