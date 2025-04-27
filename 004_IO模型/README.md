@@ -1678,3 +1678,279 @@ void poll_initwait(struct poll_wqueues *pwq)
         ```
 
 ##### 5.2.6.2 遍历输入文件描述符
+
+1. 参数参数`n`：要监控的最大文件描述符
+2. `inp = fds->in; outp = fds->out; exp = fds->ex;`：指向输入的文件描述符集合
+3. 为提高效率，一次处理32位，即一次最多监控32个文件描述符。如果当前处理的这32位中没有要监控的文件描述符，则跳过，继续下一个32位。否则，遍历这32位中的每一个文件描述符
+
+    ```c
+    in = *inp++; out = *outp++; ex = *exp++;
+    all_bits = in | out | ex;
+    if (all_bits == 0) {
+        i += BITS_PER_LONG; // 32
+        continue;
+    }
+    ```
+
+4. 当前遍历这轮32个文件描述符，有需要监控的对象。对当前32位中的每一个文件描述符，调用`fdget()`获取到文件指针。然后调用文件的poll方法，并把结果放到mask变量中
+
+    + `mask = (*f_op->poll)(f.file, wait)`：`poll`就是设备驱动提供的poll方法，wait就是`do_select`定义的轮询表，这里直接进入了设备驱动。返回值`mask`由设备驱动提供
+    + 根据`mask`判断，输入`POLLIN_SET`，输出`POLLOUT_SET`，异常`POLLEX_SET`，是否设置了对应位，来判断当前监控的文件描述符是否准备好
+    + 如果准备好了，就把对应的位设置到`res_in/out/ex`中。并把返回值加1，标识有文件描述符准备好了
+
+    ```c
+    for (j = 0; j < BITS_PER_LONG/*32*/; ++j, ++i, bit <<= 1) {
+        struct fd f;
+        if (i >= n)
+            break;
+        if (!(bit & all_bits))
+            continue;
+        f = fdget(i);
+        if (f.file) {
+            const struct file_operations *f_op;
+            f_op = f.file->f_op;
+            mask = DEFAULT_POLLMASK;
+            if (f_op->poll) {
+                wait_key_set(wait, in, out, bit, busy_flag);
+                mask = (*f_op->poll)(f.file, wait);
+            }
+            if ((mask & POLLIN_SET) && (in & bit)) {
+                res_in |= bit;
+                retval++;
+                wait->_qproc = NULL;
+            }
+            if ((mask & POLLOUT_SET) && (out & bit)) {
+                res_out |= bit;
+                retval++;
+                wait->_qproc = NULL;
+            }
+            if ((mask & POLLEX_SET) && (ex & bit)) {
+                res_ex |= bit;
+                retval++;
+                wait->_qproc = NULL;
+            }
+        }
+    }
+    if (res_in)
+        *rinp = res_in;
+    if (res_out)
+        *routp = res_out;
+    if (res_ex)
+        *rexp = res_ex;
+    ```
+
+5. 如果所有的文件描述符都没有准备好，`poll_schedule_timeout()`会被调用，进入阻塞状态。超时时间设为应用程序给的`timeout`，并且可以被信号打断
+6. 如果休眠被打断了，说明有文件描述准备好了。此时又重新执行`for (;;)`循环，把所有检测的文件描述符再重新监测一遍，返回准备好的文件描述符，并返回`>0`的值
+
+    ```c
+    for (;;) {
+        unsigned long *rinp, *routp, *rexp, *inp, *outp, *exp;
+        bool can_busy_loop = false;
+
+        inp = fds->in; outp = fds->out; exp = fds->ex;
+        rinp = fds->res_in; routp = fds->res_out; rexp = fds->res_ex;
+
+        for (i = 0; i < n; ++rinp, ++routp, ++rexp) {
+            for (j = 0; j < BITS_PER_LONG; ++j, ++i, bit <<= 1) {
+                f = fdget(i);
+                if (f.file) {
+                    const struct file_operations *f_op;
+                    f_op = f.file->f_op;
+                    if (f_op->poll) {
+                        wait_key_set(wait, in, out,
+                                    bit, busy_flag);
+                        mask = (*f_op->poll)(f.file, wait);
+                    }
+                    fdput(f);
+                    if ((mask & POLLIN_SET) && (in & bit)) {
+                        res_in |= bit;
+                        retval++;
+                        wait->_qproc = NULL;
+                    }
+                    if ((mask & POLLOUT_SET) && (out & bit)) {
+                        // 
+                    }
+                    if ((mask & POLLEX_SET) && (ex & bit)) {
+                        //
+                    }
+                }
+            }
+            if (res_in)
+                *rinp = res_in;
+            if (res_out)
+                *routp = res_out;
+            if (res_ex)
+                *rexp = res_ex;
+        }
+        to = &expire;
+        if (!poll_schedule_timeout(&table, TASK_INTERRUPTIBLE,
+                        to, slack))
+            timed_out = 1;
+    }
+    ```
+
+### 5.3 驱动程序应该怎么写
+
+#### 5.3.1 `poll`方法的设备驱动框架
+
+整个`do_select`函数，通过`mask = (*f_op->poll)(f.file, wait)`调用设备驱动程序。
+
+因此，`poll`的设备驱动框架如下：
+
+1. 设备结构体中，定义读写的等待队列头
+
+    ```c
+    // 设备私有结构体
+    struct my_dev {
+        struct cdev cdev;
+        wait_queue_head_t rwq;   // 读等待队列
+        wait_queue_head_t wwq;   // 写等待队列
+        char buf[512];
+        int buf_len;
+        spinlock_t lock;
+    };
+    ```
+
+2. `module_init`中，初始化等待队列头
+
+    ```c
+    // 模块初始化
+    static int __init my_dev_init(void)
+    {
+        dev_t devno = MKDEV(MAJOR_NUM, 0);
+        int ret;
+
+        // 注册字符设备
+        ret = register_chrdev_region(devno, 1, DEV_NAME);
+        if (ret < 0) {
+            return ret;
+        }
+
+        // 初始化cdev
+        cdev_init(&g_dev.cdev, &my_fops);
+        g_dev.cdev.owner = THIS_MODULE;
+        ret = cdev_add(&g_dev.cdev, devno, 1);
+        if (ret < 0) {
+            unregister_chrdev_region(devno, 1);
+            return ret;
+        }
+
+        // 初始化等待队列和锁
+        init_waitqueue_head(&g_dev.rwq);
+        init_waitqueue_head(&g_dev.wwq);
+        spin_lock_init(&g_dev.lock);
+        g_dev.buf_len = 0;
+
+        return 0;
+    }
+    ```
+
+3. 设备驱动的`poll`方法，调用`poll_wait(filp, &等待队列头, wait)`函数，把读写的等待队列头传给`poll_wait`函数。接下来`poll_wait`就会创建等待项，并把等待项添加到我们设置的等待队列头中
+4. 检查设备驱动的读写缓冲区设备准备好，即文件描述符是否准备好。如果就绪，设置对应的`mask`，并返回结果。这个结果就是select/poll函数返回给用户空间的值
+
+    + `设备驱动poll方法`，调用`poll_wait`函数，把等待队列头传给`poll_wait`函数
+    + 如果当前可读，设置`mask |= POLLIN | POLLRDNORM`
+    + 如果当前可写，设置`mask |= POLLOUT | POLLWRNORM`
+    + 返回`mask`值，即文件描述符是否准备好
+
+    ```c
+    // poll方法（关键）
+    static unsigned int my_poll(struct file *filp, struct poll_table_struct *wait)
+    {
+        struct my_dev *dev = filp->private_data;
+        unsigned int mask = 0;
+
+        // 注册等待队列
+        poll_wait(filp, &dev->rwq, wait);
+        poll_wait(filp, &dev->wwq, wait);
+
+        // 检查可读/可写状态
+        spin_lock(&dev->lock);
+        if (dev->buf_len > 0) {
+            mask |= POLLIN | POLLRDNORM;  // 可读
+        }
+        if (dev->buf_len < sizeof(dev->buf)) {
+            mask |= POLLOUT | POLLWRNORM; // 可写
+        }
+        spin_unlock(&dev->lock);
+
+        return mask;
+    }
+    ```
+
+5. 设备驱动的`read/write`方法，如果有读/写数据准备好了，调用`wake_up_interruptible`唤醒等待队列。此时，我们预期`poll`方法会返回`>0`的值，即文件描述符准备好。进一步的，select/poll函数会返回`>0`的值，即文件描述符准备好
+
+    ```c
+    // 读操作
+    static ssize_t my_read(struct file *filp, char __user *ubuf, size_t count, loff_t *off)
+    {
+        struct my_dev *dev = filp->private_data;
+        int ret, len;
+
+        // 等待数据可读（若缓冲区为空，阻塞）
+        wait_event_interruptible(dev->rwq, dev->buf_len > 0);
+
+        spin_lock(&dev->lock);
+        len = min(count, (size_t)dev->buf_len);
+        ret = copy_to_user(ubuf, dev->buf, len);
+        if (ret) {
+            spin_unlock(&dev->lock);
+            return -EFAULT;
+        }
+        // 移动缓冲区数据（模拟环形缓冲区，简化处理）
+        memmove(dev->buf, dev->buf + len, dev->buf_len - len);
+        dev->buf_len -= len;
+        spin_unlock(&dev->lock);
+
+        // 唤醒写等待队列（空间释放后，允许继续写）
+        wake_up_interruptible(&dev->wwq);
+        return len;
+    }
+
+    // 写操作
+    static ssize_t my_write(struct file *filp, const char __user *ubuf, size_t count, loff_t *off)
+    {
+        struct my_dev *dev = filp->private_data;
+        int ret, len;
+
+        // 等待空间可写（若缓冲区满，阻塞）
+        wait_event_interruptible(dev->wwq, dev->buf_len < sizeof(dev->buf));
+
+        spin_lock(&dev->lock);
+        len = min(count, sizeof(dev->buf) - dev->buf_len);
+        ret = copy_from_user(dev->buf + dev->buf_len, ubuf, len);
+        if (ret) {
+            spin_unlock(&dev->lock);
+            return -EFAULT;
+        }
+        dev->buf_len += len;
+        spin_unlock(&dev->lock);
+
+        // 唤醒读等待队列（数据到达后，允许读）
+        wake_up_interruptible(&dev->rwq);
+        return len;
+    }
+    ```
+
+#### 5.3.2 驱动程序的关键点
+
+`poll`方法中，如果设备可读，设置的mask为`POLLIN | POLLRDNORM`。为什么不是仅``POLLIN`？
+
+1. `POLLIN`：可读
+2. `POLLRDNORM`：poll read normal，普通数据可读
+3. `POLLOUT`：可写
+4. `POLLWRNORM`：poll write normal，普通数据可写
+
+这是Linux内核的规范，`POLLIN | POLLRDNORM`表示普通读操作准备好。如果仅设置``POLLIN`，在某些情况下（如某些特定的文件系统或设备驱动），可能会导致问题。因此，为了兼容性和一致性，推荐同时使用这两个标志。
+
+##### 5.3.2.1 标志位的作用
+
+![](./src/0020.jpg)
+
+##### 5.3.2.2 `POLLIN | POLLRDNORM`组合使用的原因
+
+![](./src/0021.jpg)
+
+##### 5.3.2.3 代码实现对比
+
+![](./src/0022.jpg)
