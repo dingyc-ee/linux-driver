@@ -1954,3 +1954,174 @@ void poll_initwait(struct poll_wqueues *pwq)
 ##### 5.3.2.3 代码实现对比
 
 ![](./src/0022.jpg)
+
+#### 5.3.3 `poll`设备驱动程序示例
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/fs.h>
+#include <linux/gpio.h>
+#include <linux/interrupt.h>
+#include <linux/poll.h>
+#include <linux/wait.h>
+
+#define DEVICE_NAME "button_select"
+#define GPIO_BUTTON_1 17
+#define GPIO_BUTTON_2 18
+#define GPIO_BUTTON_3 27
+
+// 定义按键 GPIO 数组
+static const int button_gpios[] = {GPIO_BUTTON_1, GPIO_BUTTON_2, GPIO_BUTTON_3};
+#define NUM_BUTTONS ARRAY_SIZE(button_gpios)
+
+// 等待队列头
+static wait_queue_head_t button_wait_queue;
+// 事件标志
+static volatile int button_event = 0;
+
+// 按键中断处理函数
+static irqreturn_t button_irq_handler(int irq, void *dev_id) {
+    button_event = 1;
+    wake_up_interruptible(&button_wait_queue);
+    return IRQ_HANDLED;
+}
+
+// 文件操作结构体
+static struct file_operations fops = {
+    .owner = THIS_MODULE,
+    .poll = NULL,
+    .open = NULL,
+    .release = NULL,
+    .read = NULL,
+};
+
+// poll 方法实现
+static unsigned int button_poll(struct file *filp, poll_table *wait) {
+    unsigned int mask = 0;
+
+    poll_wait(filp, &button_wait_queue, wait);
+
+    if (button_event) {
+        mask |= POLLIN | POLLRDNORM;
+        button_event = 0;
+    }
+
+    return mask;
+}
+
+// 设备打开方法
+static int button_open(struct inode *inode, struct file *filp) {
+    return 0;
+}
+
+// 设备释放方法
+static int button_release(struct inode *inode, struct file *filp) {
+    return 0;
+}
+
+// 设备读取方法
+static ssize_t button_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
+    int value = 0;
+    int i;
+
+    for (i = 0; i < NUM_BUTTONS; i++) {
+        value |= gpio_get_value(button_gpios[i]) << i;
+    }
+
+    if (copy_to_user(buf, &value, sizeof(value))) {
+        return -EFAULT;
+    }
+
+    return sizeof(value);
+}
+
+// 模块初始化函数
+static int __init button_init(void) {
+    int ret;
+    int i;
+
+    // 初始化等待队列头
+    init_waitqueue_head(&button_wait_queue);
+
+    // 注册字符设备
+    ret = register_chrdev(0, DEVICE_NAME, &fops);
+    if (ret < 0) {
+        printk(KERN_ERR "Failed to register character device\n");
+        return ret;
+    }
+
+    // 配置按键 GPIO
+    for (i = 0; i < NUM_BUTTONS; i++) {
+        ret = gpio_request(button_gpios[i], "button");
+        if (ret < 0) {
+            printk(KERN_ERR "Failed to request GPIO %d\n", button_gpios[i]);
+            goto err_gpio_request;
+        }
+
+        ret = gpio_direction_input(button_gpios[i]);
+        if (ret < 0) {
+            printk(KERN_ERR "Failed to set GPIO %d as input\n", button_gpios[i]);
+            goto err_gpio_direction;
+        }
+
+        ret = request_irq(gpio_to_irq(button_gpios[i]), button_irq_handler,
+                          IRQF_TRIGGER_RISING | IRQF_SHARED, "button_irq", (void *)&button_gpios[i]);
+        if (ret < 0) {
+            printk(KERN_ERR "Failed to request IRQ for GPIO %d\n", button_gpios[i]);
+            goto err_request_irq;
+        }
+    }
+
+    // 设置文件操作方法
+    fops.poll = button_poll;
+    fops.open = button_open;
+    fops.release = button_release;
+    fops.read = button_read;
+
+    printk(KERN_INFO "Button driver initialized\n");
+    return 0;
+
+err_request_irq:
+    for (; i >= 0; i--) {
+        free_irq(gpio_to_irq(button_gpios[i]), (void *)&button_gpios[i]);
+    }
+err_gpio_direction:
+    for (; i >= 0; i--) {
+        gpio_free(button_gpios[i]);
+    }
+err_gpio_request:
+    unregister_chrdev(ret, DEVICE_NAME);
+    return ret;
+}
+
+// 模块退出函数
+static void __exit button_exit(void) {
+    int i;
+
+    // 释放中断
+    for (i = 0; i < NUM_BUTTONS; i++) {
+        free_irq(gpio_to_irq(button_gpios[i]), (void *)&button_gpios[i]);
+    }
+
+    // 释放 GPIO
+    for (i = 0; i < NUM_BUTTONS; i++) {
+        gpio_free(button_gpios[i]);
+    }
+
+    // 注销字符设备
+    unregister_chrdev(0, DEVICE_NAME);
+
+    printk(KERN_INFO "Button driver exited\n");
+}
+
+module_init(button_init);
+module_exit(button_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Your Name");
+MODULE_DESCRIPTION("Button driver using select");    
+```
+
+
