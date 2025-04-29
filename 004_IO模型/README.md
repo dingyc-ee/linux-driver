@@ -1955,173 +1955,297 @@ void poll_initwait(struct poll_wqueues *pwq)
 
 ![](./src/0022.jpg)
 
-#### 5.3.3 `poll`设备驱动程序示例
+### 5.4 `select`多路复用代码实例
+
+#### 5.4.1 设计原则
+
+我们设计这样一个设备驱动：
+
+1. 支持监控读和写
+2. 使用一个缓冲区。不为0就可读，未满就可写
+3. 用户程序调用`write`方法写入数据后，`wake`唤醒监控的读`readfds`。用户程序调用`read`方法读走数据后，`wake`唤醒监控的写`writefds`
+4. 使用自旋锁，保护缓冲区操作
+
+#### 5.4.2 驱动程序
+
+`select.c`
 
 ```c
-#include <linux/init.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/fs.h>
-#include <linux/gpio.h>
-#include <linux/interrupt.h>
-#include <linux/poll.h>
+#include <linux/init.h>     /* module_init */
+#include <linux/module.h>   /* MODULE_LICENSE */
+#include <linux/types.h>    /* dev_t */
+#include <linux/fs.h>       /* alloc_chrdev_region */
+#include <linux/cdev.h>     /* cdev_init */
+#include <linux/device.h>   /* class_create, device_create */
+#include <linux/io.h>
+#include <asm/io.h>         /* ioremap */
+#include <linux/uaccess.h>
+#include <asm/uaccess.h>    /* copy_from_user */
+#include <linux/sched.h>
 #include <linux/wait.h>
+#include <linux/spinlock.h>
+#include <linux/poll.h>
+#include <linux/kernel.h>
 
-#define DEVICE_NAME "button_select"
-#define GPIO_BUTTON_1 17
-#define GPIO_BUTTON_2 18
-#define GPIO_BUTTON_3 27
+#define PRINTF(fmt, ...)    printk("[KERN] " fmt, ##__VA_ARGS__)
 
-// 定义按键 GPIO 数组
-static const int button_gpios[] = {GPIO_BUTTON_1, GPIO_BUTTON_2, GPIO_BUTTON_3};
-#define NUM_BUTTONS ARRAY_SIZE(button_gpios)
+#define DEVICE_NAME     "cdev_test"
+#define CLASS_NAME      "cdev_cls"
 
-// 等待队列头
-static wait_queue_head_t button_wait_queue;
-// 事件标志
-static volatile int button_event = 0;
-
-// 按键中断处理函数
-static irqreturn_t button_irq_handler(int irq, void *dev_id) {
-    button_event = 1;
-    wake_up_interruptible(&button_wait_queue);
-    return IRQ_HANDLED;
-}
-
-// 文件操作结构体
-static struct file_operations fops = {
-    .owner = THIS_MODULE,
-    .poll = NULL,
-    .open = NULL,
-    .release = NULL,
-    .read = NULL,
+struct my_dev {
+    dev_t dev;
+    struct cdev cdev;
+    struct device *device;
+    struct class  *class;
+    wait_queue_head_t rwq;
+    wait_queue_head_t wwq;
+    char buf[128];
+    int  buf_len;
+    spinlock_t lock;
 };
 
-// poll 方法实现
-static unsigned int button_poll(struct file *filp, poll_table *wait) {
-    unsigned int mask = 0;
+static struct my_dev s_dev;
 
-    poll_wait(filp, &button_wait_queue, wait);
+static int my_open(struct inode *inode, struct file *filp)
+{
+    filp->private_data = &s_dev;
+    PRINTF("driver open\n");
+    return 0;
+}
 
-    if (button_event) {
-        mask |= POLLIN | POLLRDNORM;
-        button_event = 0;
+static ssize_t my_read(struct file *filp, char __user *buf , size_t size, loff_t *ppos)
+{
+    int len;
+    struct my_dev *dev = filp->private_data;
+
+    if (filp->f_flags & O_NONBLOCK) {
+        spin_lock(&dev->lock);
+        if (!dev->buf_len) {
+            spin_unlock(&dev->lock);
+            return -EAGAIN;
+        }
+        spin_unlock(&dev->lock);
     }
+    else {
+        if (wait_event_interruptible(dev->rwq, dev->buf_len > 0)) {
+            return -EINTR;
+        }
+    }
+
+    spin_lock(&dev->lock);
+    len = min(size, (size_t)dev->buf_len);
+    if (copy_to_user(buf, dev->buf, len)) {
+        spin_unlock(&dev->lock);
+        return -EFAULT;
+    }
+    memmove(dev->buf, dev->buf + len, dev->buf_len - len);
+    dev->buf_len -= len;
+    spin_unlock(&dev->lock);
+
+    wake_up_interruptible(&dev->wwq);   // 读走了数据，缓冲区又有空间了，唤醒 写--等待队列
+    return len;
+}
+
+static ssize_t my_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+    size_t len;
+    struct my_dev *dev = filp->private_data;
+
+    if (filp->f_flags & O_NONBLOCK) {
+        spin_lock(&dev->lock);
+        if (dev->buf_len >= sizeof(dev->buf)) {
+            spin_unlock(&dev->lock);
+            return -EAGAIN;
+        }
+        spin_unlock(&dev->lock);
+    }
+    else {
+        if (wait_event_interruptible(dev->wwq, dev->buf_len < sizeof(dev->buf))) {
+            return -EINTR;
+        }
+    }
+
+    spin_lock(&dev->lock);
+    len = min(size, sizeof(dev->buf) - dev->buf_len);
+    if (copy_from_user(dev->buf + dev->buf_len, buf, len)) {
+        spin_unlock(&dev->lock);
+        return -EFAULT;
+    }
+    dev->buf_len += len;
+    spin_unlock(&dev->lock);
+
+    wake_up_interruptible(&dev->rwq);   // 写入了数据，缓冲区可读，唤醒 读--等待队列
+    return len;
+}
+
+static unsigned int my_poll(struct file *filp, struct poll_table_struct *wait)
+{
+    unsigned int mask = 0;
+    struct my_dev *dev = filp->private_data;
+
+    poll_wait(filp, &dev->rwq, wait);
+    poll_wait(filp, &dev->wwq, wait);
+
+    spin_lock(&dev->lock);
+    if (dev->buf_len > 0) {
+        mask |= POLLIN | POLLRDNORM;    // 缓冲区可读，唤醒 读--等待队列
+    }
+    if (dev->buf_len < sizeof(dev->buf)) {
+        mask |= POLLOUT | POLLWRNORM;   // 缓冲区空间未满，唤醒 写--等待队列
+    }
+    spin_unlock(&dev->lock);
 
     return mask;
 }
 
-// 设备打开方法
-static int button_open(struct inode *inode, struct file *filp) {
+static int my_close(struct inode *inode, struct file *filp)
+{
+    PRINTF("driver close\n");
     return 0;
 }
 
-// 设备释放方法
-static int button_release(struct inode *inode, struct file *filp) {
+const struct file_operations cdev_fops = {
+    .owner   = THIS_MODULE,
+    .open    = my_open,
+    .read    = my_read,
+    .write   = my_write,
+    .poll    = my_poll,
+    .release = my_close,
+};
+
+static int my_dev_init(void)
+{
+    alloc_chrdev_region(&s_dev.dev, 0, 1, DEVICE_NAME);
+    s_dev.class = class_create(THIS_MODULE, CLASS_NAME);
+    cdev_init(&s_dev.cdev, &cdev_fops);
+    s_dev.cdev.owner = THIS_MODULE;
+    cdev_add(&s_dev.cdev, s_dev.dev, 1);
+    s_dev.device = device_create(s_dev.class, NULL, s_dev.dev, NULL, DEVICE_NAME);
+
+    init_waitqueue_head(&s_dev.rwq);
+    init_waitqueue_head(&s_dev.wwq);
+    memset(s_dev.buf, 0, s_dev.buf_len);
+    s_dev.buf_len = 0;
+    spin_lock_init(&s_dev.lock);
+
+    PRINTF("driver init(major:%d minor:%d)\n", MAJOR(s_dev.dev), MINOR(s_dev.dev));
     return 0;
 }
 
-// 设备读取方法
-static ssize_t button_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos) {
-    int value = 0;
-    int i;
+static void my_dev_exit(void)
+{
+    device_destroy(s_dev.class, s_dev.dev);
+    cdev_del(&s_dev.cdev);
+    class_destroy(s_dev.class);
+    unregister_chrdev_region(s_dev.dev, 1);
 
-    for (i = 0; i < NUM_BUTTONS; i++) {
-        value |= gpio_get_value(button_gpios[i]) << i;
-    }
-
-    if (copy_to_user(buf, &value, sizeof(value))) {
-        return -EFAULT;
-    }
-
-    return sizeof(value);
+    PRINTF("driver exit\n");
 }
-
-// 模块初始化函数
-static int __init button_init(void) {
-    int ret;
-    int i;
-
-    // 初始化等待队列头
-    init_waitqueue_head(&button_wait_queue);
-
-    // 注册字符设备
-    ret = register_chrdev(0, DEVICE_NAME, &fops);
-    if (ret < 0) {
-        printk(KERN_ERR "Failed to register character device\n");
-        return ret;
-    }
-
-    // 配置按键 GPIO
-    for (i = 0; i < NUM_BUTTONS; i++) {
-        ret = gpio_request(button_gpios[i], "button");
-        if (ret < 0) {
-            printk(KERN_ERR "Failed to request GPIO %d\n", button_gpios[i]);
-            goto err_gpio_request;
-        }
-
-        ret = gpio_direction_input(button_gpios[i]);
-        if (ret < 0) {
-            printk(KERN_ERR "Failed to set GPIO %d as input\n", button_gpios[i]);
-            goto err_gpio_direction;
-        }
-
-        ret = request_irq(gpio_to_irq(button_gpios[i]), button_irq_handler,
-                          IRQF_TRIGGER_RISING | IRQF_SHARED, "button_irq", (void *)&button_gpios[i]);
-        if (ret < 0) {
-            printk(KERN_ERR "Failed to request IRQ for GPIO %d\n", button_gpios[i]);
-            goto err_request_irq;
-        }
-    }
-
-    // 设置文件操作方法
-    fops.poll = button_poll;
-    fops.open = button_open;
-    fops.release = button_release;
-    fops.read = button_read;
-
-    printk(KERN_INFO "Button driver initialized\n");
-    return 0;
-
-err_request_irq:
-    for (; i >= 0; i--) {
-        free_irq(gpio_to_irq(button_gpios[i]), (void *)&button_gpios[i]);
-    }
-err_gpio_direction:
-    for (; i >= 0; i--) {
-        gpio_free(button_gpios[i]);
-    }
-err_gpio_request:
-    unregister_chrdev(ret, DEVICE_NAME);
-    return ret;
-}
-
-// 模块退出函数
-static void __exit button_exit(void) {
-    int i;
-
-    // 释放中断
-    for (i = 0; i < NUM_BUTTONS; i++) {
-        free_irq(gpio_to_irq(button_gpios[i]), (void *)&button_gpios[i]);
-    }
-
-    // 释放 GPIO
-    for (i = 0; i < NUM_BUTTONS; i++) {
-        gpio_free(button_gpios[i]);
-    }
-
-    // 注销字符设备
-    unregister_chrdev(0, DEVICE_NAME);
-
-    printk(KERN_INFO "Button driver exited\n");
-}
-
-module_init(button_init);
-module_exit(button_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Your Name");
-MODULE_DESCRIPTION("Button driver using select");    
+
+module_init(my_dev_init);
+module_exit(my_dev_exit);
 ```
 
+#### 5.4.3 应用测试程序
 
+##### 5.4.3.1 `app.c`
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[])
+{
+    int fd, ret;
+    fd_set readfds;
+    struct timeval tv;
+
+    if (argc < 2) {
+        printf("Usage: ./app /dev/xxx param\n");
+        return -EINVAL;
+    }
+    fd = open(argv[1], O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        printf("Open %s fail:%d\n", argv[1], fd);
+        return fd;
+    }
+   
+    while (1) {
+        FD_ZERO(&readfds);
+        FD_SET(fd, &readfds);
+
+        tv.tv_sec  = 5;
+        tv.tv_usec = 0;
+        ret = select(fd + 1, &readfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            printf("select error\n");
+            return -1;
+        }
+        else if (ret == 0) {
+            printf("timeout!\n");
+            continue;
+        }
+
+        if (FD_ISSET(fd, &readfds)) {
+            char str[256] = {0};
+            ret = read(fd, str, sizeof(str));
+            if (ret > 0) {
+                printf("Read: %s\n", str);
+            }
+            else {
+                printf("Read error\n");
+            }
+        }
+    }
+    
+    close(fd);
+    return 0;
+}
+```
+
+##### 5.4.3.2 `write.c`
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[])
+{
+    int fd, len, ret;
+    char str[256] = {0};
+
+    if (argc < 3) {
+        printf("Usage: ./app /dev/xxx string\n");
+        return -EINVAL;
+    }
+    fd = open(argv[1], O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        printf("Open %s fail:%d\n", argv[1], fd);
+        return fd;
+    }
+    strcpy(str, argv[2]);
+    len = strlen(str) + 1;
+    ret = write(fd, str, len);
+    if (ret != len) {
+        printf("Write error\n");
+    }
+    
+    close(fd);
+    return 0;
+}
+```
