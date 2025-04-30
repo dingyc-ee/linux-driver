@@ -2249,3 +2249,59 @@ int main(int argc, char *argv[])
     return 0;
 }
 ```
+
+## 第6章 IO多路复用`poll`
+
+前面已经介绍了`select`多路复用，现在来看下`poll`多路复用。
+
+```c
+#include <poll.h>
+
+struct pollfd {
+    int fd;			    // 要监视的文件描述符
+    short int events;   // 请求监视的事件（用户设置），可以用mask设置多个事件位
+    short int revents;  // 实际发生的事件（内核返回）
+};
+
+typedef unsigned int nfds_t;
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout);
+```
+
+`poll`函数的参数介绍：
+
+1. `struct pollfd *fds`： 指向`pollfd`结构体数组的指针，每个结构体描述一个监控的文件描述符
+2. `nfds_t nfds`： `fds`数组元素的个数（监控的文件描述符数量）
+3. `int timeout`： 超时时间，单位：毫秒
+
+    + `-1`: 阻塞等待，直到有事件发生
+    + `0`: 立即返回，不阻塞
+    + `>0`: 等待指定毫秒后超时
+
+### 6.1 `poll`函数参数详细介绍
+
+#### 6.1.1 `struct pollfd`结构体
+
+```c
+struct pollfd {
+    int fd;			    // 要监视的文件描述符
+    short int events;   // 请求监视的事件（用户设置），可以用mask设置多个事件位
+    short int revents;  // 实际发生的事件（内核返回）
+};
+```
+
+例如，我们要监视一个文件描述符`fd`的读写状态：
+
+```c
+struct pollfd fds[1];
+int fd, ret;
+
+fd = open("/dev/cdev_test", O_RDWR);
+
+fds[0].fd = fd;
+fds[0].events = POLLIN | POLLOUT;
+
+ret = poll(fds/*fds数组*/, 1/*数组元素个数为1*/, 5000/*超时时间5000ms*/);
+```
+
+#### 6.1.2 
