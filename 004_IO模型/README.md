@@ -2304,4 +2304,531 @@ fds[0].events = POLLIN | POLLOUT;
 ret = poll(fds/*fds数组*/, 1/*数组元素个数为1*/, 5000/*超时时间5000ms*/);
 ```
 
-#### 6.1.2 
+#### 6.1.2 `nfds_t nfds`文件描述符个数
+
+`nfds`表示要监视的文件描述符个数，类型为`unsigned int`。
+
+#### 6.1.3 `int timeout`超时
+
+`int timeout`，设置监视的超时，单位为`ms毫秒`。
+
+#### 6.1.4 `struct poll_list`结构体
+
+前面介绍了`struct pollfd`结构体。在Linux内核源码中，`struct poll_list`的典型定义如下：
+
+```c
+struct poll_list {
+	struct poll_list *next;     // 指向下一个struct poll_list节点的指针
+	int len;                    // 当前节点数组中，pollfd元素的个数
+	struct pollfd entries[0];   // 柔性数组，存储实际的struct pollfd结构体
+};
+```
+
+1. `next`指针
+
+    + 作用：将多个`poll_list`节点连接成链表，用于管理大数量的`pollfd`
+    + 场景：当用户空间传递的`pollfd`数量（nfds）超过单个`poll_list`节点能容纳的大小时，内核会创建多个`poll_list`节点，通过`next`指针串联，形成链表结构
+
+2. `len`字段
+
+    + 作用：记录当前`entries`数组中实际有效的`pollfd`数量
+    + 约束：`len`的最大值由内核内存管理策略决定，通常与页面大小对齐（例如：`PAGE_SIZE / sizeof(struct pollfd)`）
+
+3. `entries[0]`柔性数组
+
+    1. 柔性数组：`C99标准支持的特性，允许结构体的最后一个成员为长度未知的数组`。以下两种写法都是正确的柔性数组写法，具体取决于编译器允许的书写形式
+
+    ```c
+    struct S1 {
+        int num;
+        double d;
+        int arr[];  // 柔性数组
+    };
+
+    struct S2 {
+        int num;
+        double d;
+        int arr[0]; // 柔性数组
+    };
+    ```
+
+    2. 柔性数组的特点：
+
+    + 不占用结构体本身的内存空间。sizeof返回结构体大小时，不报错柔性数组成员所占的内存
+    + 分配内存时，需额外为柔性数组预留空间（如`sizeof(struct poll_list) + n * sizeof(struct pollfd)`）
+
+    3. `entries[0]`的含义：
+
+    + 他是`entries`数组的起始位置
+    + 实际储存用户空间传递的`struct pollfd`结构体，每个元素对应一个被监视的文件描述符
+    + 内核通过`entries[0]`访问数组中的内核`pollfd`
+
+`struct poll_list`的使用场景：
+
+`poll`系统吊桶的核心逻辑是，遍历所有被监视的`pollfd`，检查没和文件描述符的事件状态。但用户空间传递的`pollfd`数组可能非常大（如nfds=10000），直接在栈上分配这么大的内存，会导致栈溢出。因此，内核采用以下策略：
+
+1. 动态分配链表：内核将用户空间的`pollfd`数组复制到内核空间，并分割为多个`poll_list`节点，每个节点大小与内存也对齐，如4KB
+2. 链表遍历：内核通过`poll_list->next`遍历所有节点，逐个处理每个`entries`数组中的`pollfd`
+
+`poll_list`与`pollfd`的关系：
+
+假设用户调用`poll(fds, nfds, timeout)`，其中`fds`数用户空间的`struct pollfd`数组，`nfds=500`：
+
+1. 内核计算单个`poll_list`节点最多能容纳`PAGE_SIZE / sizeof(struct pollfd)`个`pollfd`（假设`PAGE_SIZE`=4096，`sizeof(struct pollfd)=8`，则单个节点最多容纳512个）
+2. 由于`nfds=500<512`，内核只需要分配一个`poll_list`节点，其`entries`数组大小为`500 * sizeof(struct pollfd)`
+3. `entries[0]`对应用户空间`fds[0]`，依此类推，`len=500`
+
+这种设计避免了栈溢出风险，同时通过内存页对齐，优化了访问效率。
+
+### 6.2 `do_sys_poll`系统调用源码分析
+
+`poll`系统调用的过程：
+
+`poll(应用层)` -> `sys_poll(内核)` -> `do_sys_poll(核心函数)`，所以我们重点分析`do_sys_poll`函数源码。
+
+`do_sys_poll`的执行流程，可分为几个关键步骤：
+
+#### 6.2.1 用户数据校验与内核空间复制
+
+1. 创建了`stack_pps`局部变量，大小为256字节，`long`在32位系统中为32位地址对齐，64位系统中为64位地址对齐
+2. `N_STACK_PPS`表示一个`stack_pps`局部变量能够保存的`pollfd`个数。我们可以想到，如果nfds超了，说明栈变量不够用，那就要申请页内存了
+2. 如果nfds超过了最大限制，就退出
+3. `todo`初始化为nfds，len初始值设为`min(nfds, N_STACK_PPS)`，这是什么意思？很简单，这是先判断`stack_pps`这个局部变量的空间，够不够保存`nfds`这么多个文件描述符
+4. 把用户空间的`ufds`拷贝到内核空间的`stack_pps`变量中，如果`stack_pps`不够就申请内存页，每一页用来保存一个`poll_list`
+
+```c
+#define POLL_STACK_ALLOC    256
+#define N_STACK_PPS         ((sizeof(stack_pps) - sizeof(struct poll_list)) / sizeof(struct pollfd))
+#define POLLFD_PER_PAGE     ((PAGE_SIZE-sizeof(struct poll_list)) / sizeof(struct pollfd))
+
+int do_sys_poll(struct pollfd __user *ufds, unsigned int nfds,
+		struct timespec *end_time)
+{
+    struct poll_wqueues table;
+ 	int err = -EFAULT, fdcount, len, size;
+	/* Allocate small arguments on the stack to save memory and be
+	   faster - use long to make sure the buffer is aligned properly
+	   on 64 bit archs to avoid unaligned access */
+	long stack_pps[POLL_STACK_ALLOC/sizeof(long)];
+	struct poll_list *const head = (struct poll_list *)stack_pps;
+ 	struct poll_list *walk = head;
+ 	unsigned long todo = nfds;
+
+	if (nfds > rlimit(RLIMIT_NOFILE))
+		return -EINVAL;
+
+	len = min_t(unsigned int, nfds, N_STACK_PPS);
+	for (;;) {
+		walk->next = NULL;
+		walk->len = len;
+		if (!len)
+			break;
+
+		if (copy_from_user(walk->entries, ufds + nfds-todo,
+					sizeof(struct pollfd) * walk->len))
+			goto out_fds;
+
+		todo -= walk->len;
+		if (!todo)
+			break;
+
+		len = min(todo, POLLFD_PER_PAGE);
+		size = sizeof(struct poll_list) + sizeof(struct pollfd) * len;
+		walk = walk->next = kmalloc(size, GFP_KERNEL);
+		if (!walk) {
+			err = -ENOMEM;
+			goto out_fds;
+		}
+	}
+}
+```
+
+#### 6.2.2 初始化等待队列
+
+`poll_initwait`函数在之前的`select`源码中已经分析了。说白了，就是初始化等待队列，关键是`do_poll`函数。
+
+```c
+struct poll_wqueues table;
+
+poll_initwait(&table);
+fdcount = do_poll(nfds, head, &table, end_time);
+poll_freewait(&table);
+```
+
+#### 6.2.3 `do_poll`事件轮询
+
+1. 在前面已经把`fds`数组从用户空间拷贝到内核空间了，接下来我们要逐个遍历这些文件描述符`fd`，看是否准备好。由于`struct poll_list`可能是链表结构，而每个链表中又包含了多个`struct pollfd`，所以要有2层循环
+2. 调用`do_pollfd`函数进入设备驱动程序的`.poll`方法，如果有事件就绪了，会设置`fds`的`revents`变量，返回时供用户空间使用
+3. 如果有事件就绪，则`count`大于0，`do_poll`函数返回就绪的文件描述符个数
+4. 如果没有事件就绪，调用`poll_schedule_timeout`调度进程休眠。唤醒后，重新执行`do_poll`检查所有检测的文件描述符
+
+```c
+static int do_poll(unsigned int nfds,  struct poll_list *list,
+		   struct poll_wqueues *wait, struct timespec *end_time)
+{
+	poll_table* pt = &wait->pt;
+	ktime_t expire, *to = NULL;
+	int timed_out = 0, count = 0;
+	unsigned long slack = 0;
+	unsigned int busy_flag = net_busy_loop_on() ? POLL_BUSY_LOOP : 0;
+	unsigned long busy_end = 0;
+
+	for (;;) {
+		struct poll_list *walk;
+		bool can_busy_loop = false;
+
+		for (walk = list; walk != NULL; walk = walk->next) {
+			struct pollfd * pfd, * pfd_end;
+
+			pfd = walk->entries;
+			pfd_end = pfd + walk->len;
+			for (; pfd != pfd_end; pfd++) {
+				/*
+				 * Fish for events. If we found one, record it
+				 * and kill poll_table->_qproc, so we don't
+				 * needlessly register any other waiters after
+				 * this. They'll get immediately deregistered
+				 * when we break out and return.
+				 */
+				if (do_pollfd(pfd, pt, &can_busy_loop,
+					      busy_flag)) {
+					count++;
+					pt->_qproc = NULL;
+					/* found something, stop busy polling */
+					busy_flag = 0;
+					can_busy_loop = false;
+				}
+			}
+		}
+
+		if (count || timed_out)
+			break;
+
+		if (!poll_schedule_timeout(wait, TASK_INTERRUPTIBLE, to, slack))
+			timed_out = 1;
+	}
+	return count;
+}
+```
+
+#### 6.2.4 `do_pollfd`进入设备驱动
+
+1. `do_pollfd`函数就是调用了设备驱动的`.poll`方法，返回值保存在mask变量中，最终赋值给`struct pollfd`结构体的`revents`成员，供用户空间使用
+2. `mask &= pollfd->events`，这里非常重要。假设我们在用户空间设置了`events = POLLIN | POLLOUT`，而`.poll`设备驱动只有`POLLIN`，那么这里最终的返回值就只有`POLLIN`。没问题，这就是我们想要监控的操作
+
+```c
+static inline unsigned int do_pollfd(struct pollfd *pollfd, poll_table *pwait,
+				     bool *can_busy_poll,
+				     unsigned int busy_flag)
+{
+	unsigned int mask;
+	int fd;
+
+	mask = 0;
+	fd = pollfd->fd;
+	if (fd >= 0) {
+		struct fd f = fdget(fd);
+		mask = POLLNVAL;
+		if (f.file) {
+			mask = DEFAULT_POLLMASK;
+			if (f.file->f_op->poll) {
+				mask = f.file->f_op->poll(f.file, pwait);
+			}
+			/* Mask out unneeded events. */
+			mask &= pollfd->events;
+			fdput(f);
+		}
+	}
+	pollfd->revents = mask;
+
+	return mask;
+}
+```
+
+#### 6.2.5 `poll_wait`函数
+
+设备驱动的`.poll`方法，会调用`poll_wait`函数，把要监控的文件描述符，添加到自己创建的等待队列头中，这跟之前`select`中分析的一致。
+
+### 6.3 驱动代码
+
+`poll.c`
+
+```c
+#include <linux/init.h>     /* module_init */
+#include <linux/module.h>   /* MODULE_LICENSE */
+#include <linux/types.h>    /* dev_t */
+#include <linux/fs.h>       /* alloc_chrdev_region */
+#include <linux/cdev.h>     /* cdev_init */
+#include <linux/device.h>   /* class_create, device_create */
+#include <linux/io.h>
+#include <asm/io.h>         /* ioremap */
+#include <linux/uaccess.h>
+#include <asm/uaccess.h>    /* copy_from_user */
+#include <linux/sched.h>
+#include <linux/wait.h>
+#include <linux/mutex.h>
+#include <linux/poll.h>
+#include <linux/kernel.h>
+
+#define PRINTF(fmt, ...)    printk("[KERN] " fmt, ##__VA_ARGS__)
+
+#define DEVICE_NAME     "cdev_test"
+#define CLASS_NAME      "cdev_cls"
+
+struct my_dev {
+    dev_t dev;
+    struct cdev cdev;
+    struct device *device;
+    struct class  *class;
+    wait_queue_head_t rwq;
+    wait_queue_head_t wwq;
+    char buf[128];
+    unsigned int buf_len;
+    struct mutex lock;
+};
+
+static struct my_dev s_dev;
+
+static int my_open(struct inode *inode, struct file *filp)
+{
+    // PRINTF("driver open\n");
+    filp->private_data = &s_dev;
+    return 0;
+}
+
+static ssize_t my_read(struct file *filp, char __user *buf , size_t size, loff_t *ppos)
+{
+    int ret, len;
+    struct my_dev *dev = filp->private_data;
+
+    if (size == 0) {
+        return 0;
+    }
+
+    mutex_lock(&dev->lock);
+    if (dev->buf_len == 0) {
+        mutex_unlock(&dev->lock);
+        if (filp->f_flags & O_NONBLOCK) {
+            return -EAGAIN;
+        }
+        ret = wait_event_interruptible(dev->rwq, dev->buf_len > 0);
+        if (ret) {
+            return -EINTR;
+        }
+        mutex_lock(&dev->lock);
+    }
+    len = min_t(unsigned int, size, dev->buf_len);
+    if (copy_to_user(buf, dev->buf, len)) {
+        mutex_unlock(&dev->lock);
+        return -EFAULT;
+    }
+    memmove(dev->buf, dev->buf + len, dev->buf_len - len);
+    dev->buf_len -= len;
+    mutex_unlock(&dev->lock);
+
+    wake_up_interruptible(&dev->wwq);
+    return len;
+}
+
+static ssize_t my_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+    int ret, len;
+    struct my_dev *dev = filp->private_data;
+
+    if (size == 0) {
+        return 0;
+    }
+
+    mutex_lock(&dev->lock);
+    if (dev->buf_len >= sizeof(dev->buf)) {
+        if (filp->f_flags & O_NONBLOCK) {
+            mutex_unlock(&dev->lock);
+            return -EAGAIN;
+        }
+        ret = wait_event_interruptible(dev->wwq, dev->buf_len < sizeof(dev->buf));
+        if (ret) {
+            mutex_unlock(&dev->lock);
+            return -EINTR;
+        }
+        mutex_lock(&dev->lock);
+    }
+    len = min_t(unsigned int, size, sizeof(dev->buf) - dev->buf_len);
+    if (copy_from_user(dev->buf + dev->buf_len, buf, len)) {
+        mutex_unlock(&dev->lock);
+        return -EFAULT;
+    }
+    dev->buf_len += len;
+    mutex_unlock(&dev->lock);
+
+    wake_up_interruptible(&dev->rwq);
+    return len;
+}
+
+static unsigned int my_poll(struct file *filp, struct poll_table_struct *wait)
+{
+    unsigned int mask = 0;
+    struct my_dev *dev = filp->private_data;
+
+    poll_wait(filp, &dev->rwq, wait);
+    poll_wait(filp, &dev->wwq, wait);
+
+    mutex_lock(&dev->lock);
+    if (dev->buf_len > 0) {
+        mask |= POLLIN | POLLRDNORM;
+    }
+    if (dev->buf_len < sizeof(dev->buf)) {
+        mask |= POLLOUT | POLLWRNORM;
+    }
+    mutex_unlock(&dev->lock);
+
+    return mask;
+}
+
+static int my_close(struct inode *inode, struct file *filp)
+{
+    // PRINTF("driver close\n");
+    return 0;
+}
+
+const struct file_operations cdev_fops = {
+    .owner   = THIS_MODULE,
+    .open    = my_open,
+    .read    = my_read,
+    .write   = my_write,
+    .poll    = my_poll,
+    .release = my_close,
+};
+
+static int my_dev_init(void)
+{
+    alloc_chrdev_region(&s_dev.dev, 0, 1, DEVICE_NAME);
+    s_dev.class = class_create(THIS_MODULE, CLASS_NAME);
+    cdev_init(&s_dev.cdev, &cdev_fops);
+    s_dev.cdev.owner = THIS_MODULE;
+    cdev_add(&s_dev.cdev, s_dev.dev, 1);
+    s_dev.device = device_create(s_dev.class, NULL, s_dev.dev, NULL, DEVICE_NAME);
+
+    init_waitqueue_head(&s_dev.rwq);
+    init_waitqueue_head(&s_dev.wwq);
+    memset(s_dev.buf, 0, sizeof(s_dev.buf));
+    s_dev.buf_len = 0;
+    mutex_init(&s_dev.lock);
+
+    PRINTF("driver init(major:%d minor:%d)\n", MAJOR(s_dev.dev), MINOR(s_dev.dev));
+    return 0;
+}
+
+static void my_dev_exit(void)
+{
+    device_destroy(s_dev.class, s_dev.dev);
+    cdev_del(&s_dev.cdev);
+    class_destroy(s_dev.class);
+    unregister_chrdev_region(s_dev.dev, 1);
+
+    PRINTF("driver exit\n");
+}
+
+MODULE_LICENSE("GPL");
+
+module_init(my_dev_init);
+module_exit(my_dev_exit);
+```
+
+### 6.4 应用测试程序
+
+`app.c`
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <poll.h>
+
+int main(int argc, char *argv[])
+{
+    int fd, ret;
+    struct pollfd fds[1];
+
+    if (argc < 2) {
+        printf("Usage: ./app /dev/xxx param\n");
+        return -EINVAL;
+    }
+    fd = open(argv[1], O_RDWR);
+    if (fd < 0) {
+        printf("Open %s fail:%d\n", argv[1], fd);
+        return fd;
+    }
+    fds[0].fd = fd;
+    fds[0].events = POLLIN;
+   
+    while (1) {
+        ret = poll(fds, 1, 5000);
+        if (ret < 0) {
+            printf("poll error\n");
+            return -1;
+        }
+        else if (ret == 0) {
+            printf("timeout!\n");
+            continue;
+        }
+
+        if (fds[0].revents | POLLIN) {
+            char str[256] = {0};
+            ret = read(fd, str, sizeof(str));
+            if (ret > 0) {
+                printf("Read: %s\n", str);
+            }
+            else {
+                printf("Read error\n");
+            }
+        }
+    }
+    
+    close(fd);
+    return 0;
+}
+```
+
+`write.c`
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[])
+{
+    int fd, len, ret;
+    char str[256] = {0};
+
+    if (argc < 3) {
+        printf("Usage: ./app /dev/xxx string\n");
+        return -EINVAL;
+    }
+    fd = open(argv[1], O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        printf("Open %s fail:%d\n", argv[1], fd);
+        return fd;
+    }
+    strcpy(str, argv[2]);
+    len = strlen(str) + 1;
+    ret = write(fd, str, len);
+    if (ret != len) {
+        printf("Write error\n");
+    }
+    
+    close(fd);
+    return 0;
+}
+```
