@@ -2832,3 +2832,320 @@ int main(int argc, char *argv[])
     return 0;
 }
 ```
+
+## 第7章 `SIGIO`信号驱动
+
+TODO
+
+## 第8章 Timer定时器
+
+Linux内核提供了`struct timer_list`定时器。典型使用场景：
+
+1. 网络协议栈
+
+    + 超时重传：TCP使用定时器检测丢包并触发重传
+    + 连接管理：维护心跳包或检测空闲连接超时
+
+2. 设备驱动
+
+    + 轮询替代：定期检查设备状态(如USB设备插入)，避免忙等待
+    + 防抖动：处理硬件信号抖动(如按键输入)
+
+3. 内核子系统
+
+    + 内存管理：定期回收内存
+    + 任务调度：实现CPU时间片轮转
+
+4. 用户态交互
+
+    + 系统调用超时：为阻塞操作(如select)，设置超时限制
+    + 内核模块：实现周期性任务(如日志轮转、统计信息收集)
+
+### 8.1 `struct timer_list`成员解析
+
+`#include <linux/timer.h>`
+
+```c
+struct timer_list {
+	struct list_head entry;
+	unsigned long expires;
+	void (*function)(unsigned long);
+	unsigned long data;
+    // ...
+};
+```
+
+以下是`struct timer_list`的主要成员及作用：
+
+1. `entry (类型: struct list_head )`: 将定时器挂载到内核的定时器管理数据结构中。定时器激活时，内核通过`entry`将其加入全局定时器队列，到期时快速定位并执行
+
+2. `expires (类型：unsigned long)`: 记录定时器的到期时间，单位为`jiffies(内核时间单位，通常与时钟中断频率相关)`
+
+    + 到期时间通过`jiffies + timeout`计算。例如：1秒后触发: `expires = jiffies + HZ (HZ是每秒的时钟中断数)`
+    + 使用`mod_timer()`可动态更新该值，调整定时器的触发时间
+
+3. `function和data`: `function`是定时器到期时执行的回调函数指针，函数原型为`void (*function)(unsigned long data)`，`data`就是传给定时器的参数
+
+### 8.2 `timer定时器`API和底层原理
+
+1. 获取当前`jiffies`时间值
+
+    `unsigned long jiffies;`，`jiffies`是内核中的一个全局变量，记录自系统启动以来的时钟中断次数。每个时钟中断的时间间隔由`HZ`宏定义，比如HZ=1000，每个jiffies代表1毫秒。
+
+    + `unsigned long msecs_to_jiffies(const unsigned int m)`: 毫秒数转为`jiffies`计数
+    + `unsigned long usecs_to_jiffies(const unsigned int u)`: 微秒数转为`jiffies`计数
+
+    常用的代码：
+
+    ```c
+    // 设置一个500ms的定时器
+    mod_timer(&timer, jiffies + msecs_to_jiffies(500));
+    ```
+
+2. 初始化定时器：创建一个定时器变量，并赋予关键字段的初值(还没有添加进内核)
+
+    + `DEFINE_TIMER(name, function, expires, data)`: 定义 + 初始化一条龙
+    + `setup_timer(struct timer_list *timer, void (*function)(unsigned long), unsigned long data)`: 需要先在外部定义定时器变量，再调用`setup_timer`来初始化
+
+    底层代码实现：
+
+    ```c
+    #define setup_timer(timer, fn, data)    \
+    do {								    \
+		(timer)->function = (_fn);		    \
+		(timer)->data = (_data);		    \
+	} while (0)
+    ```
+
+3. 添加/启动/激活定时器
+
+    前面只是定义了定时器变量。要想启动定时器，还需要把他添加进内核中。启动定时器的函数：
+
+    + `add_timer(struct timer_list *timer)`: 启动定时器。定时时间就是初始化时设置的`expires`，适合跟`DEFINE_TIMER`配合使用
+    + `mod_timer(struct timer_list *timer, unsigned long expires)`: 设置`expires值`并启动定时器，适合跟`setup_timer`配合使用
+
+    底层代码实现: 1. `add_timer`就是调用`mod_timer`实现的。2. `mod_timer`最终是把定时器添加到链表
+
+    ```c
+    void add_timer(struct timer_list *timer)
+    {
+        mod_timer(timer, timer->expires);
+    }
+
+    // mod_timer -> __mod_timer -> internal_add_timer -> __internal_add_timer
+    static void __internal_add_timer(struct tvec_base *base, struct timer_list *timer)
+    {
+        unsigned long expires = timer->expires;
+        unsigned long idx = expires - base->timer_jiffies;
+        struct list_head *vec;
+
+        /* 省略计算过程 */
+       
+        list_add_tail(&timer->entry, vec);
+    }
+    ```
+
+    可以看到，`mod_timer`函数实际上完成了2个动作：1. 更新到期时间；2. 如果定时器没激活，那就激活定时器。
+
+4. 修改定时器到期时间
+
+    如前面分析，直接调用`mod_timer(struct timer_list *timer, unsigned long expires)`函数。
+
+5. 删除定时器
+
+    根据是单核但是多核CPU，分成同步或异步删除。同步删除可以确保安全，而异步删除有可能残留竞争
+
+    + `int del_timer(struct timer_list * timer)`: 异步删除
+    + `int del_timer_sync(struct timer_list *timer)`: 同步删除，建议使用
+
+    底层代码实现：从链表中移除。
+
+    ```c
+    int del_timer(struct timer_list *timer)
+    {
+        // detach_if_pending(timer, base, true);
+            // detach_timer(timer, clear_pending);
+                 __list_del(entry->prev, entry->next);
+    }
+    ```
+
+### 8.3 `mod_timer`行为逻辑
+
+`mod_timer()`的核心逻辑：
+
+1. 如果定时器尚未激活(未添加到内核定时器队列)，则激活他
+2. 如果定时器已经激活，则更新其到期时间
+3. 无论新设置的`expires`是否过期，定时器都会被重新挂载到内核的定时器队列中
+
+    当`expires`被设置为一个过去的时间时：
+
+    + 内核会认为定时器已经到期，立即将其标记为待执行状态
+    + 定时器的回调函数，会在下一个时钟中断或软中断中触发
+
+### 8.4 定时器是单次触发的
+
+在Linux内核中，标准的定时器本身不支持自动周期运行。他是一次性触发的，到起执行回调函数后会自动失效。
+
+定时器到期后触发流程：
+
+1. 到期检测：每次时钟中断触发时，内核会检查所有定时器的到期时间`expires`，将已过期的定时器标记为待执行
+2. 移除定时器：在触发回调函数之前，内核会从定时器链表结构中删除该定时器
+3. 执行回调：将定时器的回调函数加入待执行队列(软中断上下文)，最终在软中断中执行回调
+
+如果想要实现周期性触发定时器，可以在回调函数中通过`mod_timer()`重新设置到期时间，使其再次触发。
+
+### 8.5 驱动代码
+
+`timer.c`
+
+```c
+#include <linux/init.h>     /* module_init */
+#include <linux/module.h>   /* MODULE_LICENSE */
+#include <linux/types.h>    /* dev_t */
+#include <linux/fs.h>       /* alloc_chrdev_region */
+#include <linux/cdev.h>     /* cdev_init */
+#include <linux/device.h>   /* class_create, device_create */
+#include <linux/uaccess.h>  /* copy_from_user */
+#include <linux/timer.h>    /* mod_timer */
+#include <linux/jiffies.h>  
+#include <linux/atomic.h>
+
+#define PRINTF(fmt, ...)    printk("[KERN] " fmt, ##__VA_ARGS__)
+
+#define DEVICE_NAME     "cdev_test"
+#define CLASS_NAME      "cdev_cls"
+
+struct my_dev {
+    dev_t dev;
+    struct cdev cdev;
+    struct device *device;
+    struct class  *class;
+    atomic_t v;
+    struct timer_list timer;
+};
+
+static struct my_dev s_dev;
+
+static void timer_callback(unsigned long data)
+{
+    struct my_dev *dev = (struct my_dev *)data;
+    atomic_inc(&dev->v);
+    mod_timer(&dev->timer, jiffies + msecs_to_jiffies(1000));
+}
+
+static int my_open(struct inode *inode, struct file *filp)
+{
+    PRINTF("driver open\n");
+    filp->private_data = &s_dev;
+    mod_timer(&s_dev.timer, jiffies + msecs_to_jiffies(1000));
+    return 0;
+}
+
+static ssize_t my_read(struct file *filp, char __user *buf, size_t size, loff_t *ppos)
+{
+    int ret, val, len;
+    struct my_dev *dev = filp->private_data;
+
+    val = atomic_read(&dev->v);
+    len = sizeof(val);
+    ret = copy_to_user(buf, &val, len);
+    if (ret) {
+        return -EFAULT;
+    }
+
+    return len;
+}
+
+static ssize_t my_write(struct file *filp, const char __user *buf, size_t size, loff_t *ppos)
+{
+    return 0;
+}
+
+static unsigned int my_poll(struct file *filp, struct poll_table_struct *wait)
+{
+    return 0;
+}
+
+static int my_close(struct inode *inode, struct file *filp)
+{
+    PRINTF("driver close\n");
+    return 0;
+}
+
+const struct file_operations cdev_fops = {
+    .owner   = THIS_MODULE,
+    .open    = my_open,
+    .read    = my_read,
+    .write   = my_write,
+    .poll    = my_poll,
+    .release = my_close,
+};
+
+static int my_dev_init(void)
+{
+    alloc_chrdev_region(&s_dev.dev, 0, 1, DEVICE_NAME);
+    s_dev.class = class_create(THIS_MODULE, CLASS_NAME);
+    cdev_init(&s_dev.cdev, &cdev_fops);
+    s_dev.cdev.owner = THIS_MODULE;
+    cdev_add(&s_dev.cdev, s_dev.dev, 1);
+    s_dev.device = device_create(s_dev.class, NULL, s_dev.dev, NULL, DEVICE_NAME);
+    atomic_set(&s_dev.v, 0);
+    setup_timer(&s_dev.timer, timer_callback, (unsigned long)&s_dev);
+    PRINTF("driver init(major:%d minor:%d)\n", MAJOR(s_dev.dev), MINOR(s_dev.dev));
+    return 0;
+}
+
+static void my_dev_exit(void)
+{
+    device_destroy(s_dev.class, s_dev.dev);
+    cdev_del(&s_dev.cdev);
+    class_destroy(s_dev.class);
+    unregister_chrdev_region(s_dev.dev, 1);
+
+    PRINTF("driver exit\n");
+}
+
+MODULE_LICENSE("GPL");
+
+module_init(my_dev_init);
+module_exit(my_dev_exit);
+```
+
+### 8.6 测试应用程序
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[])
+{
+    int fd, ret, val;
+
+    if (argc < 2) {
+        printf("Usage: ./app /dev/xxx param\n");
+        return -EINVAL;
+    }
+    fd = open(argv[1], O_RDWR);
+    if (fd < 0) {
+        printf("Open %s fail:%d\n", argv[1], fd);
+        return fd;
+    }
+   
+    while (1) {
+        ret = read(fd, &val, sizeof(val));
+        if (ret > 0) {
+            printf("val:%d\n", val);
+        }
+        sleep(1);
+    }
+    
+    close(fd);
+    return 0;
+}
+```
