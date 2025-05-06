@@ -3069,6 +3069,7 @@ static unsigned int my_poll(struct file *filp, struct poll_table_struct *wait)
 static int my_close(struct inode *inode, struct file *filp)
 {
     PRINTF("driver close\n");
+    del_timer_sync(&s_dev.timer);
     return 0;
 }
 
