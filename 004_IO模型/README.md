@@ -3150,3 +3150,36 @@ int main(int argc, char *argv[])
     return 0;
 }
 ```
+
+## 第9章 Linux内核打印实验
+
+Linux内核有多种方式可以打印日志。
+
+### 9.1 `dmesg`命令
+
+在终端使用`dmesg`命令，可以获取内核的打印信息。`dmesg -c`选项会先打印log，再清除日志缓冲区。
+
+```sh
+BusyBox v1.29.0 (2025-03-31 18:21:06 CST) multi-call binary.
+
+Usage: dmesg [-c] [-n LEVEL] [-s SIZE]
+
+Print or control the kernel ring buffer
+
+        -c  Clear ring buffer after printing
+```
+
+`dmesg`命令的打印输出：
+
+![](./src/0023.jpg)
+
+`dmesg`可以跟`grep`管道组合使用，来查找我们感兴趣的日志信息。
+
+比如：我们想查找`nfs`相关的日志，可以输入`dmesg | grep nfs`，输出如下：
+
+![](./src/0024.jpg)
+
+### 9.2 `/proc/kmsg`文件
+
+
+
