@@ -3181,5 +3181,188 @@ Print or control the kernel ring buffer
 
 ### 9.2 `/proc/kmsg`文件
 
+内核的所有打印信息，都会输出到循环缓冲区`log_buf`中。为了能够方便的再用户空间读取内核打印信息，Linux内核驱动将该循环缓冲区映射到了`/proc`目录下的`kmsg`文件。
+
+通过`cat /proc/kmsg`或者其他应用程序读取`log_buf`的时候可以不断的等待新的log，所以访问`/proc/kmsg`的方式适合长时间的读取log，没有新的log时会阻塞，一旦有新的log就可以被打印出来。
+
+`/proc/kmsg`，本质上是一个`proc`虚拟文件。由内核`fs/proc/kmsg.c`源码，在内核初始化时创建：
+
+`fs/proc/kmsg.c`
+
+```c
+/*
+ *  linux/fs/proc/kmsg.c
+ *
+ *  Copyright (C) 1992  by Linus Torvalds
+ *
+ */
+
+#include <linux/types.h>
+#include <linux/errno.h>
+#include <linux/time.h>
+#include <linux/kernel.h>
+#include <linux/poll.h>
+#include <linux/proc_fs.h>
+#include <linux/fs.h>
+#include <linux/syslog.h>
+
+#include <asm/uaccess.h>
+#include <asm/io.h>
+
+extern wait_queue_head_t log_wait;
+
+static int kmsg_open(struct inode * inode, struct file * file)
+{
+	return do_syslog(SYSLOG_ACTION_OPEN, NULL, 0, SYSLOG_FROM_PROC);
+}
+
+static int kmsg_release(struct inode * inode, struct file * file)
+{
+	(void) do_syslog(SYSLOG_ACTION_CLOSE, NULL, 0, SYSLOG_FROM_PROC);
+	return 0;
+}
+
+static ssize_t kmsg_read(struct file *file, char __user *buf,
+			 size_t count, loff_t *ppos)
+{
+	if ((file->f_flags & O_NONBLOCK) &&
+	    !do_syslog(SYSLOG_ACTION_SIZE_UNREAD, NULL, 0, SYSLOG_FROM_PROC))
+		return -EAGAIN;
+	return do_syslog(SYSLOG_ACTION_READ, buf, count, SYSLOG_FROM_PROC);
+}
+
+static unsigned int kmsg_poll(struct file *file, poll_table *wait)
+{
+	poll_wait(file, &log_wait, wait);
+	if (do_syslog(SYSLOG_ACTION_SIZE_UNREAD, NULL, 0, SYSLOG_FROM_PROC))
+		return POLLIN | POLLRDNORM;
+	return 0;
+}
+
+
+static const struct file_operations proc_kmsg_operations = {
+	.read		= kmsg_read,
+	.poll		= kmsg_poll,
+	.open		= kmsg_open,
+	.release	= kmsg_release,
+	.llseek		= generic_file_llseek,
+};
+
+static int __init proc_kmsg_init(void)
+{
+	proc_create("kmsg", S_IRUSR, NULL, &proc_kmsg_operations);
+	return 0;
+}
+fs_initcall(proc_kmsg_init);
+```
+
+### 9.3 调整内核打印等级
+
+#### 9.3.1 `printk`函数
+
+`printk`是内核中用于打印调试信息的关键函数，其日志级别通过优先级数值（0-7）控制，`数值越小优先级越高`。具体定义如下：
+
+```c
+#define KERN_SOH	"\001"		/* ASCII Start Of Header */
+
+#define KERN_EMERG	    KERN_SOH "0"	/* system is unusable */
+#define KERN_ALERT	    KERN_SOH "1"	/* action must be taken immediately */
+#define KERN_CRIT	    KERN_SOH "2"	/* critical conditions */
+#define KERN_ERR	    KERN_SOH "3"	/* error conditions */
+#define KERN_WARNING	KERN_SOH "4"	/* warning conditions */
+#define KERN_NOTICE	    KERN_SOH "5"	/* normal but significant condition */
+#define KERN_INFO	    KERN_SOH "6"	/* informational */
+#define KERN_DEBUG	    KERN_SOH "7"	/* debug-level messages */
+```
+
+这里的`KERN_SOH`有什么用？为什么要把日志等级定义成`KERN_SOH 4`，而不是直接就是4呢？
+
+`KERN_SOH`是内核中定义的一个宏，其本质是ASCII控制字符SOH，十六进制表示为0x01。在ASCII编码体系中，SOH通常用于数据传输或通信协议中作为特殊控制信号，标志着数据包或报文头部的开始。它不是一个可打印字符，所以在文本编辑器或其他普通显示环境下，通常不会显示出任何可见的图形符号。在电传打字机时代以及后续的计算机通信技术中，这些控制字符对于确保数据正确传输和格式化具有重要意义。
+
+在Linux内核中，`KERN_SOH`的作用是作为内核日志消息中`优先级标记的起始符`。
+
+#### 9.3.2 内核日志的优先级格式
+
+`printk`输出的日志消息，需要包含一个`优先级标记`，用于告知日志系统（如syslogd）该消息的严重级别。优先级标记的标准格式为：
+
+`KERN_SOH <level>`
+
+#### 9.3.3 `/proc/sys/kernel/printk`文件
+
+内核的日志打印由相应的打印等级来控制，可以通过调整内核打印等级来控制打印日志的输出。以下命令用来查看内核的打印等级：
+
+```sh
+cat /proc/sys/kernel/printk
+7       4       1       7
+```
+
+这里打印了4个值。正好就对应了内核源码`kernel/printk/printk.c`中的数组变量：
+
+```c
+#define CONSOLE_LOGLEVEL_MIN	 1 /* Minimum loglevel we let people use */
+#define CONSOLE_LOGLEVEL_QUIET	 4 /* Shhh ..., when booted with "quiet" */
+#define CONSOLE_LOGLEVEL_DEFAULT 7 /* anything MORE serious than KERN_DEBUG */
+
+int console_printk[4] = {
+	CONSOLE_LOGLEVEL_DEFAULT,	/* 当前控制台日志级别 */
+	MESSAGE_LOGLEVEL_DEFAULT,	/* 默认消息日志级别 */
+	CONSOLE_LOGLEVEL_MIN,		/* 最低控制台日志级别 */
+	CONSOLE_LOGLEVEL_DEFAULT,	/* 默认控制台日志级别 */
+};
+```
+参数介绍：
+
+| 日志宏 | 默认值 | 描述 |
+| - | - | - |
+| CONSOLE_LOGLEVEL_DEFAULT | 7 | 当前控制台日志级别：优先级高于该值的消息会显示在控制台（可以由uboot启动时设置） |
+| MESSAGE_LOGLEVEL_DEFAULT | 4 | 默认消息日志级别：未指定等级的`printk`消息默认使用此级别 |
+| CONSOLE_LOGLEVEL_MIN | 1 | 最低控制台日志级别：控制台日志级别的最小值（防止误设为 0） |
+| CONSOLE_LOGLEVEL_DEFAULT | 7 | 默认控制台日志级别：系统启动时的默认值 |
+
+1. 使用方式：通过`printk(KERN_INFO "Hello, world!")`输出，或使用封装函数`pr_info("Hello, world!")`
+2. 默认级别：未指定日志等级是，使用`MESSAGE_LOGLEVEL_DEFAULT`，也就是4，对应着`KERN_WARNING`
+
+#### 9.3.4 修改打印日志等级实验
+
+既然我们可以读取`/proc/sys/kernel/printk`文件，那么也可以写入该文件来设置日志等级。
+
+`测试驱动程序.c`
+
+```c
+#include <linux/init.h>     /* module_init */
+#include <linux/module.h>   /* MODULE_LICENSE */
+#include <linux/types.h>    /* dev_t */
+#include <linux/fs.h>       /* alloc_chrdev_region */
+#include <linux/cdev.h>     /* cdev_init */
+#include <linux/device.h>   /* class_create, device_create */
+#include <linux/uaccess.h>  /* copy_from_user */
+
+static int my_dev_init(void)
+{
+    printk(KERN_EMERG   "0 KERN_EMERG\n");
+    printk(KERN_ALERT   "1 KERN_ALERT\n");
+    printk(KERN_CRIT    "2 KERN_CRIT\n");
+    printk(KERN_ERR     "3 KERN_ERR\n");
+    printk(KERN_WARNING "4 KERN_WARNING\n");
+    printk(KERN_NOTICE  "5 KERN_NOTICE\n");
+    printk(KERN_INFO    "6 KERN_INFO\n");
+    printk(KERN_DEBUG   "7 KERN_DEBUG\n");
+    return 0;
+}
+
+static void my_dev_exit(void)
+{
+}
+
+MODULE_LICENSE("GPL");
+
+module_init(my_dev_init);
+module_exit(my_dev_exit);
+```
+
+测试结果如下：
+
+![](./src/0025.jpg)
+
 
 
