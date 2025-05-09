@@ -3364,5 +3364,459 @@ module_exit(my_dev_exit);
 
 ![](./src/0025.jpg)
 
+## 第10章 内核的内存分配
+
+在Linux内核设备驱动开发中，内存分配是一个核心任务。
+
+### 10.1 `kmalloc/kzalloc`
+
+在设备驱动开发中，`kmalloc/kzalloc`这两个内存分配函数非常高频的使用。
+
+#### 函数原型
+
+头文件路径：`#include <linux/slab.h>`
+
+```c
+void *kmalloc(size_t size, gfp_t flags);
+void *kzalloc(size_t size, gfp_t flags);
+```
+
++ `size_t size`参数：要分配的内存大小，以字节为单位
++ `gfp_t flags`参数：控制内存分配的行为，包括分配位置（DMA区域）、是否允许休眠、是否清零内存
+
+| 标志类型 | 常用标志 | 说明 |
+| - | - | - |
+| 上下文限制 | `GFP_KERNEL` | 在进程上下文中使用（允许休眠，可能触发内存回收）
+| 上下文限制 | `GFP_ATOMIC` | 在原子上下文中使用（不可休眠，如中断处理程序或自旋锁内）|
+| 内存区域 | `GFP_DMA` | 从DMA可用区域（低16MB物理内存）分配，用于兼容旧设备 |
+| 内存区域 | `GFP_DMA32` | 从32位地址空间（<4GB）分配，适用于64位系统上的DMA设备 |
+| 内存初始化 | `__GFP_ZERO` | 分配的内存初始化为0（类似`kzalloc`） |
+
+#### 特点
+
++ 物理内存连续：分配的内存在物理地址上是连续的（适合DMA操作）
++ 小内存分配：通常用于小块内存（最大分配大小由`KMALLOC_MAX_SIZE`定义，通常为4MB）
++ 快速访问：由于物理连续，访问效率高
+
+#### 区别
+
+`kzalloc`是`kmalloc + memset`的封装，适用于需要清零的内存（如结构体初始化）
+
+```c
+void *kzalloc(size_t size, gfp_t flags)
+{
+	return kmalloc(size, flags | __GFP_ZERO);
+}
+```
+
+#### 使用场景
+
++ 需要物理连续内存的场景（如DMA缓冲区）
++ 分配小到中等大小的内存块（例如设备驱动的私有数据结构）
+
+### 10.2 `kfree`
+
+在Linux内核的内存管理中，`kmalloc/kzalloc`分配的内存，统一使用`kfree`释放。
+
+#### 函数原型
+
+```c
+void kfree(const void *p);
+```
+
+#### 关键细节
+
++ 直接释放内存：将内存块交还给内存管理子系统（slab分配器），不修改内存中的原有数据
++ 支持NULL指针：若传入NULL指针，`kfree`会静默跳过（不会报错）
++ 适用场景：普通内存释放，无需保护敏感数据
+
+## 第11章 `llseek`定位
+
+### 11.1 典型场景
+
+前面我们写的所有设备驱动，读写`内核buffer`时，都是从`内核buffer`的起始头部开始，这对大多数流式设备都没问题。
+
+但是，还有一些特殊的设备，需要进行随机访问，比如文件。我们在C语言中，通过`fread、fwrite`函数读写文件时，每次都会自动偏移到下一次要读取的位置，而不是每次都是从文件头开始。
+
+*总结：支持随机访问的设备，必须实现`llseek`来定位。*
+
+#### 11.1.1 内存模拟设备（RAM Disk）
+
+场景特点：
+
++ 设备的行为类似于内存或文件，允许用户随机读写任意位置的数据
++ 需要跟踪并限制读写偏移（`f_ops`）的范围，防止越界访问
+
+#### 11.1.2 固件更新
+
+场景特点：
+
++ 设备支持分块更新固件（如按4KB块写入），需强制用户按块对齐访问
++ 偏移必须是块大小的整数倍
+
+```c
+static loff_t firmware_llseek(struct file *file, loff_t offset, int whence)
+{
+    loff_t new_pos;
+    const loff_t block_size = 4096; // 固件块大小
+
+    switch (whence) {
+        case SEEK_SET: new_pos = offset; break;
+        case SEEK_CUR: new_pos = file->f_pos + offset; break;
+        case SEEK_END: new_pos = FIRMWARE_MAX_SIZE + offset; break;
+        default: return -EINVAL;
+    }
+    // 检查是否按块对齐
+    if (new_pos % block_size != 0)
+        return -EINVAL;
+    // 检查是否超出固件最大大小
+    if (new_pos < 0 || new_pos >= FIRMWARE_MAX_SIZE)
+        return -EINVAL;
+    file->f_pos = new_pos;
+    return new_pos;
+}
+```
+
+### 11.2 函数原型
+
+`file_ops`的`.llseek`方法，函数原型和参数介绍。
+
+1. `struct file *filp`：文件指针
+2. `loff_t offset`：文件位置指针。本质上是相对于whence的偏移量，可以为负值
+3. `int whence`：操作文件的位置
+
+    + `SEEK_SET`：文件头开始
+    + `SEEK_CUR`：当前文件指针位置开始
+    + `SEEK_END`：文件尾部开始
+
+```c
+loff_t my_llseek(struct file *filp, loff_t offset, int whence);
+```
+
+### 11.3 `loff_t *pos`文件位置指针
+
+在Linux设备驱动程序中，`read`和`write`方法的最后一个参数，是`loff_t *pos`文件位置指针。具有以下关键作用：
+
+`loff_t *pos`是一个指向文件偏移量的指针，用于追踪当前读写操作的起始位置。它使得驱动程序能够：
+
++ 定位数据：决定从设备的哪个位置开始读取或写入
++ 自动推进偏移：在操作完成后更新偏移量，为后续操作提供连续性
++ 支持随机访问：允许通过修改偏移量，跳转到任意位置操作
+
+#### 读操作
+
+```c
+ssize_t my_read(struct file *filp, char __user *buf , size_t size, loff_t *pos);
+```
+
++ 输入时：`*pos`表示用户空间期望的起始读取位置
++ 输出时：驱动需要更新`*pos`为实际读取的新位置（原值+读取字节数）
+
+#### 写操作
+
+```c
+ssize_t my_write(struct file *filp, const char __user *buf, size_t size, loff_t *pps);
+```
+
++ 输入时：`*pos`表示用户空间期望的起始写入位置
++ 输出时：驱动需要更新`*pos`为实际写入的新位置（原值+写入字节数）
+
+#### 与用户空间的联系
+
+| 用户空间操作 | 内核行为 | 驱动可见的`*pos`变化 |
+| - | - | - |
+| `read(fd, buf, 100)` | 传入当前偏移量（file指针中有个成员f_pos就是偏移量）| 驱动看到初始偏移，需要更新偏移 |
+| `write(fd, buf, 100)` | 同上 | 同上 |
+| `lseek(fd, 1024, SEEK_SET)` | 直接修改偏移量 | 下次读写时使用新值 |
+
+#### 典型驱动实现方式
+
+```c
+static ssize_t my_read(struct file *file, char __user *buf,
+                      size_t count, loff_t *pos)
+{
+    // 1. 计算可读范围
+    size_t available = buffer_size - *pos;
+    size_t to_read = min(count, available);
+
+    // 2. 执行数据拷贝（设备->用户空间）
+    copy_to_user(buf, device_buffer + *pos, to_read);
+
+    // 3. 更新偏移量（关键步骤！）
+    *pos += to_read;
+
+    return to_read;
+}
+```
+
+#### 注意事项
+
+1. 偏移量维护责任
+
+    + 驱动必须在每次操作后更新`*pos`
+    + 若没有更新，后续操作会重复使用相同位置
+
+2. 并发控制
+
+    + 对共享偏移量的访问，需要加锁
+
+3. 边界检查
+
+    + 需验证`*pos`是否超出设备容量
+
+4. 特殊设备处理
+
+    + 对于顺序访问的流式设备，可能要忽略`pos`
+    + 需要实现`llseek`返回错误
+
+#### 与llseek的关联
+
+当用户调用`llseek()`时：
+
+```c
+loff_t my_llseek(struct file *file, loff_t offset, int whence)
+{
+    // 计算新偏移量
+    switch(whence) {
+    case SEEK_SET: new = offset;
+    case SEEK_CUR: new = file->f_pos + offset;
+    case SEEK_END: new = device_size + offset;
+    }
+    
+    // 更新到 file->f_pos
+    file->f_pos = new;
+    return new;
+}
+```
+
++ 该函数直接修改`file->f_pos`
++ `read/write`中看到的`*pos`，就是`file->f_pos`的地址
+
+### 11.4 驱动程序
+
+```c
+#include <linux/init.h>     /* module_init */
+#include <linux/module.h>   /* MODULE_LICENSE */
+#include <linux/types.h>    /* dev_t */
+#include <linux/fs.h>       /* alloc_chrdev_region */
+#include <linux/cdev.h>     /* cdev_init */
+#include <linux/device.h>   /* class_create, device_create */
+#include <linux/uaccess.h>  /* copy_from_user */
+#include <asm/uaccess.h>    
+#include <linux/mutex.h>
+#include <linux/slab.h>
+
+#define DEVICE_NAME     "cdev_test"
+#define CLASS_NAME      "cdev_cls"
+
+#define SIZE    4096
+
+struct my_dev {
+    dev_t dev;
+    struct cdev cdev;
+    struct device *device;
+    struct class  *class;
+    struct mutex lock;
+    char  *buf;
+    size_t buf_size;
+};
+
+static struct my_dev s_dev;
+
+static int my_open(struct inode *inode, struct file *filp)
+{
+    filp->private_data = &s_dev;
+    return 0;
+}
+
+static loff_t my_llseek(struct file *filp, loff_t offset, int whence)
+{
+    loff_t new_pos;
+    struct my_dev *dev = filp->private_data;
+
+    mutex_lock(&dev->lock);
+    switch (whence)
+    {
+    case SEEK_SET:
+        new_pos = offset;
+        break;
+    case SEEK_CUR:
+        new_pos = filp->f_pos + offset;
+        break;
+    case SEEK_END:
+        new_pos = dev->buf_size + offset;
+        break;
+    default:
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+    if (new_pos < 0 || new_pos > dev->buf_size) {
+        mutex_unlock(&dev->lock);
+        return -EINVAL;
+    }
+    filp->f_pos = new_pos; // 更新当前位置
+    mutex_unlock(&dev->lock);
+
+    return new_pos;
+}
+
+static ssize_t my_read(struct file *filp, char __user *buf , size_t size, loff_t *pos)
+{
+    int ret, len;
+    struct my_dev *dev = filp->private_data;
+
+    mutex_lock(&dev->lock);
+    len = min_t(int, size, dev->buf_size - *pos);
+    if (len > 0) {
+        ret = copy_to_user(buf, dev->buf + *pos, len);
+        if (ret) {
+            mutex_lock(&dev->lock);
+            return -EFAULT;
+        }
+        *pos += len;
+    }
+    mutex_unlock(&dev->lock);
+
+    return len;
+}
+
+static ssize_t my_write(struct file *filp, const char __user *buf, size_t size, loff_t *pos)
+{
+    int ret, len;
+    struct my_dev *dev = filp->private_data;
+
+    mutex_lock(&dev->lock);
+    len = min_t(int, size, dev->buf_size - *pos);
+    if (len > 0) {
+        ret = copy_from_user(dev->buf + *pos, buf, len);
+        if (ret) {
+            mutex_lock(&dev->lock);
+            return -EFAULT;
+        }
+        *pos += len;
+    }
+    mutex_unlock(&dev->lock);
+
+    return len;
+}
+
+static int my_close(struct inode *inode, struct file *filp)
+{
+    return 0;
+}
+
+const struct file_operations cdev_fops = {
+    .owner   = THIS_MODULE,
+    .open    = my_open,
+    .llseek  = my_llseek,
+    .read    = my_read,
+    .write   = my_write,
+    .release = my_close,
+};
+
+static int my_dev_init(void)
+{
+    alloc_chrdev_region(&s_dev.dev, 0, 1, DEVICE_NAME);
+    s_dev.class = class_create(THIS_MODULE, CLASS_NAME);
+    cdev_init(&s_dev.cdev, &cdev_fops);
+    s_dev.cdev.owner = THIS_MODULE;
+    cdev_add(&s_dev.cdev, s_dev.dev, 1);
+    s_dev.device = device_create(s_dev.class, NULL, s_dev.dev, NULL, DEVICE_NAME);
+    mutex_init(&s_dev.lock);
+    s_dev.buf = kzalloc(SIZE, GFP_KERNEL);
+    s_dev.buf_size = SIZE;
+
+    printk("driver init(major:%d minor:%d)\n", MAJOR(s_dev.dev), MINOR(s_dev.dev));
+    return 0;
+}
+
+static void my_dev_exit(void)
+{
+    kfree(s_dev.buf);
+    s_dev.buf = NULL;
+    s_dev.buf_size = 0;
+    device_destroy(s_dev.class, s_dev.dev);
+    cdev_del(&s_dev.cdev);
+    class_destroy(s_dev.class);
+    unregister_chrdev_region(s_dev.dev, 1);
+
+    printk("driver exit\n");
+}
+
+MODULE_LICENSE("GPL");
+
+module_init(my_dev_init);
+module_exit(my_dev_exit);
+```
+
+### 11.5 测试应用程序
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
+
+#define SIZE    4096
+
+int main(int argc, char *argv[])
+{
+    int fd, ret;
+
+    if (argc < 2) {
+        printf("Usage: ./app /dev/xxx param\n");
+        return -1;
+    }
+    fd = open(argv[1], O_RDWR);
+    if (fd < 0) {
+        printf("Open %s fail:%d\n", argv[1], fd);
+        return fd;
+    }
+
+    // Test SEEK_SET
+    if (lseek(fd, 100, SEEK_SET) != 100) {
+        printf("lseek SEEK_SET fail\n");
+        close(fd);
+        return -1;
+    }
+    // Test write
+    char str[] = "test data";
+    if (write(fd, str, sizeof(str)) != sizeof(str)) {
+        printf("write fail\n");
+        close(fd);
+        return -1;
+    }
+    // Test SEEK_CUR
+    if (lseek(fd, -5, SEEK_CUR) != 100 + sizeof(str) - 5) {
+        printf("lseek SEEK_SET fail\n");
+        close(fd);
+        return -1;
+    }
+    // Test read
+    char read_buf[5];
+    if (read(fd, read_buf, sizeof(read_buf)) != sizeof(read_buf)) {
+        printf("read fail\n");
+        close(fd);
+        return -1;
+    }
+    printf("Read:%s\n", read_buf);
+    // Test SEEK_END
+    if (lseek(fd, -10, SEEK_END) != SIZE - 10) {
+        printf("lseek SEEK_SET fail\n");
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+    printf("lseek test complete\r\n");
+    return 0;
+}
+```
+
+测试结果如下：
+
+![](./src/0026.jpg)
 
 
