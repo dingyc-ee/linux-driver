@@ -3819,4 +3819,154 @@ int main(int argc, char *argv[])
 
 ![](./src/0026.jpg)
 
+## 第12章 `ioctl`系统调用
+
+在Linux设备驱动开发中，`ioctl`是一个关键的系统调用接口，用于实现设备无法通过常规读写操作完成的控制功能。其核心作用是，允许用户空间程序与内核驱动之间进行灵活的双向数据交互和控制命令传递。
+
+### 12.1 `ioctl`的核心作用
+
+| 功能维度 | 说明 |
+| - | - |
+| 设备控制 | 修改设备工作模式（如串口波特率、网络设备MTU）|
+| 状态获取 | 读取设备状态信息（如传感器当前值、硬件寄存器状态）|
+| 高级操作 | 触发非标准操作（如摄像头开始录像、FPGA重新配置）|
+| 参数传递 | 传递复杂数据结构（如配置参数块、加密密钥）|
+
+### 12.2 `ioctl`的典型使用场景
+
+#### 12.2.1 硬件参数配置
+
+```c
+// 用户空间设置串口波特率
+struct termios options;
+ioctl(fd, TCGETS, &options);  // 获取当前参数
+options.c_cflag |= B115200;    // 设置波特率为115200
+ioctl(fd, TCSETS, &options);  // 应用新配置
+```
+
+#### 12.2.2 设备模式切换
+
+```c
+// 设置网络接口为混杂模式（抓包）
+int promisc = 1;
+ioctl(sockfd, SIOCGIFFLAGS, &ifr);  // 获取当前标志
+ifr.ifr_flags |= IFF_PROMISC;
+ioctl(sockfd, SIOCSIFFLAGS, &ifr);  // 设置新标志
+```
+
+#### 12.2.3 私有协议实现
+
+```c
+// 自定义加密设备驱动
+struct crypto_key {
+    int algo;
+    char key[256];
+};
+
+struct crypto_key key = {
+    .algo = AES_256,
+    .key = "secret_key_here"
+};
+ioctl(fd, SET_CRYPTO_KEY, &key);  // 传递密钥
+```
+
+#### 12.2.4 状态查询
+
+```c
+// 查询磁盘剩余扇区数
+unsigned long sectors;
+ioctl(fd, BLKGETSIZE, &sectors); 
+```
+
+### 12.3 `ioctl`参数传递机制
+
+1. 参数传递方式
+
+| 方式 | 说明 |
+| - | - |
+| 整型直接传递 | 简单数值直接通过`unsigned long arg`传递 |
+| 指针传递 | 传递用户空间指针，驱动需要用`copy_to_user()/copy_from_user()`拷贝数据 |
+
+### 12.4 Linux内核`ioctl`函数详解
+
+#### 12.4.1 函数原型
+
+1. 用户空间
+
+```c
+#include <unistd.h>
+#include <sys/ioctl.h>
+int ioctl(int fd, int request, ...);  // 第三个参数通常为 void *argp
+```
+
+2. 内核空间
+
+```c
+long (*ioctl)(struct file *file, unsigned int cmd, unsigned long arg);
+```
+
+#### 12.4.2 参数介绍
+
+1. `struct file *file`：文件指针
+2. `unsigned int cmd`：32位无符号整数，包含4个核心字段：数据方向（Dir）、数据大小（Size）、幻数（MagicNumber）、命令号（NR：Number）。这些字段通过内核宏进行标准化构造和解析，确保驱动与用户空间的交互安全且规范
+
+    | 位范围 | 31~30 | 29~16 | 15~8 | 7~0 |
+    | - | - | - | - | - |
+    | 字段 | 数据方向（`dir`）| 数据大小（`size`）| 幻数（`MagicNumber`）| 命令号（`nr`）|
+    | 长度 | 2 | 14 | 8 | 8 |
+    | 含义 | 读、写、双向 | 传输数据的字节数 | 唯一标识设备，避免命令冲突（如`a`、0x41等）| 设备支持的具体操作（如0表示读状态、1表示写配置） |
+
+3. `unsigned long arg`：简单的整数，或指针（需要使用`copy_to_user`来访问）
+
+#### 12.4.3 数据传输注意事项
+
+1. 用户空间与内核空间的隔离：内核不能直接访问用户空间指针`arg`，必须通过`copy_to_user`进行数据拷贝
+2. 数据类型对齐：确保用户空间与内核空间的数据结构定义一致（字节序、对齐方式），避免因编译选项不同导致的错误
+
+#### 14.4.4 错误处理
+
+1. 驱动进检查命令的合法性（如幻数是否匹配、数据大小是否合理），通过`_IOC_TYPE(cmd)`校验幻数，避免非法命令执行
+2. 返回值：成功犯规0，错误返回负的错误码（如-EINVAL、-EFAULT）
+
+#### 14.4.5 驱动实现建议
+
+1. 命令分发
+
+使用`switch-case`根据`cmd`处理不同操作，先校验幻数，再处理具体命令
+
+```c
+long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    if (_IOC_TYPE(cmd) != MY_MAGIC) {
+        return -EINVAL;  // 非法幻数
+    }
+    switch (_IOC_NR(cmd)) {
+        case CMD_SET:  return handle_set(cmd, arg);
+        case CMD_GET:  return handle_get(cmd, arg);
+        default:       return -EINVAL;  // 非法命令号
+    }
+}
+```
+
+2. 安全检查
+
+使用`access_ok()`检查用户指针是否可读/写。虽然`copy_from_user`会隐式检查，但显式检查更清晰。
+
+#### 14.4.6 优缺点与适用场景
+
++ 优点
+
+    1. 灵活度高：可自定义任意类型的控制命令和数据格式，适用于复杂或硬件相关的操作
+    2. 兼容性强：长期存在于Linux系统，支持字符设备、块设备、网络接口
+
++ 缺点
+
+    1. 缺乏统一规范：每个设备的命令和参数自定义，导致接口混乱，难以通用化
+    2. 安全性风险：错误的命令或数据可能导致内核崩溃，需要严格校验
+
++ 适用场景
+
+    1. 硬件设备的特殊控制（串口波特率设置、GPIO配置）
+    2. 内核与用户空间的自定义数据交互
+
+### 12.5 `ioctl`宏定义操作
 
