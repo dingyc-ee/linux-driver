@@ -3908,11 +3908,11 @@ long (*ioctl)(struct file *file, unsigned int cmd, unsigned long arg);
 #### 12.4.2 参数介绍
 
 1. `struct file *file`：文件指针
-2. `unsigned int cmd`：32位无符号整数，包含4个核心字段：数据方向（Dir）、数据大小（Size）、幻数（MagicNumber）、命令号（NR：Number）。这些字段通过内核宏进行标准化构造和解析，确保驱动与用户空间的交互安全且规范
+2. `unsigned int cmd`：32位无符号整数，包含4个核心字段：方向（`_IOC_DIR`）、数据大小（`_IOC_SIZE`）、幻数（`_IOC_TYPE`）、命令号（`_IOC_NR`）。这些字段通过内核宏进行标准化构造和解析，确保驱动与用户空间的交互安全且规范
 
     | 位范围 | 31~30 | 29~16 | 15~8 | 7~0 |
     | - | - | - | - | - |
-    | 字段 | 数据方向（`dir`）| 数据大小（`size`）| 幻数（`MagicNumber`）| 命令号（`nr`）|
+    | 字段 | 方向（`_IOC_DIR`）| 数据大小（`_IOC_SIZE`）| 幻数（`_IOC_TYPE`）| 命令号（`_IOC_NR`）|
     | 长度 | 2 | 14 | 8 | 8 |
     | 含义 | 读、写、双向 | 传输数据的字节数 | 唯一标识设备，避免命令冲突（如`a`、0x41等）| 设备支持的具体操作（如0表示读状态、1表示写配置） |
 
@@ -3970,3 +3970,291 @@ long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
 
 ### 12.5 `ioctl`宏定义操作
 
+Linux内核提供以下宏来构造命令码：
+
+| 宏 | 方向 | 用途 | 原型 |
+| - | - | - | - |
+| `_IO(type,nr)` | 无数据传输 | 仅传递命令 | `_IO(type, nr)` |
+| `_IOR(type,nr,size)` | 读（用户->内核） | 从驱动读取数据 | `_IOR(type,nr,sizeof(size))` |
+| `_IOW(type,nr,size)` | 写（用户->内核） | 向驱动写入数据 | `_IOW(type,nr,sizeof(size))` |
+| `_IOWR(type,nr,size)` | 双向传输 | 读写数据 | `_IOWR(type,nr,sizeof(size))` |
+
+参数介绍：
+
++ `type`：幻数（唯一标识驱动的字符，如`'k'`）
++ `nr`：命令序号（0~255）
++ `size`：传输的数据类型（如`struct data`）
+
+解析`cmd`宏：
+
+```c
+#define _IOC_DIR(nr)
+#define _IOC_TYPE(nr)
+#define _IOC_NR(nr)
+#define _IOC_SIZE(nr)
+```
+
+### 12.6 `ioctl`测试程序
+
+下面的代码，模拟了`WiFi`设备的操作。
+
+#### 12.6.1 网卡驱动
+
+```c
+#include <linux/init.h>     /* module_init */
+#include <linux/module.h>   /* MODULE_LICENSE */
+#include <linux/types.h>    /* dev_t */
+#include <linux/fs.h>       /* alloc_chrdev_region */
+#include <linux/cdev.h>     /* cdev_init */
+#include <linux/device.h>   /* class_create, device_create */
+#include <linux/uaccess.h>  /* copy_from_user */ 
+#include <linux/mutex.h>    /* mutex_lock */
+#include <linux/ioctl.h>    /* ioctl */
+#include <linux/delay.h>    /* msleep */
+
+#define DEVICE_NAME     "wifi"
+#define CLASS_NAME      "wifi"
+
+#define WIFI_MAGIC  'w'
+
+#define WIFI_SET_SSID       _IOW(WIFI_MAGIC, 0, char[32])
+#define WIFI_CONNECT        _IO (WIFI_MAGIC, 1)
+#define WIFI_DISCONNECT     _IO (WIFI_MAGIC, 2)
+#define WIFI_GET_STATUS     _IOR(WIFI_MAGIC, 3, enum wifi_state)
+#define WIFI_GET_RSSI       _IOR(WIFI_MAGIC, 4, char)
+
+enum wifi_state {
+    WIFI_DISCONNECTED,
+    WIFI_CONNECTING,
+    WIFI_CONNECTED
+};
+
+struct wifi_dev {
+    enum wifi_state state;
+    char ssid[33];
+    char rssi;
+};
+
+struct my_dev {
+    dev_t dev;
+    struct cdev cdev;
+    struct device *device;
+    struct class  *class;
+    struct mutex lock;
+    struct wifi_dev wifi_dev;
+};
+
+static struct my_dev s_dev;
+
+static int my_open(struct inode *inode, struct file *filp)
+{
+    filp->private_data = &s_dev;
+    return 0;
+}
+
+static long my_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    char ssid[32] = {0};
+    struct my_dev *dev = filp->private_data;
+    struct wifi_dev *wifi_dev = &dev->wifi_dev;
+
+    if (_IOC_TYPE(cmd) != WIFI_MAGIC) {
+        return -EINVAL;
+    }
+
+    mutex_lock(&dev->lock);
+    switch (cmd)
+    {
+        case WIFI_SET_SSID: {
+            // 从用户空间拷贝ssid到内核
+            if (copy_from_user(ssid, (void *)arg, 32)) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            memcpy(wifi_dev->ssid, ssid, 32);
+            wifi_dev->ssid[32] = 0;
+            break;
+        }
+            
+        case WIFI_CONNECT: {
+            if (wifi_dev->state == WIFI_CONNECTED) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;     // 已连接，无需重复操作
+            }
+            // 模拟连接过程（实际驱动会操作硬件，这里简化为延时）
+            wifi_dev->state = WIFI_CONNECTING;
+            msleep(1000);
+            wifi_dev->state = WIFI_CONNECTED;
+            wifi_dev->rssi = 70;    // 模拟信号强度
+            break;
+        }
+            
+        case WIFI_DISCONNECT: {
+            memset(wifi_dev->ssid, 0x00, sizeof(wifi_dev->ssid));
+            wifi_dev->state = WIFI_DISCONNECTED;
+            wifi_dev->rssi = 0;
+            break;
+        }
+
+        case WIFI_GET_STATUS: {
+            // 将WIFI状态拷贝到用户空间
+            if (copy_to_user((void *)arg, &wifi_dev->state, sizeof(wifi_dev->state))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            break;
+        }
+
+        case WIFI_GET_RSSI: {
+            if (copy_to_user((void *)arg, &wifi_dev->rssi, sizeof(wifi_dev->rssi))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            break;
+        }
+
+        default: {
+            mutex_unlock(&dev->lock);
+            return -EINVAL;
+        }  
+    }
+
+    mutex_unlock(&dev->lock);
+    return 0;
+}
+
+static int my_close(struct inode *inode, struct file *filp)
+{
+    return 0;
+}
+
+const struct file_operations cdev_fops = {
+    .owner          = THIS_MODULE,
+    .open           = my_open,
+    .unlocked_ioctl = my_ioctl,
+    .release        = my_close,
+};
+
+static int my_dev_init(void)
+{
+    alloc_chrdev_region(&s_dev.dev, 0, 1, DEVICE_NAME);
+    s_dev.class = class_create(THIS_MODULE, CLASS_NAME);
+    cdev_init(&s_dev.cdev, &cdev_fops);
+    s_dev.cdev.owner = THIS_MODULE;
+    cdev_add(&s_dev.cdev, s_dev.dev, 1);
+    s_dev.device = device_create(s_dev.class, NULL, s_dev.dev, NULL, DEVICE_NAME);
+    mutex_init(&s_dev.lock);
+
+    printk("driver init(major:%d minor:%d)\n", MAJOR(s_dev.dev), MINOR(s_dev.dev));
+    return 0;
+}
+
+static void my_dev_exit(void)
+{
+    device_destroy(s_dev.class, s_dev.dev);
+    cdev_del(&s_dev.cdev);
+    class_destroy(s_dev.class);
+    unregister_chrdev_region(s_dev.dev, 1);
+
+    printk("driver exit\n");
+}
+
+MODULE_LICENSE("GPL");
+
+module_init(my_dev_init);
+module_exit(my_dev_exit);
+```
+
+#### 12.6.2 测试程序
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+#include <fcntl.h> 
+
+#define WIFI_MAGIC  'w'
+
+#define WIFI_SET_SSID       _IOW(WIFI_MAGIC, 0, char[32])
+#define WIFI_CONNECT        _IO (WIFI_MAGIC, 1)
+#define WIFI_DISCONNECT     _IO (WIFI_MAGIC, 2)
+#define WIFI_GET_STATUS     _IOR(WIFI_MAGIC, 3, enum wifi_state)
+#define WIFI_GET_RSSI       _IOR(WIFI_MAGIC, 4, char)
+
+enum wifi_state {
+    WIFI_DISCONNECTED,
+    WIFI_CONNECTING,
+    WIFI_CONNECTED
+};
+
+struct wifi_dev {
+    enum wifi_state state;
+    char ssid[33];
+    char rssi;
+};
+
+int main(int argc, char *argv[])
+{
+    int fd;
+    char ssid[32] = "TestWiFi";
+    struct wifi_dev dev;
+
+    if (argc < 2) {
+        printf("Usage: ./app /dev/xxx param\n");
+        return -1;
+    }
+    fd = open(argv[1], O_RDWR);
+    if (fd < 0) {
+        printf("Open %s fail:%d\n", argv[1], fd);
+        return fd;
+    }
+
+    // 1. 设置ssid
+    if (ioctl(fd, WIFI_SET_SSID, ssid) < 0) {
+        printf("Failed to set SSID\n");
+        close(fd);
+        return -1;
+    }
+    printf("Set SSID to: %s\n", ssid);
+    // 2. 连接WiFi
+    if (ioctl(fd, WIFI_CONNECT) < 0) {
+        printf("Failed to connect\n");
+        close(fd);
+        return -1;
+    }
+    printf("Connecting to WiFi...\n");
+    // 3. 获取WiFi状态
+    if (ioctl(fd, WIFI_GET_STATUS, &dev.state) < 0) {
+        printf("Failed get status\n");
+        close(fd);
+        return -1;
+    }
+    printf("State: %s\n",
+        dev.state == WIFI_DISCONNECTED ? "Disconnected" :
+        dev.state == WIFI_CONNECTING ? "Connecting" : "Connected");
+    // 4. 获取Rssi
+    if (ioctl(fd, WIFI_GET_RSSI, &dev.rssi) < 0) {
+        printf("Failed get rssi\n");
+        close(fd);
+        return -1;
+    }
+    printf("Rssi: %d\n", dev.rssi);
+    // 5. 断开WiFi连接
+    if (ioctl(fd, WIFI_DISCONNECT) < 0) {
+        printf("Failed to disconnect\n");
+        close(fd);
+        return -1;
+    }
+    printf("Disconnecting from WiFi\n");
+
+    close(fd);
+    return 0;
+}
+```
+
+#### 12.6.3 测试结果
+
+![](./src/0027.jpg)
