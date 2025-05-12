@@ -4258,3 +4258,307 @@ int main(int argc, char *argv[])
 #### 12.6.3 测试结果
 
 ![](./src/0027.jpg)
+
+## 第13章 驱动优化
+
+在前面的`ioctl`实验中，我们实现了`unlocked_ioctl`方法。这是当时的代码：
+
+```c
+static long my_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    char ssid[32] = {0};
+    struct my_dev *dev = filp->private_data;
+    struct wifi_dev *wifi_dev = &dev->wifi_dev;
+
+    if (_IOC_TYPE(cmd) != WIFI_MAGIC) {
+        return -EINVAL;
+    }
+
+    mutex_lock(&dev->lock);
+    switch (cmd)
+    {
+        case WIFI_SET_SSID: {
+            // 从用户空间拷贝ssid到内核
+            if (copy_from_user(ssid, (void *)arg, 32)) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            memcpy(wifi_dev->ssid, ssid, 32);
+            wifi_dev->ssid[32] = 0;
+            break;
+        }
+            
+        case WIFI_CONNECT: {
+            if (wifi_dev->state == WIFI_CONNECTED) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;     // 已连接，无需重复操作
+            }
+            // 模拟连接过程（实际驱动会操作硬件，这里简化为延时）
+            wifi_dev->state = WIFI_CONNECTING;
+            msleep(1000);
+            wifi_dev->state = WIFI_CONNECTED;
+            wifi_dev->rssi = 70;    // 模拟信号强度
+            break;
+        }
+            
+        case WIFI_DISCONNECT: {
+            memset(wifi_dev->ssid, 0x00, sizeof(wifi_dev->ssid));
+            wifi_dev->state = WIFI_DISCONNECTED;
+            wifi_dev->rssi = 0;
+            break;
+        }
+
+        case WIFI_GET_STATUS: {
+            // 将WIFI状态拷贝到用户空间
+            if (copy_to_user((void *)arg, &wifi_dev->state, sizeof(wifi_dev->state))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            break;
+        }
+
+        case WIFI_GET_RSSI: {
+            if (copy_to_user((void *)arg, &wifi_dev->rssi, sizeof(wifi_dev->rssi))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            break;
+        }
+
+        default: {
+            mutex_unlock(&dev->lock);
+            return -EINVAL;
+        }  
+    }
+
+    mutex_unlock(&dev->lock);
+    return 0;
+}
+```
+
+### 13.1 优化一：`ioctl`命令检测
+
+应用程序设置的`ioctl`命令，是由宏定义`_IOR、_IOW`合成的。因此，可以在驱动中对传入的命令分解，进行检测。从而判断输入的参数是否合法。
+
+```c
+#define WIFI_MAGIC  'w'
+
+static long my_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    char ssid[32] = {0};
+    struct my_dev *dev = filp->private_data;
+    struct wifi_dev *wifi_dev = &dev->wifi_dev;
+
+    if (_IOC_TYPE(cmd) != WIFI_MAGIC) {
+        return -EINVAL;
+    }
+}
+```
+
+### 13.2 优化二：`access_ok`内存检查
+
+Linux内核中的`access_ok`函数用于验证用户空间指针的有效性，确保内核不会意外访问非法内存区域。
+
+#### 13.2.1 函数原型
+
+```c
+int access_ok(int type, const void __user *addr, unsigned long size);
+```
+
++ 参数
+
+    1. `type`：指定访问类型，需传递`VERIFY_READ`或`VERIFY_WRITE`，用于区分读写操作
+        + `VERIFY_READ`：检查用户空间地址是否允许读操作
+        + `VERIFY_WRITE`：检查用户空间地址是否允许写操作（隐含同时允许读取）
+    2. `addr`：待检查的用户空间指针
+    3. `size`：需访问的内存区域大小
+
++ 返回值
+
+    1. 非零（1）：地址合法
+    2. 零（0）：地址非法
+
+#### 13.2.2 功能与作用
+
++ 地址范围验证：检查用户空间指针`addr`及其后的`size`字节否否位于合法的用户空间范围内，避免内核访问空格空间的地址或越界
++ 安全访问：防止因用户传递非法种子很导致的内核崩溃或安全漏洞
++ 轻量级检查：仅验证地址范围是否有效，不检查物理内存是否存在（如页面是否分配）。实际的内存访问（如缺页处理）由函数`copy_from_user`来完成
+
+#### 13.2.2 适用场景
+
+内核模块设备驱动，在驱动程序的`read()`、`write()`、`ioctl()`方法中，验证用户传入的缓冲区地址
+
+*部分内核版本的拷贝函数，如`copy_to_user`内部可能已经集成了`access_ok`，但显式调用仍然是良好实践。*
+
+```c
+static long my_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    char ssid[32] = {0};
+    struct my_dev *dev = filp->private_data;
+    struct wifi_dev *wifi_dev = &dev->wifi_dev;
+
+    if (_IOC_TYPE(cmd) != WIFI_MAGIC) {
+        return -EINVAL;
+    }
+
+    mutex_lock(&dev->lock);
+    switch (cmd)
+    {
+        case WIFI_SET_SSID: {
+            // 从用户空间拷贝ssid到内核
+            if (!access_ok(VERIFY_READ, arg, 32)) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            if (copy_from_user(ssid, (void *)arg, 32)) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            memcpy(wifi_dev->ssid, ssid, 32);
+            wifi_dev->ssid[32] = 0;
+            break;
+        }
+            
+        case WIFI_CONNECT: {
+            if (wifi_dev->state == WIFI_CONNECTED) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;     // 已连接，无需重复操作
+            }
+            // 模拟连接过程（实际驱动会操作硬件，这里简化为延时）
+            wifi_dev->state = WIFI_CONNECTING;
+            msleep(1000);
+            wifi_dev->state = WIFI_CONNECTED;
+            wifi_dev->rssi = 70;    // 模拟信号强度
+            break;
+        }
+
+        case WIFI_GET_STATUS: {
+            // 将WIFI状态拷贝到用户空间
+            if (!access_ok(VERIFY_WRITE, arg, sizeof(wifi_dev->state))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            if (copy_to_user((void *)arg, &wifi_dev->state, sizeof(wifi_dev->state))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            break;
+        }
+
+        default: {
+            mutex_unlock(&dev->lock);
+            return -EINVAL;
+        }  
+    }
+
+    mutex_unlock(&dev->lock);
+    return 0;
+}
+```
+
+### 13.2 优化三：`likely`分支预测
+
+在Linux内核驱动开发中，使用`likely()`和`ulikely()`宏的主要目的是，通过分支预测提示代码执行路径，减少因分支预测失败导致的流水线刷新。
+
+#### 13.2.1 性能提升的原理
+
+分支预测优化：`likely()`和`unlikely()`会通过GCC内置函数`__builtin_expect`向编译器提示条件成立的概率
+
+1. `likely(condition)`：表示条件更可能成立，编译器会将条件为真的代码路径紧接在条件判断之后，减少跳转指令的开销
+2. `unlikely(condition)`：表示条件更可能不成立，常用于错误处理等次要路径
+
+#### 13.2.2 性能提升的幅度
+
++ 高频调用的代码路径：在频繁执行的关键路径（网络驱动、中断、高速IO）中，分支预测优化可能带来1~5%的性能提升
++ 低频或不可预测分支：对不常执行的代码（如错误处理），优化效果微乎其微
++ 错误预测的代价：如果开发者错误标记分支，可能导致性能下降
+
+#### 13.2.3 使用注意事项
+
+避免滥用：
+
++ 仅在高频且分支偏向性明显的代码中使用（如主循环、中断处理）
++ 若分支概率接近50%，使用`likely()/unlikely()`无效甚至有害
++ 启动`-O2`或`-O3`优化级别，编译器可能自动推断分支概率
+
+#### 13.2.4 代码实践
+
+对于我们设备驱动开发而言，`likely()/unlikely()`的典型适用场景：
+
+1. 多线程并发场景下，锁的获取通常偏向于成功，使用`likely()`优化锁的主路径
+
+```c
+if (likely(mutex_trylock(&dev->lock))) {
+    // 正常操作
+    mutex_unlock(&dev->lock);
+} else {
+    handle_contention(); // 锁竞争概率低
+}
+```
+
+2. 内存拷贝函数`copy_to_user`，通常不会失败，使用`unlikely()`优化错误路径
+
+```c
+static long my_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    char ssid[32] = {0};
+    struct my_dev *dev = filp->private_data;
+    struct wifi_dev *wifi_dev = &dev->wifi_dev;
+
+    if (_IOC_TYPE(cmd) != WIFI_MAGIC) {
+        return -EINVAL;
+    }
+
+    mutex_lock(&dev->lock);
+    switch (cmd)
+    {
+        case WIFI_SET_SSID: {
+            // 从用户空间拷贝ssid到内核
+            if (!access_ok(VERIFY_READ, arg, 32)) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            if (unlikely(copy_from_user(ssid, (void *)arg, 32))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            memcpy(wifi_dev->ssid, ssid, 32);
+            wifi_dev->ssid[32] = 0;
+            break;
+        }
+            
+        case WIFI_GET_STATUS: {
+            // 将WIFI状态拷贝到用户空间
+            if (!access_ok(VERIFY_WRITE, arg, sizeof(wifi_dev->state))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            if (unlikely(copy_to_user((void *)arg, &wifi_dev->state, sizeof(wifi_dev->state)))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            break;
+        }
+
+        case WIFI_GET_RSSI: {
+            if (!access_ok(VERIFY_WRITE, arg, sizeof(wifi_dev->rssi))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            if (unlikely(copy_to_user((void *)arg, &wifi_dev->rssi, sizeof(wifi_dev->rssi)))) {
+                mutex_unlock(&dev->lock);
+                return -EINVAL;
+            }
+            break;
+        }
+
+        default: {
+            mutex_unlock(&dev->lock);
+            return -EINVAL;
+        }  
+    }
+
+    mutex_unlock(&dev->lock);
+    return 0;
+}
+```
