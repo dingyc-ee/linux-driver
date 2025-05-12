@@ -4562,3 +4562,92 @@ static long my_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
     return 0;
 }
 ```
+
+## 第14章 驱动调试方法
+
+在之前编写的驱动程序中，都是使用`printk`打印相应的提示信息，对驱动进行调试。本章我们介绍其他的调试方法。
+
+### 14.1 `dump_stack`函数
+
+```c
+void dump_stack(void);
+```
+
+作用：打印内核调用堆栈，并打印函数的调用关系。
+
+我们在设备驱动的`open`方法中，加入`dump_stack()`打印。测试结果如下：
+
+```c
+static int my_open(struct inode *inode, struct file *filp)
+{
+    dump_stack();
+    filp->private_data = &s_dev;
+    return 0;
+}
+```
+
+![](./src/0028.jpg)
+
+### 14.2 `WARN_ON(condition)`函数
+
+功能：若`condition`条件为真，触发内核警告`WARNING`，打印堆栈跟踪信息，但不终止代码执行。
+
+使用场景：
+
++ 非致命性错误检查：如参数合法性检查、状态一致性验证
++ 记录偶发问题：用于调试难以复现的异常条件
+
+```c
+int my_driver_write(struct file *file, const char __user *buf, size_t count) {
+    if (WARN_ON(count > MAX_BUFFER_SIZE)) {
+        return -EINVAL;  // 继续执行，但记录警告
+    }
+    // 正常处理...
+}
+```
+
+### 14.3 `BUG_ON(condition)`函数
+
+功能：条件触发内核异常：若`condition`为真，强制引发内核异常，终止当前代码执行。表示遇到了不可恢复的内核级错误。
+
+适用场景：
+
++ 严重逻辑错误：如检测到空指针解引用，内存越界等致命问题
++ 断言关键条件：确保内核状态符合预期
+
+```c
+void my_driver_ioctl(struct file *file, unsigned int cmd, unsigned long arg) {
+    struct device_data *data = file->private_data;
+    BUG_ON(!data);  // 若data为NULL，触发Oops
+    // 正常处理...
+}
+```
+
+### 14.4 `panic(const char *fmt, ...)`
+
+功能：
+
++ 强制内核崩溃：立即终止系统运行，输出错误信息并触发内核恐慌`panic`
++ 用于不可恢复错误：当系统无法安全继续运行时调用（如关键数据结构损坏）
+
+适用场景：
+
++ 全局性致命错误：如内存管理严重错误、根文件系统挂载失败
++ 主动终止系统：在驱动中检测到硬件不可恢复故障时调用
+
+```c
+void my_driver_probe(struct pci_dev *pdev) {
+    if (!pci_enable_device(pdev)) {
+        panic("Failed to enable PCI device %04x:%04x\n", 
+              pdev->vendor, pdev->device);  // 终止系统
+    }
+```
+
+### 14.5 总结
+
+| 方法 | 触发条件 | 系统行为 | 适用场景 |
+| - | - | - | - |
+| `dump_stack()` | 无条件 | 打印调用栈 | 分析执行路径或异常上下文 |
+| `WARN_ON(condition)` | 条件为真 | 打印警告，继续运行 | 非致命性错误检查 |
+| `BUG_ON(condition)` | 条件为真 | 终止进程 | 严重但局部性错误 |
+| `WARN_ON(condition)` | 显式调用 | 内核崩溃，系统停止 | 全局不可恢复错误 |
