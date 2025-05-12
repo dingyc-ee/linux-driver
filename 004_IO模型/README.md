@@ -4650,4 +4650,4 @@ void my_driver_probe(struct pci_dev *pdev) {
 | `dump_stack()` | 无条件 | 打印调用栈 | 分析执行路径或异常上下文 |
 | `WARN_ON(condition)` | 条件为真 | 打印警告，继续运行 | 非致命性错误检查 |
 | `BUG_ON(condition)` | 条件为真 | 终止进程 | 严重但局部性错误 |
-| `WARN_ON(condition)` | 显式调用 | 内核崩溃，系统停止 | 全局不可恢复错误 |
+| `panic()` | 显式调用 | 内核崩溃，系统停止 | 全局不可恢复错误 |
