@@ -79,4 +79,232 @@ ARM Linux为何必须使用GIC？
 + NVIC是为资源受限的单片机设计，适合实时操作系统（`FreeRTOS`）
 + 高性能多和系统设计的，是Linux在Cortex-A平台上的唯一选择。两者服务于不同的生态位，不可互换。
 
+## 第2章 `GIC`与`CPU核心`
 
+在ARM Linux SoC中，GIC（`Generic Interrupt Controller`）通常是集成在CPU核外部的独立模块，但与CPU核紧密集成在同一芯片上。外设的中断信号线会直接连到GIC，而非直接连到CPU核。
+
+### 2.1 典型SoC架构图
+
+```
++-------------------+       +-------------------+
+|      CPU Core      |       |      CPU Core      |
+| (Cortex-A7/A53/A76)|       | (Cortex-A7/A53/A76)|
++---------+---------+       +---------+---------+
+          |                           |
+          |         +-------+         |
+          +-------->|       |<--------+
+                    |  GIC  |
+                    |       |<--- [外设中断信号线]
+                    +-------+
+                      ^  |  ^
+                      |  |  |
+                      |  |  +--- 其他外设（如 GPU、NPU）
+                      |  |
+          +-----------+--+-----------+
+          |           |              |
+      [UART]       [GPIO]         [Ethernet]...
+```
+
+### 2.2 GIC的位置
+
++ 外部模块：GIC是SoC中断一个独立硬件组件，与CPU分离，不直接嵌入CPU内部。通过片上总线（AMBA/AXI）与CPU核紧密相连
++ 多核支持：GIC通常设计为支持多核架构，可集中管理多个CPU核的中断分发（例如分配中断到不同核心、设置优先级）
+
+### 2.3 外设中断的连接方式
+
++ 中断信号接入GIC：所有外设（如 UART、GPIO、以太网控制器等）的中断请求线（IRQ）直接连接到 GIC 的输入端
++ GIC 的中断路由：
+    + GIC的`Distributor`模块接收外设中断，根据优先级、目标 CPU 核配置（如亲和性）将中断分发给特定CPU核
+    + CPU 核通过 CPU Interface 模块与 GIC 交互，接收中断信号（如 IRQ/FIQ）
+
+### 2.4 与传统架构的区别
+
++ 传统中断控制器：在早期ARM架构（如ARM7/ARM9）中，外设中断可能直接连接到CPU核的专用中断引脚（如IRQ/FIQ），此时中断控制器可能集成在CPU核内部
++ 现在多核场景：GIC的出现是为了支持多核SoC核复杂中断管理（如负载均衡），因此必须作为独立模块存在
+
+### 2.5 Linux内核的视角
+
++ 设备树配置：在设备树中，外设的中断属性会指定其连接的GIC和中断号（如`<interrupt-parent = <&gic>>`）
++ 中断处理流程：
+    1. 外设触发中断，GIC接收并标记为挂起状态
+    2. GIC根据优先级和目标核配置，向对应CPU发出中断信号
+    3. CPU核通过读取`GICC_IAR`寄存器确认中断，执行中断服务程序（ISR）
+    4. ISR完成后，CPU写入`GICC_EOIR`寄存器通知GIC结束中断
+
+### 2.6 GIC的`Distributor`与`CPU Interface`
+
+```
++---------------------+      +---------------------+
+|    Peripheral 1     |      |    Peripheral N     |
+| (SPI: UART/GPIO...) |      | (SPI: Ethernet...)  |
++----------+----------+      +----------+----------+
+           | SPI                        | SPI
+           v                            v
+    +------+----------------------------+------+
+    |              GIC Distributor               |
+    | (全局中断管理：优先级仲裁、目标核分配、使能控制) |
+    +------+----------------------------+------+
+           | IRQ_OUT[0] ... IRQ_OUT[M]  |      | PPI/SGI (来自CPU核私有外设)
+           v                            v      v
+    +------+--------+            +------+--------+     +-----------------+
+    | CPU Interface 0 |          | CPU Interface M |<----| SGI (核间中断)  |
+    | (Core 0 专属)    |          | (Core M 专属)    |     | (软件触发，如IPI)|
+    +------+--------+            +------+--------+     +-----------------+
+           | IRQ/FIQ                  | IRQ/FIQ
+           v                            v
+    +------+--------+            +------+--------+
+    |   CPU Core 0   |            |   CPU Core M   |
+    | (Cortex-A系列核) |            | (Cortex-A系列核) |
+    +---------------+            +---------------+
+```
+
+#### 2.6.1 关键模块与连接说明
+
+1. 外设（`Peripheral`）
+
+    + 所有外设的中断信号（SPI）直接连到`GIC Distributor`
+    + 示例外设：UART、GPIO、以太网控制器
+
+2. `GIC Distributor`
+
+    + 功能：
+        + 接收所有外设的中断请求（SPI）
+        + 管理中断优先级、使能状态、目标CPU核分配（亲和性）
+        + 将中断路由到对应的`CPU Interface`
+
+    + 关键信号：
+        + `SPI[0-N]`：外设中断输入线
+        + `IRQ OUT[0-M]`：路由到各CPU核的中断信号线
+
+3. `CPU Interface`
+
+    + 功能：
+        + 每个CPU核对应一个独立的`CPU Interface`
+        + 将`Distributor`路由的中断，转换为CPU核的IRQ信号
+        + 处理CPU核的中断确认（`GICC_IAR`）和中断结束（`GICC_EOIR`）操作
+
+    + 关键信号：
+        + `IRQ/FIQ`：连接到CPU核的中断引脚
+        + `PPI`：每个CPU核的私有中断
+        + `SGI`：核间中断，由软件触发
+
+4. `CPU`
+
+    + 通过`IRQ/FIQ`引脚接收中断信号
+    + 通过AMBA 总线（AXI/AHB）与GIC寄存器交互，完成中断处理流程
+
+#### 2.6.2 详细信号流
+
+1. 外设触发中断
+    + 外设产生中断后，通过SPI信号线发送给`Distributor`
+
+2. `Distributor`路由中断
+    + `Distributor`根据优先级核目标CPU核配置，选择中断路由路径
+    + 将中断通过`IRQ_OUT`信号线发送到目标`CPU Interface`
+
+3. `CPU Interface`转发中断
+    + `CPU Interface`将中断转换为IRQ或FIQ信号，触发CPU核进入中断处理模式
+
+4. CPU 核处理中断
+    + CPU 核读取`GICC_IAR`获取中断ID，执行中断服务程序（ISR）
+    + ISR 完成后，写入`GICC_EOIR`通知GIC结束中断
+
+**SPI信号流**
+
+```
+外设（SPI）--> GIC Distributor --> IRQ_OUT[0:M] --> CPU Interface --> IRQ/FIQ --> CPU 核
+```
+
+**PPI信号流**
+
+```
+CPU 核私有外设（PPI）--> CPU Interface --> IRQ/FIQ --> 同一 CPU 核
+```
+
+**SGI信号流**
+
+```
+CPU 核 A 写寄存器触发 SGI --> GIC Distributor --> IRQ_OUT[X] --> CPU Interface B --> IRQ --> CPU 核 B
+```
+
+## 2.7 `GICv2`状态机
+
+下图是GICv2中断处理状态机，主要描述了中断从触发到完成的完整生命周期，涵盖`Distributor`和`CPU Interface`的协作流程。
+
+```
+    +-------------------+
+    |      Idle         | <------------------+
+    +-------------------+                    |
+            |                             |
+            | 外设触发中断                 |
+            | (Distributor检测到中断)       |
+            v                             |
+    +-------------------+                    |
+    |     Pending       |                    |
+    +-------------------+                    |
+            |                             |
+            | Distributor仲裁并路由中断     |
+            | (优先级、目标核亲和性)         |
+            v                             |
+    +-------------------+                    |
+    |    Active         |--------------------+
+    +-------------------+                    |
+            |                             |
+            | CPU核响应中断                 |
+            | (读GICC_IAR获取中断ID)        |
+            v                             |
+    +-------------------+                    |
+    | Active & Pending  |                    |
+    +-------------------+                    |
+            |                             |
+            | 中断处理完成                 |
+            | (写GICC_EOIR结束中断)        |
+            v                             |
+    +-------------------+                    |
+    |     Idle         |--------------------+
+    +-------------------+
+```
+
+### 2.7.1 状态机详细说明
+
+1. `IDLE`（空闲状态）
+    + 触发条件：
+        + 初始状态，无中断挂起或处理中
+        + 中断处理完成（CPU核写入`GICC_EOIR`）后返回此状态
+    + 行为：
+        + `Distributor`和`CPU Interface`等待新中断触发
+
+2. `Pending`（挂起状态）
+    + 触发条件：
+        + 外设触发中断（SPI、PPI、SGI），`Distributor`检测到中断并标记为挂起
+    + 行为：
+        + `Distributor`更新中断状态寄存器`GICD_ISPENDRn`，标记中断为`Pending`
+        + 若中断已使能（`GICD_ISENABLERn`置位），且优先级高于当前活动中断，进入仲裁流程
+        ![](./src/0001.jpg)
+        ![](./src/0002.jpg)
+    + 关键操作：
+        + 中断优先级仲裁，选择目标CPU核（通过`GICD_ITARGETSRn`配置亲和性）
+
+3. `Active`活动状态
+    + 触发条件：
+        + `Distributor`完成仲裁，将中断路由到目标CPU核的`CPU Interface`
+    + 行为：
+        + `Distributor`将中断状态标记为`Active`（`GICD_ISACTIVERn`置位）
+        + `CPU Interface`向目标CPU核发送IRQ或FIQ信号        
+    + 关键操作：
+        + CPU核响应中断，读取`GICC_IAR`寄存器获取中断ID，状态转换为`Active & Pending`
+        ![](./src/0003.jpg)
+
+4. `Active & Pending`活动并挂起状态
+    + 触发条件：
+        + 在 Active 状态下，同一中断源再次触发中断（例如高优先级中断抢占）
+        + 中断处理过程中，新中断到达并被仲裁为更高优先级
+    + 行为：
+        + `Distributor`标记中断为`Active & Pending`（`GICD_ISPENDRn`和`GICD_ISACTIVERn`同时置位）
+        + CPU 核可能暂停当前低优先级中断，处理高优先级中断（抢占机制）
+    + 关键操作：
+        + 若发生抢占，当前中断状态保持`Active`，新中断进入`Pending`队列
+
+    典型使用场景：
+
+    ![](./src/0004.jpg)
