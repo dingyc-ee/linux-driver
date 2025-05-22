@@ -308,3 +308,142 @@ CPU 核 A 写寄存器触发 SGI --> GIC Distributor --> IRQ_OUT[X] --> CPU Inte
     典型使用场景：
 
     ![](./src/0004.jpg)
+
+## 第3章 `imx6ull`芯片的GIC控制器
+
+### 3.1 中断ID分类
+
+前一章介绍`GICC_IAR`寄存器时，`bit [0~9]`表示`Interrupt ID`，也就是说最多支持`2^10=1024`个中断ID。按范围核用途分成三类：
+
+| 中断类型 | 中断ID范围 | 说明 |
+| - | - | - |
+| SGI | 0-15 | Software Gennerated Interrupts（软件生成中断），用于核间通信 |
+| PPI | 16-31 | Private Peripheral Interrupts（私有外设中断），每个CPU核心独享的中断 |
+| SPI | 32-1019 | Shared Peripheral Interrupts（共享外设中断），全局外设中断，可路由到任意核心 |
+
+ID 1020-1023：保留给GIC内部使用。保留中断ID的特殊用途：
+
++ ID 1023：虚拟化扩展中的维护中断
++ ID 1020-1022：可能用于调试或未来扩展
+
+### 3.2 `imx6ull`的芯片中断
+
+`imx6ull`芯片支持128个外设SPI中断。
+
+![](./src/0005.jpg)
+
+### 3.3 `Distributor`寄存器描述
+
+`GICv2 Distributor`是中断控制的核心模块，负责全局中断管理，如优先级仲裁、目标核分配、中断使能。
+
+#### 3.3.1 `GICD_CTRL (Distributor Control Register)`
+
++ 功能：全局控制`Distributor`的行为
++ 位域：
+    + Bit 0(Enable)：置1使能`Distributor`
+    + 示例：
+    ```c
+    // 使能 Distributor
+    *((volatile uint32_t*)GICD_CTRL) |= 0x1;
+    ```
+
+#### 3.3.2 `GICD_TYPER (Distributor Type Register)`
+
++ 功能：描述`Distributor`的硬件实现特性（只读）
++ 位域：
+    + Bits 4:0 (ITLinesNumber): 支持的SPI中断数量
+    + Bit 10 (CPUNumber): 支持的 CPU 接口数量
+
+#### 3.3.3 中断使能与禁用`GICD_ISENABLERn / GICD_ICENABLERn (Interrupt Set/Clear Enable Registers)`
+
++ 功能：使能或禁用特定中断
++ 地址计算：每个寄存器控制32个中断，偏移由中断号决定
+```c
+reg_offset = 0x100 + (interrupt_id / 32) * 4;  // ISENABLERn
+reg_offset = 0x180 + (interrupt_id / 32) * 4;  // ICENABLERn
+```
++ 位操作：写1到某一位使能/禁用对应中断
+```c
+// 使能中断号 50（SPI）
+uint32_t reg = GICD_ISENABLERn + (50 / 32) * 4;
+*((volatile uint32_t*)reg) |= (1 << (50 % 32));
+```
+
+#### 3.3.4 中断优先级配置`GICD_IPRIORITYRn (Interrupt Priority Registers)`
+
++ 功能：设置每个中断的优先级（8位/中断），0–255，值越小优先级越高
++ 优先级值：数值越小优先级越高（0为最高，255为最低）
+
+#### 3.3.5 中断目标CPU配置`GICD_ITARGETSRn (Interrupt Target CPU Registers)` 
+
++ 功能：指定SPI中断的路由目标CPU（每个中断占8位，每个bit对应一个CPU，如bit0=CPU0）
++ 示例：将中断ID 32路由到CPU0和CPU1
+```c
+uint32_t reg_offset = 0x800 + (32 / 4) * 4;
+write32(GICD_BASE + reg_offset, 0x3 << (8 * (32 % 4))); // 0x3 = CPU0 | CPU1
+```
+
+#### 3.3.6 中断触发类型配置`GICD_ICFGRn (Interrupt Configuration Registers)`
+
++ 功能：配置中断触发方式（电平触发或边沿触发）
++ 地址计算：每个寄存器控制 16 个中断（每个中断占用 2 位）
++ 功能: 配置中断触发类型
+    + 00：保留
+    + 01：边沿触发
+    + 10：保留
+    + 11：电平触发
++ 示例：配置中断号 50 为边沿触发
+```c
+uint32_t reg = GICD_ICFGRn + (50 / 16) * 4;
+uint32_t shift = (50 % 16) * 2;
+*((volatile uint32_t*)reg) = (*((volatile uint32_t*)reg) & ~(0x3 << shift)) | (0x3 << shift);
+```
+
+### 3.4 `CPU Interface`寄存器描述
+
+#### 3.4.1 `GICC_CTLR (CPU Interface Control Register)`
+
++ 功能：控制`CPU Interface`的全局行为
++ 位域：
+    + Bit 0 (Enable): 置1使能`CPU Interface`（必须使能才能接收中断）
+    + Bit 1 (FIQEn): 置1允许`FIQ`中断（否则所有中断通过`IRQ`触发）
++ 示例：使能`CPU Interface`并允许FIQ
+```c
+*((volatile uint32_t*)GICC_CTLR) |= (1 << 0) | (1 << 1);
+```
+
+#### 3.4.2 `GICC_BPR (Binary Point Register)`
+
++ 功能：设置优先级分组点，决定抢占级别和子优先级
++ 位域：二进制点值（0~7），将优先级字段分为两部分
+    + 抢占级别（Group）：高位部分，用于中断抢占决策
+    + 子优先级（Subpriority）：低位部分，仅在同组内排序
++ 示例：设置优先级分组点为 3（抢占级别占高4位，子优先级占低4位）
+```c
+// 设置优先级分组点为 3（抢占级别占高4位，子优先级占低4位）
+*((volatile uint32_t*)GICC_BPR) = 2;  // BPR=2 → 分组点=3
+```
+
+#### 3.4.3 `GICC_IAR (Interrupt Acknowledge Register)`
+
++ 功能：CPU核读取此寄存器以获取当前中断ID，并标记中断为活动状态
++ 返回值：
+    + Bits 9:0 (Interrupt ID): 中断编号（0~1023）
+    + Bits 12:10 (CPU ID): 发送 SGI 的源 CPU 核编号（仅对 SGI 有效）
++ 操作：读取后，GIC将中断状态从`Pending`转为`Active`
++ 示例：读取当前中断ID
+```c
+// 读取当前中断 ID
+uint32_t iar = *((volatile uint32_t*)GICC_IAR);
+uint32_t int_id = iar & 0x3FF;  // 提取中断 ID
+```
+
+#### 3.4.4 `GICC_EOIR (End of Interrupt Register)`
+
++ 功能：CPU核写入中断ID，通知GIC中断处理完成，清除活动状态
++ 注意事项：写入的ID必须与之前`GICC_IAR`读取的值一致
++ 示例：结束中断处理（假设 int_id 为之前读取的中断 ID）
+```c
+// 结束中断处理（假设 int_id 为之前读取的中断 ID）
+*((volatile uint32_t*)GICC_EOIR) = int_id;
+```
