@@ -43,7 +43,7 @@ NVIC只能适用于单核CPU。
 #### 1.3.1 GIC的细分中断类型
 
 | 中断类型 | 功能 | Linux应用场景 |
-| - | - |
+| - | - | - |
 | SPI | 共享外设中断（如网卡、磁盘） | 多核共享外设的中断处理 |
 | PPI | CPU私有中断（如本地定时器） | 每核独立的时钟中断 |
 | SGI | 软件生成中断（核间通信）） | 多核任务调度 |
@@ -309,141 +309,327 @@ CPU 核 A 写寄存器触发 SGI --> GIC Distributor --> IRQ_OUT[X] --> CPU Inte
 
     ![](./src/0004.jpg)
 
-## 第3章 `imx6ull`芯片的GIC控制器
+## 第3章 `imx6ull`的GIC编程
 
-### 3.1 中断ID分类
+在前面的章节，我们介绍了`GIC`的原理，感觉还是比较抽象，编程有点无从下手。有没有例程可以参考呢？
 
-前一章介绍`GICC_IAR`寄存器时，`bit [0~9]`表示`Interrupt ID`，也就是说最多支持`2^10=1024`个中断ID。按范围核用途分成三类：
+*有的，NXP官方提供了SDK。事实上，官方SDK提供了对外设操作的所有代码，我们拥有丰富的资料可以参考。*
 
-| 中断类型 | 中断ID范围 | 说明 |
-| - | - | - |
-| SGI | 0-15 | Software Gennerated Interrupts（软件生成中断），用于核间通信 |
-| PPI | 16-31 | Private Peripheral Interrupts（私有外设中断），每个CPU核心独享的中断 |
-| SPI | 32-1019 | Shared Peripheral Interrupts（共享外设中断），全局外设中断，可路由到任意核心 |
+### 3.1 官方SDK的中断操作
 
-ID 1020-1023：保留给GIC内部使用。保留中断ID的特殊用途：
+以最简单的GPIO中断为例，看看官方SDK是怎么写的。
 
-+ ID 1023：虚拟化扩展中的维护中断
-+ ID 1020-1022：可能用于调试或未来扩展
+#### 3.1.1 启动文件`startup_MCIMX6Y2.S`
 
-### 3.2 `imx6ull`的芯片中断
+启动文件`startup_MCIMX6Y2.S`，设置完栈指针后（C语言环境准备好了），就调用了`SystemInit`函数。
 
-`imx6ull`芯片支持128个外设SPI中断。
+```S
+/* Reset Handler */
 
-![](./src/0005.jpg)
+Reset_Handler:
+    cpsid   i               /* Mask interrupts */
 
-### 3.3 `Distributor`寄存器描述
+    /* Reset SCTlr Settings */
+    mrc     p15, 0, r0, c1, c0, 0     /* Read CP15 System Control register                  */
+    bic     r0,  r0, #(0x1 << 12)     /* Clear I bit 12 to disable I Cache                  */
+    bic     r0,  r0, #(0x1 <<  2)     /* Clear C bit  2 to disable D Cache                  */
+    bic     r0,  r0, #0x2             /* Clear A bit  1 to disable strict alignment         */
+    bic     r0,  r0, #(0x1 << 11)     /* Clear Z bit 11 to disable branch prediction        */
+    bic     r0,  r0, #0x1             /* Clear M bit  0 to disable MMU                      */
+    mcr     p15, 0, r0, c1, c0, 0     /* Write value back to CP15 System Control register   */
 
-`GICv2 Distributor`是中断控制的核心模块，负责全局中断管理，如优先级仲裁、目标核分配、中断使能。
+    /* Set up stack for IRQ, System/User and Supervisor Modes */
+    cps     #0x12                /* Enter IRQ mode                */
+    ldr     sp, =__IStackTop     /* Set up IRQ handler stack      */
 
-#### 3.3.1 `GICD_CTRL (Distributor Control Register)`
+    cps     #0x1F                /* Enter System mode             */
+    ldr     sp, =__CStackTop     /* Set up System/User Mode stack */
 
-+ 功能：全局控制`Distributor`的行为
-+ 位域：
-    + Bit 0(Enable)：置1使能`Distributor`
-    + 示例：
-    ```c
-    // 使能 Distributor
-    *((volatile uint32_t*)GICD_CTRL) |= 0x1;
-    ```
+    cps     #0x13                /* Enter Supervisor mode         */
+    ldr     sp, =__CStackTop     /* Set up Supervisor Mode stack  */
 
-#### 3.3.2 `GICD_TYPER (Distributor Type Register)`
+    ldr     r0,=SystemInit
+    blx     r0
 
-+ 功能：描述`Distributor`的硬件实现特性（只读）
-+ 位域：
-    + Bits 4:0 (ITLinesNumber): 支持的SPI中断数量
-    + Bit 10 (CPUNumber): 支持的 CPU 接口数量
-
-#### 3.3.3 中断使能与禁用`GICD_ISENABLERn / GICD_ICENABLERn (Interrupt Set/Clear Enable Registers)`
-
-+ 功能：使能或禁用特定中断
-+ 地址计算：每个寄存器控制32个中断，偏移由中断号决定
-```c
-reg_offset = 0x100 + (interrupt_id / 32) * 4;  // ISENABLERn
-reg_offset = 0x180 + (interrupt_id / 32) * 4;  // ICENABLERn
-```
-+ 位操作：写1到某一位使能/禁用对应中断
-```c
-// 使能中断号 50（SPI）
-uint32_t reg = GICD_ISENABLERn + (50 / 32) * 4;
-*((volatile uint32_t*)reg) |= (1 << (50 % 32));
+    cpsie   i                    /* Unmask interrupts             */
 ```
 
-#### 3.3.4 中断优先级配置`GICD_IPRIORITYRn (Interrupt Priority Registers)`
+#### 3.1.2 系统初始化函数`SystemInit`
 
-+ 功能：设置每个中断的优先级（8位/中断），0–255，值越小优先级越高
-+ 优先级值：数值越小优先级越高（0为最高，255为最低）
+`SystemInit`函数调用了`GIC_Init`函数，用来初始化GIC控制器。
 
-#### 3.3.5 中断目标CPU配置`GICD_ITARGETSRn (Interrupt Target CPU Registers)` 
-
-+ 功能：指定SPI中断的路由目标CPU（每个中断占8位，每个bit对应一个CPU，如bit0=CPU0）
-+ 示例：将中断ID 32路由到CPU0和CPU1
 ```c
-uint32_t reg_offset = 0x800 + (32 / 4) * 4;
-write32(GICD_BASE + reg_offset, 0x3 << (8 * (32 % 4))); // 0x3 = CPU0 | CPU1
+void SystemInit (void)
+{
+  uint32_t sctlr;
+  uint32_t actlr;
+
+  L1C_InvalidateInstructionCacheAll();
+  L1C_InvalidateDataCacheAll();
+
+  sctlr = __get_SCTLR();
+  sctlr = (sctlr & ~(SCTLR_V_Msk       | /* Use low vector */
+                     SCTLR_A_Msk       | /* Disable alignment fault checking */
+                     SCTLR_M_Msk))       /* Disable MMU */
+                 |  (SCTLR_I_Msk       | /* Enable ICache */
+                     SCTLR_Z_Msk       | /* Enable Prediction */
+                     SCTLR_CP15BEN_Msk | /* Enable CP15 barrier operations */
+                     SCTLR_C_Msk);       /* Enable DCache */
+  __set_SCTLR(sctlr);
+
+  /* Set vector base address */
+  GIC_Init();
+  __set_VBAR((uint32_t)__VECTOR_TABLE);
+}
 ```
 
-#### 3.3.6 中断触发类型配置`GICD_ICFGRn (Interrupt Configuration Registers)`
+#### 3.1.3 GIC初始化函数`GIC_Init`
 
-+ 功能：配置中断触发方式（电平触发或边沿触发）
-+ 地址计算：每个寄存器控制 16 个中断（每个中断占用 2 位）
-+ 功能: 配置中断触发类型
-    + 00：保留
-    + 01：边沿触发
-    + 10：保留
-    + 11：电平触发
-+ 示例：配置中断号 50 为边沿触发
+这里实际上是在配置GIC的寄存器。`gic->D_xxx`指的是`Distributor`，`gic_C_xxx`指的是`CPU Interface`。我们先简单的看下这里做了些什么，后面再具体分析这些出现的寄存器。
+
+1. `imx6ull`支持5位中断优先级，`2^5=32`
+2. 获取`SoC`最大支持的GIC中断个数
+3. 先禁用所有支持的GIC中断
+4. 允许所有中断通过
+5. 没有子优先级
+6. 使能`Distributor`
+7. 使能`CPU Interface`
+
 ```c
-uint32_t reg = GICD_ICFGRn + (50 / 16) * 4;
-uint32_t shift = (50 % 16) * 2;
-*((volatile uint32_t*)reg) = (*((volatile uint32_t*)reg) & ~(0x3 << shift)) | (0x3 << shift);
+#define __GIC_PRIO_BITS     5   /**< Number of Bits used for Priority Levels */
+
+FORCEDINLINE __STATIC_INLINE void GIC_Init(void)
+{
+  uint32_t i;
+  uint32_t irqRegs;
+  GIC_Type *gic = (GIC_Type *)(__get_CBAR() & 0xFFFF0000UL);
+
+  irqRegs = (gic->D_TYPER & 0x1FUL) + 1;
+
+  /* On POR, all SPI is in group 0, level-sensitive and using 1-N model */
+
+  /* Disable all PPI, SGI and SPI */
+  for (i = 0; i < irqRegs; i++)
+    gic->D_ICENABLER[i] = 0xFFFFFFFFUL;
+
+  /* Make all interrupts have higher priority */
+  gic->C_PMR = (0xFFUL << (8 - __GIC_PRIO_BITS)) & 0xFFUL;
+
+  /* No subpriority, all priority level allows preemption */
+  gic->C_BPR = 7 - __GIC_PRIO_BITS;
+
+  /* Enable group0 distribution */
+  gic->D_CTLR = 1UL;
+
+  /* Enable group0 signaling */
+  gic->C_CTLR = 1UL;
+}
 ```
 
-### 3.4 `CPU Interface`寄存器描述
+到目前为止，我们初始化完成了GIC控制器。接下来就可以用外设中断了。如果要启动外设中断，需要做两件事：
 
-#### 3.4.1 `GICC_CTLR (CPU Interface Control Register)`
+1. 设置外设中断的优先级
+2. 使能外设中断
 
-+ 功能：控制`CPU Interface`的全局行为
-+ 位域：
-    + Bit 0 (Enable): 置1使能`CPU Interface`（必须使能才能接收中断）
-    + Bit 1 (FIQEn): 置1允许`FIQ`中断（否则所有中断通过`IRQ`触发）
-+ 示例：使能`CPU Interface`并允许FIQ
+#### 3.1.4 设置外设中断优先级`GIC_SetPriority`
+
+SDK中列出了`imx6ull`支持的全部中断号。我们要使用外设中断，就从这里面找对应的`中断IRQn`。
+
 ```c
-*((volatile uint32_t*)GICC_CTLR) |= (1 << 0) | (1 << 1);
+typedef enum IRQn {
+  /* Auxiliary constants */
+  NotAvail_IRQn                = -128,             /**< Not available device specific interrupt */
+
+  /* Core interrupts */
+  Software0_IRQn               = 0,                /**< Cortex-A7 Software Generated Interrupt 0 */
+  Software1_IRQn               = 1,                /**< Cortex-A7 Software Generated Interrupt 1 */
+  Software2_IRQn               = 2,                /**< Cortex-A7 Software Generated Interrupt 2 */
+  Software3_IRQn               = 3,                /**< Cortex-A7 Software Generated Interrupt 3 */
+  Software4_IRQn               = 4,                /**< Cortex-A7 Software Generated Interrupt 4 */
+  Software5_IRQn               = 5,                /**< Cortex-A7 Software Generated Interrupt 5 */
+  Software6_IRQn               = 6,                /**< Cortex-A7 Software Generated Interrupt 6 */
+  Software7_IRQn               = 7,                /**< Cortex-A7 Software Generated Interrupt 7 */
+  Software8_IRQn               = 8,                /**< Cortex-A7 Software Generated Interrupt 8 */
+  Software9_IRQn               = 9,                /**< Cortex-A7 Software Generated Interrupt 9 */
+  Software10_IRQn              = 10,               /**< Cortex-A7 Software Generated Interrupt 10 */
+  Software11_IRQn              = 11,               /**< Cortex-A7 Software Generated Interrupt 11 */
+  Software12_IRQn              = 12,               /**< Cortex-A7 Software Generated Interrupt 12 */
+  Software13_IRQn              = 13,               /**< Cortex-A7 Software Generated Interrupt 13 */
+  Software14_IRQn              = 14,               /**< Cortex-A7 Software Generated Interrupt 14 */
+  Software15_IRQn              = 15,               /**< Cortex-A7 Software Generated Interrupt 15 */
+  VirtualMaintenance_IRQn      = 25,               /**< Cortex-A7 Virtual Maintenance Interrupt */
+  HypervisorTimer_IRQn         = 26,               /**< Cortex-A7 Hypervisor Timer Interrupt */
+  VirtualTimer_IRQn            = 27,               /**< Cortex-A7 Virtual Timer Interrupt */
+  LegacyFastInt_IRQn           = 28,               /**< Cortex-A7 Legacy nFIQ signal Interrupt */
+  SecurePhyTimer_IRQn          = 29,               /**< Cortex-A7 Secure Physical Timer Interrupt */
+  NonSecurePhyTimer_IRQn       = 30,               /**< Cortex-A7 Non-secure Physical Timer Interrupt */
+  LegacyIRQ_IRQn               = 31,               /**< Cortex-A7 Legacy nIRQ Interrupt */
+
+  /* Device specific interrupts */
+  IOMUXC_IRQn                  = 32,               /**< General Purpose Register 1 from IOMUXC. Used to notify cores on exception condition while boot. */
+  DAP_IRQn                     = 33,               /**< Debug Access Port interrupt request. */
+  SDMA_IRQn                    = 34,               /**< SDMA interrupt request from all channels. */
+  TSC_IRQn                     = 35,               /**< TSC interrupt. */
+  SNVS_IRQn                    = 36,               /**< Logic OR of SNVS_LP and SNVS_HP interrupts. */
+  LCDIF_IRQn                   = 37,               /**< LCDIF sync interrupt. */
+  RNGB_IRQn                    = 38,               /**< RNGB interrupt. */
+  CSI_IRQn                     = 39,               /**< CMOS Sensor Interface interrupt request. */
+  PXP_IRQ0_IRQn                = 40,               /**< PXP interrupt pxp_irq_0. */
+  SCTR_IRQ0_IRQn               = 41,               /**< SCTR compare interrupt ipi_int[0]. */
+  SCTR_IRQ1_IRQn               = 42,               /**< SCTR compare interrupt ipi_int[1]. */
+  WDOG3_IRQn                   = 43,               /**< WDOG3 timer reset interrupt request. */
+  Reserved44_IRQn              = 44,               /**< Reserved */
+  APBH_IRQn                    = 45,               /**< DMA Logical OR of APBH DMA channels 0-3 completion and error interrupts. */
+  WEIM_IRQn                    = 46,               /**< WEIM interrupt request. */
+  RAWNAND_BCH_IRQn             = 47,               /**< BCH operation complete interrupt. */
+  RAWNAND_GPMI_IRQn            = 48,               /**< GPMI operation timeout error interrupt. */
+  UART6_IRQn                   = 49,               /**< UART6 interrupt request. */
+  PXP_IRQ1_IRQn                = 50,               /**< PXP interrupt pxp_irq_1. */
+  SNVS_Consolidated_IRQn       = 51,               /**< SNVS consolidated interrupt. */
+  SNVS_Security_IRQn           = 52,               /**< SNVS security interrupt. */
+  CSU_IRQn                     = 53,               /**< CSU interrupt request 1. Indicates to the processor that one or more alarm inputs were asserted. */
+  USDHC1_IRQn                  = 54,               /**< USDHC1 (Enhanced SDHC) interrupt request. */
+  USDHC2_IRQn                  = 55,               /**< USDHC2 (Enhanced SDHC) interrupt request. */
+  SAI3_RX_IRQn                 = 56,               /**< SAI3 interrupt ipi_int_sai_rx. */
+  SAI3_TX_IRQn                 = 57,               /**< SAI3 interrupt ipi_int_sai_tx. */
+  UART1_IRQn                   = 58,               /**< UART1 interrupt request. */
+  UART2_IRQn                   = 59,               /**< UART2 interrupt request. */
+  UART3_IRQn                   = 60,               /**< UART3 interrupt request. */
+  UART4_IRQn                   = 61,               /**< UART4 interrupt request. */
+  UART5_IRQn                   = 62,               /**< UART5 interrupt request. */
+  eCSPI1_IRQn                  = 63,               /**< eCSPI1 interrupt request. */
+  eCSPI2_IRQn                  = 64,               /**< eCSPI2 interrupt request. */
+  eCSPI3_IRQn                  = 65,               /**< eCSPI3 interrupt request. */
+  eCSPI4_IRQn                  = 66,               /**< eCSPI4 interrupt request. */
+  I2C4_IRQn                    = 67,               /**< I2C4 interrupt request. */
+  I2C1_IRQn                    = 68,               /**< I2C1 interrupt request. */
+  I2C2_IRQn                    = 69,               /**< I2C2 interrupt request. */
+  I2C3_IRQn                    = 70,               /**< I2C3 interrupt request. */
+  UART7_IRQn                   = 71,               /**< UART-7 ORed interrupt. */
+  UART8_IRQn                   = 72,               /**< UART-8 ORed interrupt. */
+  Reserved73_IRQn              = 73,               /**< Reserved */
+  USB_OTG2_IRQn                = 74,               /**< USBO2 USB OTG2 */
+  USB_OTG1_IRQn                = 75,               /**< USBO2 USB OTG1 */
+  USB_PHY1_IRQn                = 76,               /**< UTMI0 interrupt request. */
+  USB_PHY2_IRQn                = 77,               /**< UTMI1 interrupt request. */
+  DCP_IRQ_IRQn                 = 78,               /**< DCP interrupt request dcp_irq. */
+  DCP_VMI_IRQ_IRQn             = 79,               /**< DCP interrupt request dcp_vmi_irq. */
+  DCP_SEC_IRQ_IRQn             = 80,               /**< DCP interrupt request secure_irq. */
+  TEMPMON_IRQn                 = 81,               /**< Temperature Monitor Temperature Sensor (temperature greater than threshold) interrupt request. */
+  ASRC_IRQn                    = 82,               /**< ASRC interrupt request. */
+  ESAI_IRQn                    = 83,               /**< ESAI interrupt request. */
+  SPDIF_IRQn                   = 84,               /**< SPDIF interrupt. */
+  Reserved85_IRQn              = 85,               /**< Reserved */
+  PMU_IRQ1_IRQn                = 86,               /**< Brown-out event on either the 1.1, 2.5 or 3.0 regulators. */
+  GPT1_IRQn                    = 87,               /**< Logical OR of GPT1 rollover interrupt line, input capture 1 and 2 lines, output compare 1, 2, and 3 interrupt lines. */
+  EPIT1_IRQn                   = 88,               /**< EPIT1 output compare interrupt. */
+  EPIT2_IRQn                   = 89,               /**< EPIT2 output compare interrupt. */
+  GPIO1_INT7_IRQn              = 90,               /**< INT7 interrupt request. */
+  GPIO1_INT6_IRQn              = 91,               /**< INT6 interrupt request. */
+  GPIO1_INT5_IRQn              = 92,               /**< INT5 interrupt request. */
+  GPIO1_INT4_IRQn              = 93,               /**< INT4 interrupt request. */
+  GPIO1_INT3_IRQn              = 94,               /**< INT3 interrupt request. */
+  GPIO1_INT2_IRQn              = 95,               /**< INT2 interrupt request. */
+  GPIO1_INT1_IRQn              = 96,               /**< INT1 interrupt request. */
+  GPIO1_INT0_IRQn              = 97,               /**< INT0 interrupt request. */
+  GPIO1_Combined_0_15_IRQn     = 98,               /**< Combined interrupt indication for GPIO1 signals 0 - 15. */
+  GPIO1_Combined_16_31_IRQn    = 99,               /**< Combined interrupt indication for GPIO1 signals 16 - 31. */
+  GPIO2_Combined_0_15_IRQn     = 100,              /**< Combined interrupt indication for GPIO2 signals 0 - 15. */
+  GPIO2_Combined_16_31_IRQn    = 101,              /**< Combined interrupt indication for GPIO2 signals 16 - 31. */
+  GPIO3_Combined_0_15_IRQn     = 102,              /**< Combined interrupt indication for GPIO3 signals 0 - 15. */
+  GPIO3_Combined_16_31_IRQn    = 103,              /**< Combined interrupt indication for GPIO3 signals 16 - 31. */
+  GPIO4_Combined_0_15_IRQn     = 104,              /**< Combined interrupt indication for GPIO4 signals 0 - 15. */
+  GPIO4_Combined_16_31_IRQn    = 105,              /**< Combined interrupt indication for GPIO4 signals 16 - 31. */
+  GPIO5_Combined_0_15_IRQn     = 106,              /**< Combined interrupt indication for GPIO5 signals 0 - 15. */
+  GPIO5_Combined_16_31_IRQn    = 107,              /**< Combined interrupt indication for GPIO5 signals 16 - 31. */
+  Reserved108_IRQn             = 108,              /**< Reserved */
+  Reserved109_IRQn             = 109,              /**< Reserved */
+  Reserved110_IRQn             = 110,              /**< Reserved */
+  Reserved111_IRQn             = 111,              /**< Reserved */
+  WDOG1_IRQn                   = 112,              /**< WDOG1 timer reset interrupt request. */
+  WDOG2_IRQn                   = 113,              /**< WDOG2 timer reset interrupt request. */
+  KPP_IRQn                     = 114,              /**< Key Pad interrupt request. */
+  PWM1_IRQn                    = 115,              /**< hasRegInstance(`PWM1`)?`Cumulative interrupt line for PWM1. Logical OR of rollover, compare, and FIFO waterlevel crossing interrupts.`:`Reserved`) */
+  PWM2_IRQn                    = 116,              /**< hasRegInstance(`PWM2`)?`Cumulative interrupt line for PWM2. Logical OR of rollover, compare, and FIFO waterlevel crossing interrupts.`:`Reserved`) */
+  PWM3_IRQn                    = 117,              /**< hasRegInstance(`PWM3`)?`Cumulative interrupt line for PWM3. Logical OR of rollover, compare, and FIFO waterlevel crossing interrupts.`:`Reserved`) */
+  PWM4_IRQn                    = 118,              /**< hasRegInstance(`PWM4`)?`Cumulative interrupt line for PWM4. Logical OR of rollover, compare, and FIFO waterlevel crossing interrupts.`:`Reserved`) */
+  CCM_IRQ1_IRQn                = 119,              /**< CCM interrupt request ipi_int_1. */
+  CCM_IRQ2_IRQn                = 120,              /**< CCM interrupt request ipi_int_2. */
+  GPC_IRQn                     = 121,              /**< GPC interrupt request 1. */
+  Reserved122_IRQn             = 122,              /**< Reserved */
+  SRC_IRQn                     = 123,              /**< SRC interrupt request src_ipi_int_1. */
+  Reserved124_IRQn             = 124,              /**< Reserved */
+  Reserved125_IRQn             = 125,              /**< Reserved */
+  CPU_PerformanceUnit_IRQn     = 126,              /**< Performance Unit interrupt ~ipi_pmu_irq_b. */
+  CPU_CTI_Trigger_IRQn         = 127,              /**< CTI trigger outputs interrupt ~ipi_cti_irq_b. */
+  SRC_Combined_IRQn            = 128,              /**< Combined CPU wdog interrupts (4x) out of SRC. */
+  SAI1_IRQn                    = 129,              /**< SAI1 interrupt request. */
+  SAI2_IRQn                    = 130,              /**< SAI2 interrupt request. */
+  Reserved131_IRQn             = 131,              /**< Reserved */
+  ADC1_IRQn                    = 132,              /**< ADC1 interrupt request. */
+  ADC_5HC_IRQn                 = 133,              /**< ADC_5HC interrupt request. */
+  Reserved134_IRQn             = 134,              /**< Reserved */
+  Reserved135_IRQn             = 135,              /**< Reserved */
+  SJC_IRQn                     = 136,              /**< SJC interrupt from General Purpose register. */
+  CAAM_Job_Ring0_IRQn          = 137,              /**< CAAM job ring 0 interrupt ipi_caam_irq0. */
+  CAAM_Job_Ring1_IRQn          = 138,              /**< CAAM job ring 1 interrupt ipi_caam_irq1. */
+  QSPI_IRQn                    = 139,              /**< QSPI1 interrupt request ipi_int_ored. */
+  TZASC_IRQn                   = 140,              /**< TZASC (PL380) interrupt request. */
+  GPT2_IRQn                    = 141,              /**< Logical OR of GPT2 rollover interrupt line, input capture 1 and 2 lines, output compare 1, 2 and 3 interrupt lines. */
+  CAN1_IRQn                    = 142,              /**< Combined interrupt of ini_int_busoff,ini_int_error,ipi_int_mbor,ipi_int_txwarning and ipi_int_waken */
+  CAN2_IRQn                    = 143,              /**< Combined interrupt of ini_int_busoff,ini_int_error,ipi_int_mbor,ipi_int_txwarning and ipi_int_waken */
+  Reserved144_IRQn             = 144,              /**< Reserved */
+  Reserved145_IRQn             = 145,              /**< Reserved */
+  PWM5_IRQn                    = 146,              /**< Cumulative interrupt line. OR of Rollover Interrupt line, Compare Interrupt line and FIFO Waterlevel crossing interrupt line */
+  PWM6_IRQn                    = 147,              /**< Cumulative interrupt line. OR of Rollover Interrupt line, Compare Interrupt line and FIFO Waterlevel crossing interrupt line */
+  PWM7_IRQn                    = 148,              /**< Cumulative interrupt line. OR of Rollover Interrupt line, Compare Interrupt line and FIFO Waterlevel crossing interrupt line */
+  PWM8_IRQn                    = 149,              /**< Cumulative interrupt line. OR of Rollover Interrupt line, Compare Interrupt line and FIFO Waterlevel crossing interrupt line */
+  ENET1_IRQn                   = 150,              /**< ENET1 interrupt */
+  ENET1_1588_IRQn              = 151,              /**< ENET1 1588 Timer interrupt [synchronous] request. */
+  ENET2_IRQn                   = 152,              /**< ENET2 interrupt */
+  ENET2_1588_IRQn              = 153,              /**< MAC 0 1588 Timer interrupt [synchronous] request. */
+  Reserved154_IRQn             = 154,              /**< Reserved */
+  Reserved155_IRQn             = 155,              /**< Reserved */
+  Reserved156_IRQn             = 156,              /**< Reserved */
+  Reserved157_IRQn             = 157,              /**< Reserved */
+  Reserved158_IRQn             = 158,              /**< Reserved */
+  PMU_IRQ2_IRQn                = 159               /**< Brown-out event on either core, gpu or soc regulators. */
+} IRQn_Type;
 ```
 
-#### 3.4.2 `GICC_BPR (Binary Point Register)`
+设置中断优先级，其实就是设置`中断IRQn`对应的这个`D_IPRIORITYR`寄存器的值。
 
-+ 功能：设置优先级分组点，决定抢占级别和子优先级
-+ 位域：二进制点值（0~7），将优先级字段分为两部分
-    + 抢占级别（Group）：高位部分，用于中断抢占决策
-    + 子优先级（Subpriority）：低位部分，仅在同组内排序
-+ 示例：设置优先级分组点为 3（抢占级别占高4位，子优先级占低4位）
 ```c
-// 设置优先级分组点为 3（抢占级别占高4位，子优先级占低4位）
-*((volatile uint32_t*)GICC_BPR) = 2;  // BPR=2 → 分组点=3
+FORCEDINLINE __STATIC_INLINE void GIC_SetPriority(IRQn_Type IRQn, uint32_t priority)
+{
+  GIC_Type *gic = (GIC_Type *)(__get_CBAR() & 0xFFFF0000UL);
+
+  gic->D_IPRIORITYR[((uint32_t)(int32_t)IRQn)] = (uint8_t)((priority << (8UL - __GIC_PRIO_BITS)) & (uint32_t)0xFFUL);
+}
 ```
 
-#### 3.4.3 `GICC_IAR (Interrupt Acknowledge Register)`
+### 4.1.5 使能外设中断`GIC_EnableIRQ`
 
-+ 功能：CPU核读取此寄存器以获取当前中断ID，并标记中断为活动状态
-+ 返回值：
-    + Bits 9:0 (Interrupt ID): 中断编号（0~1023）
-    + Bits 12:10 (CPU ID): 发送 SGI 的源 CPU 核编号（仅对 SGI 有效）
-+ 操作：读取后，GIC将中断状态从`Pending`转为`Active`
-+ 示例：读取当前中断ID
+使能中断，就是设置`D_ISENABLER`寄存器。
+
 ```c
-// 读取当前中断 ID
-uint32_t iar = *((volatile uint32_t*)GICC_IAR);
-uint32_t int_id = iar & 0x3FF;  // 提取中断 ID
+FORCEDINLINE __STATIC_INLINE void GIC_EnableIRQ(IRQn_Type IRQn)
+{
+  GIC_Type *gic = (GIC_Type *)(__get_CBAR() & 0xFFFF0000UL);
+
+  gic->D_ISENABLER[((uint32_t)(int32_t)IRQn) >> 5] = (uint32_t)(1UL << (((uint32_t)(int32_t)IRQn) & 0x1FUL));
+}
 ```
 
-#### 3.4.4 `GICC_EOIR (End of Interrupt Register)`
+#### 3.1.5 总结
 
-+ 功能：CPU核写入中断ID，通知GIC中断处理完成，清除活动状态
-+ 注意事项：写入的ID必须与之前`GICC_IAR`读取的值一致
-+ 示例：结束中断处理（假设 int_id 为之前读取的中断 ID）
-```c
-// 结束中断处理（假设 int_id 为之前读取的中断 ID）
-*((volatile uint32_t*)GICC_EOIR) = int_id;
-```
+在`imx6ull`芯片中，我们要启动某个硬件外设的中断，调用以下3个函数：
+
+1. 初始化GIC控制器：`void GIC_Init(void)`
+2. 设置外设的中断优先级：`void GIC_SetPriority(IRQn_Type IRQn, uint32_t priority)`
+3. 使能外设中断：`void GIC_EnableIRQ(IRQn_Type IRQn)`
+
+### 3.2 `imx6ull`的中断详解
+
+
+
