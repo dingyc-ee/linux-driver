@@ -387,7 +387,7 @@ void SystemInit (void)
 
 这里实际上是在配置GIC的寄存器。`gic->D_xxx`指的是`Distributor`，`gic_C_xxx`指的是`CPU Interface`。我们先简单的看下这里做了些什么，后面再具体分析这些出现的寄存器。
 
-1. `imx6ull`支持5位中断优先级，`2^5=32`
+1. `imx6ull`支持5位中断优先级，`2^5=32`，可设置的中断优先级为0~31
 2. 获取`SoC`最大支持的GIC中断个数
 3. 先禁用所有支持的GIC中断
 4. 允许所有中断通过
@@ -608,7 +608,7 @@ FORCEDINLINE __STATIC_INLINE void GIC_SetPriority(IRQn_Type IRQn, uint32_t prior
 }
 ```
 
-### 4.1.5 使能外设中断`GIC_EnableIRQ`
+### 3.1.5 使能外设中断`GIC_EnableIRQ`
 
 使能中断，就是设置`D_ISENABLER`寄存器。
 
@@ -629,7 +629,124 @@ FORCEDINLINE __STATIC_INLINE void GIC_EnableIRQ(IRQn_Type IRQn)
 2. 设置外设的中断优先级：`void GIC_SetPriority(IRQn_Type IRQn, uint32_t priority)`
 3. 使能外设中断：`void GIC_EnableIRQ(IRQn_Type IRQn)`
 
-### 3.2 `imx6ull`的中断详解
+### 3.2 `imx6ull`的`GIC`寄存器
 
+#### 3.2.1 **中断优先级寄存器`GICD_IPRIORITYR`**
 
+![](./src/0005.jpg)
+
+`GICD_IPRIORITYR`是`Distributor`的核心寄存器，用于设置每个中断的优先级。
+
++ 寄存器结构：多中断共享的32位寄存器组。
+
+    GICv2的终端数量，由`GICD_TYPER`寄存器的`ITLinesNumber`字段决定，最多支持1020个中断。为了管理这些优先级，每个寄存器是32位，包含4个8位的优先级字段（每个字段控制1个中断）。
+
++ 位域定义：有效位与RAZ/WI位
+
+    每个8位优先级字段的有效位数由芯片设计决定（ARM规范允许1~8位），未使用的位为RAZ/WI（读返回0，写忽略）。
+
++ 有效位：有效位是优先级字段中，实际用于表示优先级的位，决定了中断的优先级数值范围。
+
+    + 5位有效位(`imx6ull、am335x`)：`Bit[7:3]`，对应32级优先级（0~31）
+    + 4位有效位(`部分Cortex-A9芯片`)：`Bit[7:4]`，对应16级优先级（0~15）
+    + 8位有效位(`高端芯片`)：`Bit[7:0]`，对应256级优先级
+
++ RAZ/WI位：保留位
+
+    未被有效位占据的低位为RAZ/WI位，软件写入时会被忽略，读取时返回0。
+
++ 优先级编码规则：数值越小，优先级越高
+
++ 与其他寄存器的协同工作
+
+    + `GICC_PMR（CPU 接口优先级屏蔽寄存器）`
+        + 功能：设置CPU可响应的最低优先级阈值
+        + 协同：仅当`中断优先级 < GICC_PMR值`时，中断才会被传递给CPU
+
+    + `GICC_BPR（二进制点寄存器）`
+        + 功能：划分主优先级和子优先级
+        + 协同：若启用子优先级(`BPR < 7`)，`GICD_IPRIORITYR`的有效位会被分成主优先级和子优先级，影响中断的抢占顺序
+        
++ SDK代码的定义：MICIX6Y2.h`头文件，写了只支持5位中断优先级，范围0~31
+
+    ```c
+    #define __GIC_PRIO_BITS 5         /**< Number of Bits used for Priority Levels */
+    ```
+
++ SDK设置优先级的函数
+
+    ```c
+    void GIC_SetPriority(IRQn_Type IRQn, uint32_t priority)
+    {
+    GIC_Type *gic = (GIC_Type *)(__get_CBAR() & 0xFFFF0000UL);
+
+    gic->D_IPRIORITYR[((uint32_t)(int32_t)IRQn)] = (uint8_t)((priority << (8UL - __GIC_PRIO_BITS)) & (uint32_t)0xFFUL);
+    }
+    ```
+
+#### 3.2.2 **中断主优先级/子优先级划分寄存器`GICC_BPR`**
+
+![](./src/0006.jpg)
+
+`GICC_BPR`寄存器，用于划分中断的主优先级和子优先级。*建议值：通常我们把中断优先级的有效位数都设为主优先级，不使用子优先级。*
+
++ 寄存器结构：32位寄存器，但仅低3位(`Bit[2:0]`)有效。`2^3=8`，正好对应了8位优先级。
+
+    + 主优先级位数：`7 - GICC_BPR`
+    + 子优先级位数：有效优先级位数(`imx6ull为5`) - 主优先级位数
+
++ 优先级抢占规则：主优先级决定抢占，子优先级决定顺序
+
+    + 主优先级数值越小，抢占能力越强。高主优先级的中断可以`立即抢占`当前运行的低主优先级中断(无论子优先级如何)
+    + 若连个中断的主优先级相同，子优先级数值越小的中断先被处理(不抢占、按顺序执行)
+
++ 注意事项：通常建议系统`禁用子优先级`，简化配置并减少仲裁逻辑复杂度。
+
++ SDK中`GIC_Init`函数，`禁用了子优先级`：`GICC_BPR = 7 - 5 = 2`，此时主优先级位数为5，这就是全部的有效位数了。
+
+    ```c
+    #define __GIC_PRIO_BITS 5
+
+    void GIC_Init(void)
+    {
+        /* No subpriority, all priority level allows preemption */
+        gic->C_BPR = 7 - __GIC_PRIO_BITS;
+    }
+    ```
+
+#### 3.2.3 **中断优先级屏蔽寄存器`GICC_PMR`**
+
+![](./src/0007.jpg)
+
+`GICC_PMR`是`Distributor`的核心寄存器，用于设置CPU可响应的最低优先级阈值。仅当`中断优先级高于(数值小于)该阈值`时，CPU才会接收并处理该中断。
+
++ 寄存器结构：32位寄存器，低8位有效
+
+    `GICC_PMR`是32位寄存器，但仅低8位(`Bit[7:0]`)用于存储优先级屏蔽值。低8位的有效位数由芯片`SoC`实现决定（ARM规范允许1~8位）
+
++ 位域定义：有效位与RAZ/WI位
+
+    `GICC_PMR`的低8位中，仅部分为有效，其余位为RAZ/WI位。有效位数与GIC支持的优先级有效位数一致（如imx6ull的中原优先级支持5位有效位，GICC_PMR的有效位也为5位）。
+
+    `imx6ull`芯片的sdk中，只有5位有效位，`Bit[7:3]=0b11111`（十进制31），此时仅优先级<31的中断会被响应，优先级31的中断被屏蔽。
+
+    ```c
+    void GIC_Init(void)
+    {
+        /* Make all interrupts have higher priority */
+        gic->C_PMR = (0xFFUL << (8 - __GIC_PRIO_BITS)) & 0xFFUL;
+    }
+    ```
+
++ 优先级比较规则：数值越小、优先级越高
+
+    仅当`中断优先级 < GICC_PMR值`时，中断才会被传递给CPU。
+
+#### 3.2.3 **外设中断使能寄存器`GICD_ISENABLER`**
+
+`GICD_ISENABLER`是`Distributor`的核心寄存器，核心功能时启用特定中断，使其能够被分发到CPU接口并触发CPU响应。
+
++ 功能定位：中断的`启动开关`。
+
+    + 仅当`GICD_ISENABLER`中对应位为1时，中断才可能被分发到
 
