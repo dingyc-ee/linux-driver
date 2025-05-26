@@ -11,3 +11,5 @@
 [IO模型](004_IO模型/README.md)
 
 [中断](005_中断/README.md)
+
+[platform总线](006_platform总线/README.md)
