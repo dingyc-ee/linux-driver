@@ -742,11 +742,38 @@ FORCEDINLINE __STATIC_INLINE void GIC_EnableIRQ(IRQn_Type IRQn)
 
     仅当`中断优先级 < GICC_PMR值`时，中断才会被传递给CPU。
 
-#### 3.2.3 **外设中断使能寄存器`GICD_ISENABLER`**
+#### 3.2.4 **外设中断使能寄存器`GICD_ISENABLER`**
 
-`GICD_ISENABLER`是`Distributor`的核心寄存器，核心功能时启用特定中断，使其能够被分发到CPU接口并触发CPU响应。
+![](./src/0008.jpg)
 
-+ 功能定位：中断的`启动开关`。
+`GICD_ISENABLER`是`Distributor`的核心寄存器，核心功能是启用特定中断，使其能够被分发到CPU接口并触发CPU响应。
 
-    + 仅当`GICD_ISENABLER`中对应位为1时，中断才可能被分发到
++ 功能定位：中断的`启动开关`，仅当`GICD_ISENABLER`中对应位为1时，中断才可能被分发到CPU。
 
++ SDK使能GIC外设中断的函数中，`IRQn >> 5`实际上就等价于`IRQn / 32`，因为这个寄存器可以控制32个中断源。
+
+```c
+void GIC_EnableIRQ(IRQn_Type IRQn)
+{
+  GIC_Type *gic = (GIC_Type *)(__get_CBAR() & 0xFFFF0000UL);
+
+  gic->D_ISENABLER[((uint32_t)(int32_t)IRQn) >> 5] = (uint32_t)(1UL << (((uint32_t)(int32_t)IRQn) & 0x1FUL));
+}
+```
+
+#### 3.2.5 **外设中断禁止寄存器`GICD_ICENABLER`**
+
+![](./src/0009.jpg)
+
+`GICD_ICENABLER`是`Distributor`的核心寄存器，核心功能是禁用特定中断，写1屏蔽该中断源的请求。
+
++ SDK禁用GIC外设中断的函数中，`IRQn >> 5`实际上就等价于`IRQn / 32`，因为这个寄存器可以控制32个中断源。
+
+```c
+void GIC_DisableIRQ(IRQn_Type IRQn)
+{
+  GIC_Type *gic = (GIC_Type *)(__get_CBAR() & 0xFFFF0000UL);
+
+  gic->D_ICENABLER[((uint32_t)(int32_t)IRQn) >> 5] = (uint32_t)(1UL << (((uint32_t)(int32_t)IRQn) & 0x1FUL));
+}
+```
