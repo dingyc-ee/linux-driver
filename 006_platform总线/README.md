@@ -311,7 +311,35 @@ static struct resource i2c_resources[] = {
 };
 ```
 
-### 2.4 实例代码
+### 2.4 `platform设备`编程框架
+
+1. 创建`struct platform_device`变量
+
+    + `.name`：必须(与驱动名一致)
+    + `.id`: 必须(单设备设为-1)
+    + `.num_resources`: 资源数组个数(可设为0)
+    + `.resource`: 资源数组指针(可设为NULL)
+    + `.dev.release`: 必须设置一个release函数，即使为空函数(不能不设或者设为NULL，否则`rmmod卸载设备时会报错`)
+
+```c
+static struct platform_device my_device = {
+    .name = "my-led",
+    .id = -1,
+    .num_resources = 0,
+    .resource = NULL,
+    .dev = {
+        .release = my_release
+    },
+};
+
+static int __init my_init(void)
+{
+    platform_device_register(&my_device);
+    return 0;
+}
+```
+
+### 2.5 实例代码
 
 我们要用`platform`总线来点亮LED。先写设备端的代码：
 
@@ -322,64 +350,33 @@ static struct resource i2c_resources[] = {
 #include <linux/resource.h>
 #include <linux/platform_device.h>
 
-#define MUX_GPIO5_IO00_BASE     0x02290008
-#define PAD_GPIO5_IO00_BASE     0x0229004C
-#define GPIO5_DR_BASE           0x020AC000
-#define GPIO5_GDIR_BASE         0x020AC004
-
-static struct resource my_res[] = {
-    [0] = {
-        .start = MUX_GPIO5_IO00_BASE,
-        .end   = MUX_GPIO5_IO00_BASE + 0x04 - 1,
-        .name  = "gpio5_io00_mux",
-        .flags = IORESOURCE_MEM,
-    },
-    [1] = {
-        .start = PAD_GPIO5_IO00_BASE,
-        .end   = PAD_GPIO5_IO00_BASE + 0x04 - 1,
-        .name  = "gpio5_io00_pad",
-        .flags = IORESOURCE_MEM,
-    },
-    [2] = {
-        .start = GPIO5_DR_BASE,
-        .end   = GPIO5_DR_BASE + 0x04 - 1,
-        .name  = "gpio5_dr",
-        .flags = GPIO5_DR_BASE,
-    },
-    [3] = {
-        .start = GPIO5_GDIR_BASE,
-        .end   = GPIO5_GDIR_BASE + 0x04 - 1,
-        .name  = "gpio5_gdir",
-        .flags = GPIO5_GDIR_BASE,
-    },
-};
-
-static void	my_release(struct device *dev)
+static void my_release(struct device *dev)
 {
-
+    struct platform_device *pdev = container_of(dev, struct platform_device, dev);
+    printk(KERN_INFO "%s device released\n", pdev->name);
 }
 
 static struct platform_device my_device = {
-    .name = "my_device",
+    .name = "my-led",
     .id = -1,
-    .num_resources = ARRAY_SIZE(my_res),
-    .resource = my_res,
+    .num_resources = 0,
+    .resource = NULL,
     .dev = {
-        .release = my_release,
+        .release = my_release
     },
 };
 
 static int __init my_init(void)
 {
     platform_device_register(&my_device);
-    printk(KERN_INFO "register my_device\n");
+    printk(KERN_INFO "register %s device\n", my_device.name);
     return 0;
 }
 
 static void __exit my_exit(void)
 {
     platform_device_unregister(&my_device);
-    printk(KERN_INFO "unregister my_device\n");
+    printk(KERN_INFO "unregister %s device\n", my_device.name);
 }
 
 module_init(my_init);
@@ -389,9 +386,296 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("ding");
 ```
 
-### 2.5 实测结果
+### 2.6 实测结果
 
 执行`insmod`命令，加载`platform设备`后，在`/sys/bus/platform/devices`目录下，生成了我们注册的`platform`设备。
 
 ![](./src/0001.jpg)
+
+## 第3章 `platform_driver`驱动
+
+前面已经完成了`platform设备`，接下来开始写`platform驱动`。
+
+### 3.1 `platform_driver_register`注册驱动
+
+`platform_driver_register`是Linux内核中，用于注册平台设备驱动的核心函数，属于`platform`总线模型的一部分。它的作用是将一个驱动描述符关联到虚拟的`platform`总线上，实现驱动与设备的动态匹配。
+
+#### 3.1.1 函数原型
+
+```c
+int platform_driver_register(struct platform_driver *pdrv);
+```
+
++ 返回值: 0(成功)，负数(失败)
++ 参数`struct platform_driver *pdrv`: 我们要实现的驱动
+
+#### 3.1.2 `struct platform_driver 结构体`
+
+这是我们写`platform驱动`要实现的结构体，注册驱动本质上就是注册这个结构体。
+
+```c
+struct platform_driver {
+	int (*probe)(struct platform_device *);
+	int (*remove)(struct platform_device *);
+	void (*shutdown)(struct platform_device *);
+	int (*suspend)(struct platform_device *, pm_message_t state);
+	int (*resume)(struct platform_device *);
+	struct device_driver driver;
+	const struct platform_device_id *id_table;
+};
+```
+
+1. `probe`函数
+
+	+ 作用: 当驱动与设备匹配成功后调用，用于初始化硬件资源(寄存器映射、中断注册)
+	+ 触发条件: 通过设备树匹配(`.of_match_table`)、`id_table`匹配、名称匹配(.driver.name)
+	
+2. `remove`函数
+
+	+ 作用: 驱动卸载或设备移除时调用，释放资源(如iounmap、中断注销)
+	+ 注意事项: 需确保多次调用不会引发错误
+
+3. `shutdown、suspend、resume`函数
+
+	+ 作用: 电源管理相关回调，分别作用域设备关闭、休眠和唤醒时的状态管理
+
+4. `driver`成员
+
+	+ 类型: `struct device_driver`，包含驱动的通用属性
+	
+		+ `.name`: 驱动名称，用于与传统非设备树设备匹配
+		+ `.of_match_table`: 设备树兼容性匹配表，用于设备树场景
+
+5. `id_table`成员: 结尾需要有一个`{}`标识结束，`Sentinel`是哨兵的意思
+
+	+ 类型: `struct platform_device_id 数组`，定义驱动支持的设备名称列表(非设备树场景)
+	+ 示例:
+	
+		```c
+		static const struct platform_device_id my_id_table[] = {
+			{ .name = "device_v1" },
+			{ .name = "device_v2" },
+			{ /* Sentinel */ }
+		};
+		```
+
+#### 3.1.3 设计要点与使用场景
+
+1. 设备匹配机制
+
+	+ 优先级: 设备树兼容性匹配(.of_match_table) -> `.id_table` -> 名称匹配(.driver.name)
+	+ 设备树示例: 设备树节点需包含`compatible = "vendor,device-name"`，以匹配驱动的`.of_match_table`
+
+2. 资源管理
+
+	+ 自动释放: 推荐使用`devm_`系列函数(如devm_ioremap_resource)自动释放资源，避免remove函数遗漏
+	+ 资源获取: 通过`platform_get_resource()`获取设备的内存、中断等资源
+	
+3. 典型使用流程
+
+	```c
+	static struct platform_driver my_driver = {
+		.probe = my_probe,
+		.remove = my_remove,
+		.driver = {
+			.name = "my_device",
+			.of_match_table = my_of_match,
+		},
+		.id_table = my_devices,
+	};
+
+	module_platform_driver(my_driver);  // 自动生成 init/exit 函数
+	```
+
+### 3.2 `platform_driver_unregister`注销驱动
+
+函数原型
+
+```c
+int platform_driver_unregister(struct platform_driver *pdrv);
+```
+
++ 返回值: 0(成功)，负数(失败)
+
+### 3.3 `platform驱动`编程框架
+
+1. 创建`struct platform_driver`变量
+
+    + `.probe`：必须(匹配成功调用)
+    + `.remove`: 必须(卸载驱动时调用)
+    + `.driver.name`: 必须(驱动名，要与设备名一致)
+    + `..driver.omner`: 必须(设为THIS_MODULE)
+    + `.id_table`: 必须
+	
+```c
+static int my_probe(struct platform_device *pdev)
+{
+    printk(KERN_INFO "%s probe\n", pdev->name);
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    printk(KERN_INFO "%s remove\n", pdev->name);
+    return 0;
+}
+
+const struct platform_device_id my_id_table[] = {
+    { .name = "my-led" },
+    { /* sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .probe  = my_probe,
+    .remove = my_remove,
+    .driver = {
+        .name = "my-led",
+        .owner = THIS_MODULE
+    },
+    .id_table = my_id_table
+};
+
+static int __init my_init(void)
+{
+    platform_driver_register(&my_driver);
+    return 0;
+}
+```
+
+### 3.4 实测代码
+
+#### 3.4.1 `led_device.c`
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/io.h>
+#include <linux/resource.h>
+#include <linux/platform_device.h>
+
+static void my_release(struct device *dev)
+{
+    struct platform_device *pdev = container_of(dev, struct platform_device, dev);
+    printk(KERN_INFO "%s device released\n", pdev->name);
+}
+
+static struct platform_device my_device = {
+    .name = "my-led",
+    .id = -1,
+    .num_resources = 0,
+    .resource = NULL,
+    .dev = {
+        .release = my_release
+    },
+};
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "register %s device\n", my_device.name);
+    platform_device_register(&my_device);
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_device_unregister(&my_device);
+    printk(KERN_INFO "unregister %s device\n", my_device.name);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+#### 3.4.2 `led_driver.c`
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/io.h>
+#include <linux/resource.h>
+#include <linux/platform_device.h>
+
+static int my_probe(struct platform_device *pdev)
+{
+    printk(KERN_INFO "%s probe\n", pdev->name);
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    printk(KERN_INFO "%s remove\n", pdev->name);
+    return 0;
+}
+
+const struct platform_device_id my_id_table[] = {
+    { .name = "my-led" },
+    { /* sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .probe  = my_probe,
+    .remove = my_remove,
+    .driver = {
+        .name = "my-led",
+        .owner = THIS_MODULE
+    },
+    .id_table = my_id_table
+};
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "register %s driver\n", my_driver.driver.name);
+    platform_driver_register(&my_driver);
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk(KERN_INFO "unregister %s driver\n", my_driver.driver.name);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+#### 3.4.3 `Makefile`
+
+```Makefile
+# 生成目标
+TARGET := led_device led_driver
+
+obj-m += $(patsubst %, %.o, $(TARGET))
+
+# 交叉编译工具链
+CROSS_COMPILE ?= /usr/local/arm/gcc-linaro-4.9.4-2017.01-x86_64_arm-linux-gnueabihf/bin/arm-linux-gnueabihf-
+
+# 编译路径
+PWD  ?= $(shell pwd)
+KDIR ?= /home/ding/linux/imx/kernel
+
+# 编译规则
+all:
+	make -C $(KDIR) M=$(PWD) modules
+
+clean:
+	make -C $(KDIR) M=$(PWD) clean
+
+copy:
+	rm -f /home/ding/net/nfs/rootfs/*.ko
+	cp *.ko /home/ding/net/nfs/rootfs
+```
+
+### 3.5 测试结果
+
+![](./src/0002.jpg)
+
+## 第4章 `probe函数获取resource资源`
+
 
