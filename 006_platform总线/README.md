@@ -678,4 +678,336 @@ copy:
 
 ## 第4章 `probe函数获取resource资源`
 
+前面我们已经写了`platform设备`和`platform`驱动的软件框架，实测可以匹配成功。现在要做什么呢？
+
+**现在要来操作硬件资源。所以，我们要在`platform设备`中定义资源，`platform驱动中获取资源`。**
+
+### 4.1 `platform设备`定义资源
+
+```c
+/* KEY: SNVS_TAMPER0(GPIO5_IO00) */
+#define MUX_CTRL_BASE   0X02290008
+#define PAD_CTRL_BASE   0X0229004C
+#define GPIO_DR_BASE    0x020AC000
+#define GPIO_GDIR_BASE  0x020AC004
+
+static struct resource my_res[] = {
+    [0] = {
+        .start  = MUX_CTRL_BASE,
+        .end    = MUX_CTRL_BASE + 4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "mux_ctrl"
+    },
+    [1] = {
+        .start  = PAD_CTRL_BASE,
+        .end    = PAD_CTRL_BASE + 4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "pad_ctrl"
+    },
+    [2] = {
+        .start  = GPIO_DR_BASE,
+        .end    = GPIO_DR_BASE + 4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "gpio_dr"
+    },
+    [3] = {
+        .start  = GPIO_GDIR_BASE,
+        .end    = GPIO_GDIR_BASE + 4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "gpio_gdir"
+    }
+};
+
+static void my_release(struct device *dev)
+{
+    struct platform_device *pdev = container_of(dev, struct platform_device, dev);
+    printk(KERN_INFO "%s device released\n", pdev->name);
+}
+
+static struct platform_device my_device = {
+    .name = "my-led",
+    .id = -1,
+    .num_resources = ARRAY_SIZE(my_res),
+    .resource = my_res,
+    .dev = {
+        .release = my_release
+    },
+};
+```
+
+### 4.2 `platform驱动`获取资源
+
+4.1节已经在`platform设备`中定义了资源，那么`platform驱动`就可以使用这些资源。在哪里使用呢？
+
+**考虑一下流程，如果设备和驱动匹配了，就会调用`probe`函数。这个函数的原型: `int (*probe)(struct platform_device *pdev)`。没错，内核把`platform设备`中定义了资源作为入参传给`probe`函数了，所以`probe`函数可以直接访问结构体来获取资源。**
+
+#### 4.2.1 直接访问`platform_device的resource数组`
+
+示例代码：
+
+```c
+static int my_probe(struct platform_device *pdev)
+{
+    int i;
+    struct resource	*res;
+    printk(KERN_INFO "%s matched\n", pdev->name);
+
+    printk(KERN_INFO "Method:1 resource info .......................................\n");
+    for (i = 0; i < pdev->num_resources; i++) {
+        res = &pdev->resource[i];
+        printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    }
+	
+    return 0;
+}
+```
+
+#### 4.2.2 使用`platform_get_resource()`函数，按resource数组索引获取
+
++ 函数原型
+
+```c
+struct resource *platform_get_resource(struct platform_device *dev,unsigned int type, unsigned int num);
+```
+
++ 参数解析
+
+	+ `dev`: `platform_device`指针，也就是`probe()`函数的入参
+	+ `type`: 资源类型。指定需要获取的资源类型，常见类型包括:
+
+		+ `IORESOURCE_MEM`: 内存资源(如寄存器地址范围)
+		+ `IORESOURCE_IRQ`: 中断资源
+		
+	+ `num`: 资源索引号。就是数组下标，从0开始
+
++ 返回值: 成功时返回指向`struct resource`的指针，失败返回NULL
+
++ 资源匹配机制
+
+函数内部的实现逻辑时，检查`pdev->resource`数组，对应索引的类型。如果索引和类型匹配，则返回该资源
+
+```c
+static int my_probe(struct platform_device *pdev)
+{
+    int i;
+    struct resource	*res;
+    printk(KERN_INFO "%s matched\n", pdev->name);
+
+    printk(KERN_INFO "\nMethod:2 resource info .......................................\n");
+    for (i = 0; i < pdev->num_resources; i++) {
+        res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+        printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    }
+    
+    return 0;
+}
+```
+
+#### 4.2.3 使用`platform_get_resource_byname()`函数，按resource数组成员的名称获取
+
++ 函数原型
+
+```c
+struct resource *platform_get_resource_byname(struct platform_device *dev, unsigned int type, const char *name);
+```
+
++ 参数解析
+
+	+ `dev`: `platform_device`指针，也就是`probe()`函数的入参
+	+ `type`: 资源类型。指定需要获取的资源类型，常见类型包括:
+
+		+ `IORESOURCE_MEM`: 内存资源(如寄存器地址范围)
+		+ `IORESOURCE_IRQ`: 中断资源
+		
+	+ 资源的名称标识符，需与`struct resource`中定义的`.name`字段完全匹配
+
++ 返回值: 成功时返回指向`struct resource`的指针，失败返回NULL
+
+```c
+static int my_probe(struct platform_device *pdev)
+{
+    int i;
+    struct resource	*res;
+    printk(KERN_INFO "%s matched\n", pdev->name);
+
+    printk(KERN_INFO "\nMethod:3 resource info .......................................\n");
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mux_ctrl");
+    printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pad_ctrl");
+    printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpio_dr");
+    printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpio_gdir");
+    printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+
+    return 0;
+}
+```
+
+### 4.3 实例代码
+
+#### 4.3.1 `platform设备`
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/io.h>
+#include <linux/resource.h>
+#include <linux/platform_device.h>
+
+/* KEY: SNVS_TAMPER0(GPIO5_IO00) */
+#define MUX_CTRL_BASE   0X02290008
+#define PAD_CTRL_BASE   0X0229004C
+#define GPIO_DR_BASE    0x020AC000
+#define GPIO_GDIR_BASE  0x020AC004
+
+static struct resource my_res[] = {
+    [0] = {
+        .start  = MUX_CTRL_BASE,
+        .end    = MUX_CTRL_BASE + 4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "mux_ctrl"
+    },
+    [1] = {
+        .start  = PAD_CTRL_BASE,
+        .end    = PAD_CTRL_BASE + 4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "pad_ctrl"
+    },
+    [2] = {
+        .start  = GPIO_DR_BASE,
+        .end    = GPIO_DR_BASE + 4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "gpio_dr"
+    },
+    [3] = {
+        .start  = GPIO_GDIR_BASE,
+        .end    = GPIO_GDIR_BASE + 4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "gpio_gdir"
+    }
+};
+
+static void my_release(struct device *dev)
+{
+    struct platform_device *pdev = container_of(dev, struct platform_device, dev);
+    printk(KERN_INFO "%s device released\n", pdev->name);
+}
+
+static struct platform_device my_device = {
+    .name = "my-led",
+    .id = -1,
+    .num_resources = ARRAY_SIZE(my_res),
+    .resource = my_res,
+    .dev = {
+        .release = my_release
+    },
+};
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "register %s device\n", my_device.name);
+    platform_device_register(&my_device);
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_device_unregister(&my_device);
+    printk(KERN_INFO "unregister %s device\n", my_device.name);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+#### 4.3.2 `platform驱动`
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/io.h>
+#include <linux/resource.h>
+#include <linux/platform_device.h>
+
+static int my_probe(struct platform_device *pdev)
+{
+    int i;
+    struct resource	*res;
+    printk(KERN_INFO "%s matched\n", pdev->name);
+
+    printk(KERN_INFO "Method:1 resource info .......................................\n");
+    for (i = 0; i < pdev->num_resources; i++) {
+        res = &pdev->resource[i];
+        printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    }
+    
+    printk(KERN_INFO "\nMethod:2 resource info .......................................\n");
+    for (i = 0; i < pdev->num_resources; i++) {
+        res = platform_get_resource(pdev, IORESOURCE_MEM, i);
+        printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    }
+    
+    printk(KERN_INFO "\nMethod:3 resource info .......................................\n");
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "mux_ctrl");
+    printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "pad_ctrl");
+    printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpio_dr");
+    printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+    res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpio_gdir");
+    printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    printk(KERN_INFO "%s remove\n", pdev->name);
+    return 0;
+}
+
+const struct platform_device_id my_id_table[] = {
+    { .name = "my-led" },
+    { /* sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .probe  = my_probe,
+    .remove = my_remove,
+    .driver = {
+        .name = "my-led",
+        .owner = THIS_MODULE
+    },
+    .id_table = my_id_table
+};
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "register %s driver\n", my_driver.driver.name);
+    platform_driver_register(&my_driver);
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk(KERN_INFO "unregister %s driver\n", my_driver.driver.name);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+### 4.4 实测结果
+
+实测3种方式，获取到的资源内容一致。
+
+![](./src/0003.jpg)
 
