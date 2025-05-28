@@ -844,9 +844,217 @@ static int my_probe(struct platform_device *pdev)
 }
 ```
 
-### 4.3 实例代码
+### 4.3 `传递引脚号资源`
 
-#### 4.3.1 `platform设备`
+前面我们在`platform_device`中分别设置了`mux_ctrl、pad_ctrl、gpio5_dr、gpio5_gdir`这4个寄存器资源，然后在`platform_driver`获取这些寄存器资源。
+
+看起来问题都已经解决了，但其实具体的引脚号还没有传递。比如，我现在要通过`gpio5_gdir`设置led的引脚为输出，但引脚号不知道。这里问题就来了，引脚号并不对应具体的寄存器，我们不好通过`IORESOURCE_MEM`来映射。应该怎么办？
+
+#### 4.3.1 通过`IORESOURCE_IRQ`，把引脚号通过中断号来传递
+
+我们可以在`platform_device`的`resource`数组再增加一项，定义`IORESOURCE_IRQ`来传递GPIO引脚号:
+
+```c
+static struct resource my_res[] = {
+    [4] = {
+        .start  = 0,	// Led引脚号，GPIO5_IO00
+        .flags  = IORESOURCE_IRQ,
+        .name   = "gpio_pin"
+    }
+};
+```
+
+`platform_driver`驱动，可以通过`platform_get_resource()`获取:
+
+```c
+static int my_probe(struct platform_device *pdev)
+{
+    struct resource	*res;
+    printk(KERN_INFO "%s matched\n", pdev->name);
+
+    res = platform_get_resource(pdev, IORESOURCE_IRQ, 4);
+	unsigned int gpio_pin = res->start;	// 获取GPIO引脚号
+
+    return 0;
+}
+```
+
+这里其实有点疑问。`IORESOURCE_IRQ`能否标识普通GPIO引脚？
+
+*可以，但并非最佳实践。*
+
+1. 可行性
+
+	通过将GPIO引脚编码到`IORESOURCE_IRQ`的`.start`字段，可实现GPIO引脚传递。
+	
+2. 局限性
+
+	+ 语义混淆: IRQ资源本应用于中断处理，直接传递GPIO编号会导致代码可读性下降
+	+ 功能缺失: 无法直接支持GPIO方向设置、电平读写等基础操作，需要手动操作寄存器
+	+ 兼容性风险: 与GPIO子系统的标准化接口不兼容
+
+3. 推荐替代方案: 自定义`platform_data`传递硬件信息
+
+4. 应用场景选择建议
+
+| 场景 | 推荐资源类型 | 理由 |
+| - | - | - |
+| 外设寄存器访问 | `IORESOURCE_MEM` | 直接映射物理地址，符合内存操作语义 |
+| 中断事件处理 | `IORESOURCE_IRQ` | 明确中断触发机制，支持回调函数注册 |
+| GPIO引脚控制(非中断) | 自定义数据`platform_data` | 避免资源类型滥用，兼容Linux标准化接口 |
+
+#### 4.3.2 自定义数据`platform_data`
+
+##### 4.3.2.1 什么是自定义数据`platform_data`
+
+什么是自定义数据`platform_data`？我们看下之前的做法。
+
+```c
+static struct platform_device my_device = {
+    .name = "my-led",
+    .id = -1,
+    .num_resources = ARRAY_SIZE(my_res),
+    .resource = my_res,
+    .dev = {
+        .release = my_release
+    },
+};
+```
+
+`platform_device`中有2个重要的成员:
+
+1. `struct resource	*resource`: 资源数组，对应我们的寄存器映射
+2. `struct device	dev`: 通用设备模型。里面有个成员可以自定义数据`platform_data`
+
+	```c
+	struct device {
+		/* 其他成员 */
+		void		*platform_data;	/* Platform specific data, device
+						   core doesn't touch it */
+		/* 其他成员 */
+	};
+	```
+
+前面我们提到，内核在执行`platform_driver`驱动的`probe()`函数时，会把`platform_device`作为参数传入。那么我们就可以获取到成员`struct device dev`里面的`platform_data`自定义数据。
+
+##### 4.3.2.2 `platform_data`作用和适用场景
+
+`struct device`结构体的`platform_data`成员，是Linux设备驱动模型中用于传递板级硬件配置信息的核心机制。
+
++ *核心作用*
+
+`platform_data`是一个`void *`类型指针，用于存储与特定硬件平台相关的配置数据。这些数据由板级支持包(BSP)定义，驱动通过解析这些数据完成对硬件的适配。
+
+1. `解耦驱动与硬件细节`: 将硬件相关的参数从驱动代码中剥离，提升驱动的跨平台复用性
+2. `传递非标准化资源`: 描述无法通过标准资源`resource`表达的硬件特性，比如GPIO引脚号、外设工作模式(网卡速率)
+
++ *典型适用场景*
+
+1. 板级硬件差异适配
+
+	+ 在嵌入式开发中，同一芯片的外设(网卡、GPIO控制器)在不同电路板上的连接方式可能不同。通过`platform_data`传递差异化参数
+	+ 示例: DM9000网卡在不同开发板上，可能使用8位或16位数据总线模式。在BSP中定义`dm9000_plat_data`结构体，通过`platform_data`传递flags标志，驱动根据此标志初始化总线宽度
+	
+2. 传递非标准外设参数
+
+	+ 某些设备的配置无法通过`struct resource`完全描述，需要自定义数据结构
+	+ 示例: LED设备的板级配置(GPIO编号、极性)。定义`gpio_led_platform_data`结构体，包含每个LED的GPIO编号、名称和触发条件，驱动通过`platform_data`读取并初始化LED控制器
+	
+3. 设备树的替代方案
+
+	+ 在未使用设备树的传统内核中，`platform_data`是传递硬件描述的主要方式
+	+ 示例: ARM平台通过BSP代码(arch/arm/mach-*/board-*.c)定义`platform_device`，并将设备数中类似的信息(如时钟频率、DMA通道)封装到`platform_data`中
+
++ *操作流程*
+
+1. BSP定义数据结构: 在板级代码中声明自定义结构体，填充硬件参数
+
+	```c
+	struct mydev_platdata {
+		u32 reg_base;
+		int irq_num;
+		bool use_dma;
+	};
+	```
+	
+2. 绑定到`platform_device`: 在注册`platform_device`时，直接把`mydev_platdata`地址设置给`platform_data`，或通过接口`platform_device_add_data()`来设置，原理一样
+
+	```c
+	struct mydev_platdata config = {.reg_base = 0xFE00, .irq_num = 32};
+	
+	/* 方法1: 直接添加 */
+	pdev->dev.platform_data = &config;
+	
+	/* 方法2: 通过接口添加 */
+	platform_device_add_data(pdev, &config, sizeof(config));
+	```
+
+3. 驱动读取数据: 在驱动的`probe()`函数中，通过`dev_get_platdata()`获取并解析，也可以直接访问结构体成员来获取
+
+	```c
+	/* 方法1: 直接获取 */
+	struct mydev_platdata *pdata = pdev->dev.platform_data;
+	
+	/* 方法2: 通过接口获取 */
+	struct mydev_platdata *pdata = dev_get_platdata(&pdev->dev);
+	if (pdata->use_dma) 
+		setup_dma_channels();
+	```
+
++ *设计建议*
+
+	1. 数据封装原则: 将硬件相关的所有可变参数，集中到单一结构体中，避免分散定义
+	2. 生命周期管理: `platform_data`通常由BSP静态分配，驱动不应修改其内容，仅作只读访问
+
+##### 4.3.2.3 `platform_data`传递GPIO引脚号
+
+我们在`platform_device`中定义引脚号的结构体，并设置给`pdev->dev.platform_data`。
+
+```c
+struct gpio_pin_info {
+    u32 pin;
+    const char *label;
+};
+
+static const struct gpio_pin_info my_pin = {
+    .pin = 0,
+    .label = "GPIO5_IO00"
+};
+
+static struct platform_device my_device = {
+    .name = "my-led",
+    .id = -1,
+    .num_resources = ARRAY_SIZE(my_res),
+    .resource = my_res,
+    .dev = {
+        .platform_data = &my_pin,   // 设置platfoem
+        .release       = my_release
+    },
+};
+```
+然后在`platform_driver`中获取`platform_data`，取出引脚号。
+
+```c
+static int my_probe(struct platform_device *pdev)
+{
+    struct gpio_pin_info *pin;
+    printk(KERN_INFO "%s matched\n", pdev->name);
+
+    printk(KERN_INFO "\nplatform_data:1 direct access .......................................\n");
+    pin = pdev->dev.platform_data;
+    printk(KERN_INFO "pin:%s num:%d\n", pin->label, pin->pin);
+
+    printk(KERN_INFO "\nplatform_data:2 interface access .......................................\n");
+    pin = dev_get_platdata(&pdev->dev);
+    printk(KERN_INFO "pin:%s num:%d\n", pin->label, pin->pin);
+
+    return 0;
+}
+```
+	
+### 4.4 实例代码
+
+#### 4.4.1 `platform设备`
 
 ```c
 #include <linux/init.h>
@@ -888,6 +1096,16 @@ static struct resource my_res[] = {
     }
 };
 
+struct gpio_pin_info {
+    u32 pin;
+    const char *label;
+};
+
+static const struct gpio_pin_info my_pin = {
+    .pin = 0,
+    .label = "GPIO5_IO00"
+};
+
 static void my_release(struct device *dev)
 {
     struct platform_device *pdev = container_of(dev, struct platform_device, dev);
@@ -900,7 +1118,8 @@ static struct platform_device my_device = {
     .num_resources = ARRAY_SIZE(my_res),
     .resource = my_res,
     .dev = {
-        .release = my_release
+        .platform_data = &my_pin,
+        .release       = my_release
     },
 };
 
@@ -924,7 +1143,7 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("ding");
 ```
 
-#### 4.3.2 `platform驱动`
+#### 4.4.2 `platform驱动`
 
 ```c
 #include <linux/init.h>
@@ -933,10 +1152,16 @@ MODULE_AUTHOR("ding");
 #include <linux/resource.h>
 #include <linux/platform_device.h>
 
+struct gpio_pin_info {
+    u32 pin;
+    const char *label;
+};
+
 static int my_probe(struct platform_device *pdev)
 {
     int i;
     struct resource	*res;
+    struct gpio_pin_info *pin;
     printk(KERN_INFO "%s matched\n", pdev->name);
 
     printk(KERN_INFO "Method:1 resource info .......................................\n");
@@ -960,6 +1185,14 @@ static int my_probe(struct platform_device *pdev)
     printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
     res = platform_get_resource_byname(pdev, IORESOURCE_MEM, "gpio_gdir");
     printk(KERN_INFO "%-10s start:0x%08X end:0x%08X flag:0x%08X\n", res->name, res->start, res->end, res->flags);
+
+    printk(KERN_INFO "\nplatform_data:1 direct access .......................................\n");
+    pin = pdev->dev.platform_data;
+    printk(KERN_INFO "pin:%s num:%d\n", pin->label, pin->pin);
+
+    printk(KERN_INFO "\nplatform_data:2 interface access .......................................\n");
+    pin = dev_get_platdata(&pdev->dev);
+    printk(KERN_INFO "pin:%s num:%d\n", pin->label, pin->pin);
 
     return 0;
 }
@@ -1003,9 +1236,10 @@ module_exit(my_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("ding");
+
 ```
 
-### 4.4 实测结果
+### 4.5 实测结果
 
 实测3种方式，获取到的资源内容一致。
 
