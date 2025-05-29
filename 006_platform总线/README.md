@@ -1245,3 +1245,640 @@ MODULE_AUTHOR("ding");
 
 ![](./src/0003.jpg)
 
+## 第5章 `probe()`与`remove()`操作LED
+
+在前面的章节，我们主要做了两件事:
+
+1. 在`platform_device`设备中，定义了LED需要的寄存器资源
+2. 在`platform_driver`驱动中，获取到了寄存器资源
+
+**OK。寄存器有了，我们现在还需要做什么呢？**
+
++ 寄存器地址映射: ioremap
++ 创建字符设备和设备文件: alloc_chedrv_region、cdev_init、class_create、device_create
+
+执行这些流程，有先后顺序的要求吗？
+
+### 5.1 `platform`字符设备驱动的操作顺序规范
+
+在编写`platform_driver`的字符设备驱动时，资源处理与设备创建的顺序，具有明确的规范。
+
++ *操作顺序规范*
+
+正确的顺序应为: 先处理硬件资源(Resource)再创建字符设备。原因如下:
+
+1. 资源依赖: 字符设备的操作(open、read、write)通常需要访问硬件资源(如寄存器、GPIO、中断)，若未初始化资源直接操作设备，会导致内核错误
+2. 架构一致性: Linux设备驱动模型，要求`probe()`函数完成硬件初始化后再注册设备，确保用户空间访问设备时资源已就绪
+3. 错误处理安全: 若资源初始化失败，应在`probe()`中以前推出，避免创建无效设备节点污染系统
+
+### 5.2 通用代码框架
+
+以下是基于传统platform总线的通用字符设备驱动框架：
+
+#### 5.2.1 设备模块`my_device.c`: 描述硬件资源
+
+设备模块就是常规操作了。
+
+```c
+#include <linux/module.h>
+#include <linux/platform_device.h>
+
+/* 定义寄存器地址范围示例 */
+#define MYDEV_BASE_ADDR 0x12345000
+#define MYDEV_REG_SIZE   0x100
+
+/* 设备资源定义 */
+static struct resource mydev_resources[] = {
+    [0] = {  // 内存资源
+        .start = MYDEV_BASE_ADDR,
+        .end = MYDEV_BASE_ADDR + MYDEV_REG_SIZE - 1,
+        .flags = IORESOURCE_MEM,
+    },
+    // 可添加中断资源等...
+};
+
+static void mydev_release(struct device *dev) {
+    printk(KERN_INFO "mydevice released\n");
+}
+
+/* Platform设备定义 */
+static struct platform_device my_device = {
+    .name = "my_char_device",
+    .id = -1,
+    .dev = {
+        .release = mydev_release,
+    },
+    .num_resources = ARRAY_SIZE(mydev_resources),
+    .resource = mydev_resources,
+};
+
+/* 模块初始化 */
+static int __init mydevice_init(void) {
+    return platform_device_register(&my_device);
+}
+
+/* 模块退出 */
+static void __exit mydevice_exit(void) {
+    platform_device_unregister(&my_device);
+}
+
+module_init(mydevice_init);
+module_exit(mydevice_exit);
+MODULE_LICENSE("GPL");
+```
+
+#### 5.2.2 驱动模块`mydriver.c`: 实现设备驱动
+
+驱动模块有很多技巧。我们来逐一分析:
+
++ `probe()`函数
+	1. 不创建静态的设备，而是在`probe()`函数中动态申请`priv`
+	2. 先通过`platform_get_resource()`获取硬件资源
+	3. 使用devm_ioremap映射寄存，映射的大小通过`resource_size(res)`来获取，直接写`res->end - res->start + 1`太麻烦了
+	4. 最后注册字符设备
+	5. 设备结构体只有`class`没有`device`，因为不需要使用`device`
+	6. 使用`platform_set_drvdata(pdev, priv)`，把申请的`priv`设置给`struct device`的结构体成员`driver_data`，这样在`remove()`函数中就可以获取到`priv`
+	
++ `remove()`函数
+	1. 通过`platform_get_drvdata(pdev)`，获取`priv`资源
+	2. 销毁设备、设备类、字符设备、设备号
+
++ `open()`函数
+	1. 使用`struct mydev_priv *priv = container_of(inode->i_cdev, struct mydev_priv, cdev);`，通过i_node获取`priv`
+	2. 把`priv`设置给`filp->private_data`指针
+
++ `probe()`函数使用了`devm_*`这类接口来申请内存和资源。`devm_*`接口的特点是，在rmmod移除模块时，内核会自动释放内存和资源，不需要在`remove()`中显式的释放
+	
+```c
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/platform_device.h>
+#include <linux/io.h>
+
+#define DEVICE_NAME "my_char_device"
+#define CLASS_NAME "my_class"
+
+/* 设备私有数据结构 */
+struct mydev_priv {
+    struct cdev cdev;
+    dev_t devno;
+    struct class *cls;
+    void __iomem *reg_base;
+};
+
+/* 文件操作函数集 */
+static int mydev_open(struct inode *inode, struct file *filp) {
+    struct mydev_priv *priv = container_of(inode->i_cdev, struct mydev_priv, cdev);
+    filp->private_data = priv;
+    return 0;
+}
+
+static ssize_t mydev_read(struct file *filp, char __user *buf, size_t count, loff_t *pos) {
+    struct mydev_priv *priv = filp->private_data;
+    // 通过priv->reg_base访问硬件寄存器
+    return 0;
+}
+
+static struct file_operations mydev_fops = {
+    .owner = THIS_MODULE,
+    .open = mydev_open,
+    .read = mydev_read,
+};
+
+/* Platform驱动probe函数 */
+static int mydev_probe(struct platform_device *pdev) {
+    struct mydev_priv *priv;
+    struct resource *res;
+    int ret;
+
+    /* 1. 分配私有结构体 */
+    priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv) return -ENOMEM;
+
+    /* 2. 获取硬件资源 */
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    if (!res) {
+        ret = -ENXIO;
+        goto err_res;
+    }
+
+    /* 3. 映射寄存器 */
+    priv->reg_base = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+    if (!priv->reg_base) {
+        ret = -ENOMEM;
+        goto err_res;
+    }
+
+    /* 4. 注册字符设备 */
+    ret = alloc_chrdev_region(&priv->devno, 0, 1, DEVICE_NAME);
+    if (ret < 0) goto err_alloc;
+
+    cdev_init(&priv->cdev, &mydev_fops);
+    priv->cdev.owner = THIS_MODULE;
+
+    ret = cdev_add(&priv->cdev, priv->devno, 1);
+    if (ret) goto err_cdev;
+
+    /* 5. 创建设备节点 */
+    priv->cls = class_create(THIS_MODULE, CLASS_NAME);
+    if (IS_ERR(priv->cls)) {
+        ret = PTR_ERR(priv->cls);
+        goto err_class;
+    }
+
+    device_create(priv->cls, NULL, priv->devno, NULL, DEVICE_NAME);
+    platform_set_drvdata(pdev, priv);
+    return 0;
+
+    /* 错误处理 */
+err_class:
+    cdev_del(&priv->cdev);
+err_cdev:
+    unregister_chrdev_region(priv->devno, 1);
+err_alloc:
+    devm_iounmap(&pdev->dev, priv->reg_base);
+err_res:
+    return ret;
+}
+
+static int mydev_remove(struct platform_device *pdev) {
+    struct mydev_priv *priv = platform_get_drvdata(pdev);
+    device_destroy(priv->cls, priv->devno);
+    class_destroy(priv->cls);
+    cdev_del(&priv->cdev);
+    unregister_chrdev_region(priv->devno, 1);
+    return 0;
+}
+
+static struct platform_driver my_driver = {
+    .driver = {
+        .name = DEVICE_NAME,
+        .owner = THIS_MODULE,
+    },
+    .probe = mydev_probe,
+    .remove = mydev_remove,
+};
+
+module_platform_driver(my_driver);
+MODULE_LICENSE("GPL");
+```
+
+### 5.3 `devm_*`系列函数
+
+`devm`系列函数头文件
+
+```c
+#include <linux/device.h>
+```
+
+#### 5.3.1 `devm`系列函数的核心机制
+
+devm(`Device Resource Management`)系列函数，是Linux内核提供的一种`设备资源自动管理机制`，通过将资源(如内存、中断、GPIO)与设备(struct device)绑定，实现资源的自动释放。当设备被卸载或驱动注册失败时，内核会自动调用预定义的释放函数，避免内存泄露或资源未回收问题。
+
+#### 5.3.2 主要`devm`系列函数及作用
+
+1. *内存管理*
+
+	+ *devm_kmalloc/devm_kzalloc*
+
+		+ 作用: 分配内核内存，功能等同于`kmalloc/kzalloc`，但内存与设备生命周期绑定
+		+ 适用场景: 设备驱动中需要动态分配内存(如私有数据结构)，无需手动`kfree`
+		+ 示例: 
+		
+			```c
+			struct priv_data *data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+			```
+
+	+ *devm_kfree*
+
+		+ 作用: 显式释放由`devm_kmalloc`分配的内存(通常不建议主动调用)
+	
+2. *中断管理*
+
+	+ *devm_request_irq*
+	
+		+ 作用: 申请中断并绑定到设备，驱动卸载时自动释放中断
+		+ 示例:
+		
+			```c
+			devm_request_irq(dev, irq, handler, flags, "dev_irq", data);
+			```
+			
+3. *GPIO管理*
+
+	+ *devm_gpio_request*
+	
+		+ 作用: 申请GPIO引脚，设备卸载时自动释放
+
+	+ *devm_gpiod_get*
+	
+		+ 作用: 通过设备树获取GPIO描述符，自动管理生命周期
+		
+4. *IO内存*
+
+	+ *devm_ioremap*
+	
+		+ 作用: 映射设备物理内存到内核虚拟地址空间，自动解除映射
+		+ 适用场景: 访问设备寄存器或内存区域时
+		
+5. *典型代码流程*
+
+	```c
+	static int my_probe(struct platform_device *pdev) {
+		struct device *dev = &pdev->dev;
+		// 自动管理内存
+		struct priv_data *data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+		// 自动管理中断
+		devm_request_irq(dev, irq, handler, 0, "my_irq", data);
+		// 自动管理GPIO
+		int gpio = devm_gpiod_get(dev, "enable", GPIOD_OUT_HIGH);
+		return 0;
+	}
+
+	static int my_remove(struct platform_device *pdev) {
+		// 无需手动释放资源
+		return 0;
+	}
+	```
+
+### 5.4 `priv`数据封装
+
+在Linux内核驱动开发中，封装`priv`指针以实现跨函数的安全访问，需要结合`设备模型、数据生命周期管理和内核API`的综合设计。以下是分步骤的技术实现方案:
+
+#### 5.4.1 `struct priv`的定义与初始化(probe阶段)
+
+在设备探测阶段(probe函数)中，通过动态内存分配创建私有数据结构体，并绑定到设备对象:
+
+```c
+// 定义设备私有数据结构
+struct mydev_priv {
+    void __iomem *reg_base;   // 寄存器基地址
+    int irq_num;              // 中断号
+    struct mutex lock;        // 互斥锁
+    struct cdev cdev;         // 字符设备
+    // 其他设备特定字段...
+};
+
+static int mydev_probe(struct platform_device *pdev) {
+    struct mydev_priv *priv;
+    // 分配自动释放的内存（推荐使用devm系列函数）
+    priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv) return -ENOMEM;
+    
+    // 初始化硬件资源（如寄存器映射）
+    priv->reg_base = devm_platform_ioremap_resource(pdev, 0);
+    if (IS_ERR(priv->reg_base)) return PTR_ERR(priv->reg_base);
+    
+    // 绑定私有数据到设备（核心操作）
+    platform_set_drvdata(pdev, priv);  // [1](@ref)
+    return 0;
+}
+```
+
+这里最重要的一步操作，就是`platform_set_drvdata(pdev, priv);`。在之前我们介绍了，`probe`函数的入参`pdev`类型时`struct platform_device`，其中有个成员为`struct device dev`。
+
+```c
+struct device {
+	void *platform_data;/* Platform specific data, device core doesn't touch it */
+	void *driver_data;	/* Driver data, set and get with dev_set/get_drvdata */
+};
+```
+
++ `void *platform_data`: 这个是给`platform_device`自定义数据硬件资源
++ `void *driver_data`: 这个是给`platform_driver`来保存私有数据，正好就用来保存`priv`指针
+
+#### 5.4.2 跨函数访问封装`remove阶段`
+
+原理: `platform_get_drvdata`反向解析设备关联的私有数据
+
+```c
+// Remove函数
+static int mydev_remove(struct platform_device *pdev) {
+    struct mydev_priv *priv = platform_get_drvdata(pdev);  // [1](@ref)
+    // 自动释放由devm_系列分配的资源，无需手动释放
+    return 0;
+}
+```
+
+#### 5.4.3 跨函数访问封装`open、read、write阶段`
+
+原理: 通过`container_of`宏实现结构体内嵌成员的逆向推导（如字符设备cdev与priv的关联）
+
+```c
+// Open函数
+static int mydev_open(struct inode *inode, struct file *filp) {
+    struct mydev_priv *priv = container_of(inode->i_cdev, struct mydev_priv, cdev);  // [2](@ref)
+    filp->private_data = priv;  // 传递到文件操作上下文
+    return 0;
+}
+
+// Read/Write函数
+static ssize_t mydev_read(struct file *filp, char __user *buf, size_t count, loff_t *pos) {
+    struct mydev_priv *priv = filp->private_data;
+    mutex_lock(&priv->lock);  // 并发保护
+    // 访问寄存器或私有数据
+    mutex_unlock(&priv->lock);
+    return count;
+}
+```
+
+### 5.5 代码实例
+
+#### 5.5.1 `led_device.c`
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/io.h>
+#include <linux/resource.h>
+#include <linux/platform_device.h>
+
+/* LED1: SNVS_TAMPER1(GPIO5_IO01), LED1: SNVS_TAMPER2(GPIO5_IO02) */
+#define MUX_CTRL_BASE   0X0229000C
+#define PAD_CTRL_BASE   0X02290050
+#define GPIO_DR_BASE    0x020AC000
+#define GPIO_GDIR_BASE  0x020AC004
+
+struct gpio_pin_info {
+    u32 pin;
+    const char *label;
+};
+
+static struct resource my_res[] = {
+    [0] = {
+        .start  = MUX_CTRL_BASE,
+        .end    = MUX_CTRL_BASE + SZ_4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "mux_ctrl"
+    },
+    [1] = {
+        .start  = PAD_CTRL_BASE,
+        .end    = PAD_CTRL_BASE + SZ_4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "pad_ctrl"
+    },
+    [2] = {
+        .start  = GPIO_DR_BASE,
+        .end    = GPIO_DR_BASE + SZ_4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "gpio_dr"
+    },
+    [3] = {
+        .start  = GPIO_GDIR_BASE,
+        .end    = GPIO_GDIR_BASE + SZ_4 - 1,
+        .flags  = IORESOURCE_MEM,
+        .name   = "gpio_gdir"
+    }
+};
+
+static struct gpio_pin_info my_pin = {
+    .pin = 1,
+    .label = "GPIO5_IO01"
+};
+
+static void my_release(struct device *dev)
+{
+    struct platform_device *pdev = container_of(dev, struct platform_device, dev);
+    printk(KERN_INFO "%s device released\n", pdev->name);
+}
+
+static struct platform_device my_device = {
+    .name = "my-led",
+    .id = -1,
+    .num_resources = ARRAY_SIZE(my_res),
+    .resource = my_res,
+    .dev = {
+        .platform_data = &my_pin,
+        .release       = my_release
+    },
+};
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "register %s device\n", my_device.name);
+    platform_device_register(&my_device);
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_device_unregister(&my_device);
+    printk(KERN_INFO "unregister %s device\n", my_device.name);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+#### 5.5.2 `led_driver.c`
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/io.h>
+#include <linux/resource.h>
+#include <linux/platform_device.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/device.h>
+#include <linux/uaccess.h>
+
+struct my_device {
+    dev_t devno;
+    struct cdev cdev;
+    struct class *class;
+    void __iomem *mux_ctrl;
+    void __iomem *pad_ctrl;
+    void __iomem *gpio_dr;
+    void __iomem *gpio_gdir;
+    u32 pin;
+};
+
+struct gpio_pin_info {
+    u32 pin;
+    const char *label;
+};
+
+static int my_open(struct inode *inode, struct file *filp)
+{
+    u32 reg_val;
+    struct my_device *priv = container_of(inode->i_cdev, struct my_device, cdev);
+    filp->private_data = priv;
+
+    writel(5, priv->mux_ctrl);
+    writel(0x10b0, priv->pad_ctrl);
+    reg_val = readl(priv->gpio_gdir);
+    reg_val |= 1 << priv->pin;
+    writel(reg_val, priv->gpio_gdir);
+    reg_val = readl(priv->gpio_dr);
+    reg_val |= 1 << priv->pin;
+    writel(reg_val, priv->gpio_dr);
+
+    return 0;
+}
+
+static ssize_t my_write(struct file *filp, const char __user *buf, size_t size, loff_t *pos)
+{
+    u8 val, reg_val;
+    struct my_device *priv = filp->private_data;
+
+    if (copy_from_user(&val, buf, 1)) {
+        return -EFAULT;
+    }
+    if (val == 1 || val == '1') {
+        reg_val = readl(priv->gpio_dr);
+        reg_val &= ~(1 << priv->pin);
+        writel(reg_val, priv->gpio_dr);
+    }
+    else if (val == 0 || val == '0') {
+        reg_val = readl(priv->gpio_dr);
+        reg_val |= ~(1 << priv->pin);
+        writel(reg_val, priv->gpio_dr);
+    }
+
+    return size;
+}
+
+static int my_release(struct inode *inode, struct file *filp)
+{
+    return 0;
+}
+
+static const struct file_operations my_fops = {
+    .owner   = THIS_MODULE,
+    .open    = my_open,
+    .write   = my_write,
+    .release = my_release
+};
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_device *priv;
+    struct resource	*res;
+    struct gpio_pin_info *pin;
+    
+    /* 1. 分配内存、获取硬件资源、映射寄存器 */
+    priv = devm_kzalloc(&pdev->dev, sizeof(struct my_device), GFP_KERNEL);
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    priv->mux_ctrl = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+    priv->pad_ctrl = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 2);
+    priv->gpio_dr = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 3);
+    priv->gpio_gdir = devm_ioremap(&pdev->dev, res->start, resource_size(res));
+    pin = dev_get_platdata(&pdev->dev);
+    priv->pin = pin->pin;
+
+    /* 2. 创建字符设备，字符设备注册成功后，可以在open()方法获取到priv */
+    /* priv = container_of(inode->i_cdev, struct my_device, cdev) */
+    alloc_chrdev_region(&priv->devno, 0, 1, "my-led");
+    cdev_init(&priv->cdev, &my_fops);
+    priv->cdev.owner = THIS_MODULE;
+    cdev_add(&priv->cdev, priv->devno, 1);
+    priv->class = class_create(THIS_MODULE, "my-led");
+    device_create(priv->class, NULL, priv->devno, NULL, "my-led");
+
+    /* 3. 把priv设置给pdev的driver_data字段，这样可以在remove()函数中获取到priv */
+    platform_set_drvdata(pdev, priv);
+
+    printk(KERN_INFO "%s matched\n", pdev->name);
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    struct my_device *priv;
+    
+    priv = platform_get_drvdata(pdev);
+    device_destroy(priv->class, priv->devno);
+    class_destroy(priv->class);
+    cdev_del(&priv->cdev);
+    unregister_chrdev_region(priv->devno, 1);
+
+    printk(KERN_INFO "%s remove\n", pdev->name);
+    return 0;
+}
+
+const struct platform_device_id my_id_table[] = {
+    { .name = "my-led" },
+    { /* sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .probe  = my_probe,
+    .remove = my_remove,
+    .driver = {
+        .name = "my-led",
+        .owner = THIS_MODULE
+    },
+    .id_table = my_id_table
+};
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "register %s driver\n", my_driver.driver.name);
+    platform_driver_register(&my_driver);
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk(KERN_INFO "unregister %s driver\n", my_driver.driver.name);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+#### 5.5.3 测试结果
+
+最终实测，可以正常点亮或关闭LED设备。我们的`platform`总线的学习到此结束。
