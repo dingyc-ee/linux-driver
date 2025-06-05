@@ -71,4 +71,224 @@ graph LR
 
 ### 2.2 设备树文件存放路径
 
+ARM体系结构下的设备树源文件，通常存放在内核源码`arch/arm/boot/dts`目录中。如下所示:
 
+```sh
+ding@linux:~/linux/imx/kernel/arch/arm/boot/dts$ pwd
+/home/ding/linux/imx/kernel/arch/arm/boot/dts
+ding@linux:~/linux/imx/kernel/arch/arm/boot/dts$ ls imx6ull*
+imx6ull-14x14-ddr3-arm2-adc.dtb        imx6ull-14x14-ddr3-arm2-ldo.dtb       imx6ull-14x14-evk-emmc.dtb
+imx6ull-14x14-ddr3-arm2-adc.dts        imx6ull-14x14-ddr3-arm2-ldo.dts       imx6ull-14x14-evk-emmc.dts
+imx6ull-14x14-ddr3-arm2-cs42888.dtb    imx6ull-14x14-ddr3-arm2-qspi-all.dtb  imx6ull-14x14-evk-gpmi-weim.dtb
+imx6ull-14x14-ddr3-arm2-cs42888.dts    imx6ull-14x14-ddr3-arm2-qspi-all.dts  imx6ull-14x14-evk-gpmi-weim.dts
+imx6ull-14x14-ddr3-arm2.dtb            imx6ull-14x14-ddr3-arm2-qspi.dtb      imx6ull-14x14-evk-usb-certi.dtb
+imx6ull-14x14-ddr3-arm2.dts            imx6ull-14x14-ddr3-arm2-qspi.dts      imx6ull-14x14-evk-usb-certi.dts
+imx6ull-14x14-ddr3-arm2-ecspi.dtb      imx6ull-14x14-ddr3-arm2-tsc.dtb       imx6ull-9x9-evk-btwifi.dtb
+imx6ull-14x14-ddr3-arm2-ecspi.dts      imx6ull-14x14-ddr3-arm2-tsc.dts       imx6ull-9x9-evk-btwifi.dts
+imx6ull-14x14-ddr3-arm2-emmc.dtb       imx6ull-14x14-ddr3-arm2-uart2.dtb     imx6ull-9x9-evk.dtb
+imx6ull-14x14-ddr3-arm2-emmc.dts       imx6ull-14x14-ddr3-arm2-uart2.dts     imx6ull-9x9-evk.dts
+imx6ull-14x14-ddr3-arm2-epdc.dtb       imx6ull-14x14-ddr3-arm2-usb.dtb       imx6ull-9x9-evk-ldo.dtb
+imx6ull-14x14-ddr3-arm2-epdc.dts       imx6ull-14x14-ddr3-arm2-usb.dts       imx6ull-9x9-evk-ldo.dts
+imx6ull-14x14-ddr3-arm2-flexcan2.dtb   imx6ull-14x14-ddr3-arm2-wm8958.dtb    imx6ull.dtsi
+imx6ull-14x14-ddr3-arm2-flexcan2.dts   imx6ull-14x14-ddr3-arm2-wm8958.dts    imx6ull_iot.dtb
+imx6ull-14x14-ddr3-arm2-gpmi-weim.dtb  imx6ull-14x14-evk-btwifi.dtb          imx6ull_iot.dts
+imx6ull-14x14-ddr3-arm2-gpmi-weim.dts  imx6ull-14x14-evk-btwifi.dts          imx6ull-pinfunc.h
+imx6ull-14x14-ddr3-arm2-lcdif.dtb      imx6ull-14x14-evk.dtb                 imx6ull-pinfunc-snvs.h
+imx6ull-14x14-ddr3-arm2-lcdif.dts      imx6ull-14x14-evk.dts
+```
+
+### 2.3 设备树的编译
+
+在ARM Linux系统中，设备树(`Device-Tree`)的编译，是将设备树源文件`.dts`转换成二进制文件(.dtb)的过程，以便内核或引导加载程序识别硬件配置。以下是完整的编译流程及关键步骤：
+
+#### 2.3.1 编译器`DTC`
+
+在Linux内核源码中，`DTC`的源代码和相关工具，通常存放在`scripts/dtc`目录中，如下图所示：
+
+![](./src/0001.jpg)
+
+在编译完源码后，`dtc`设备树编译器会默认生成。
+
+#### 2.3.2 设备树的编译
+
+设备树有2种编译方式:
+
+1. 内核集中编译(推荐): 通过内核构建系统自动编译所有配置的设备树
+2. 单独编译特定设备树: 针对单个`.dts`文件编译
+
+##### 2.3.2.1 内核集中编译(推荐)
+
+进入内核源码目录，执行命令:
+
+```sh
+make dtbs	# 编译所有设备树
+```
+
++ 输出路径: 编译后的`.dtb`文件，默认生成在`arch/arm/boot/dts`目录下
+
+##### 2.3.2.2 单独编译特定设备树
+
+针对单个`.dts`文件编译:
+
+```sh
+dtc -I dts -O dtb -o output.dtb input.dts
+```
+
+下面举例。我们写一个最简单的设备树框架来编译:
+
+```dts
+/dts-v1/;
+/{
+
+};
+```
+
+编译如下:
+
+```sh
+ding@linux:~/linux/imx/driver/ch6_device_tree/01_base_dts$ ~/linux/imx/kernel/scripts/dtc/dtc -I dts -O dtb -o test.dtb test.dts
+ding@linux:~/linux/imx/driver/ch6_device_tree/01_base_dts$ ls
+test.dtb  test.dts
+```
+
+其中，`input.dts`是输入的设备树源文件，`output.dtb`是编译后的二进制设备树文件
+
+##### 2.3.2.3 设备树的反编译
+
+设备树的反编译，是将二进制设备树文件转换回设备树源文件的过程，以便进行查看、编辑或修改。饭编译器通常也是DTC。
+
+```sh
+dtc -I dtb -O dts -o output.dts input.dtb
+```
+
+其中，`input.dtb`是输入的二进制设备树文件，`output.dts`是反编译后的设备树源文件
+
+下面举例，我们对上面编译的二进制设备树，进行反编译。可以看到，反编译之后的设备树，与源码一致。
+
+```sh
+ding@linux:~/linux/imx/driver/ch6_device_tree/01_base_dts$ ~/linux/imx/kernel/scripts/dtc/dtc -I dtb -O dts -o 1.dts test.dtb 
+ding@linux:~/linux/imx/driver/ch6_device_tree/01_base_dts$ cat 1.dts 
+/dts-v1/;
+
+/ {
+};
+```
+
+## 第3章 设备树基本语法
+
+### 3.1 根节点
+
+根节点是整个设备树的起点和顶层节点，代表整个硬件系统平台。
+
+**根节点由`/`开头的标识符来表示，然后使用`{}`来包含根节点所在的内容。**
+
+一个最简单的根节点实例：
+
+```dts
+/dts-v1/;	// 设备树版本信息
+/{
+	// 根节点开始
+	
+	/*
+	在这里可以添加注释，描述根节点的属性和配置
+	*/
+};
+```
+
+下面我们来逐一解释这个根节点模板。
+
+#### 3.1.1 `/dts-v1/;`
+
+在ARM Linux设备树中，`/dts-v1/;`是一个必选的版本声明指令，位域设备树源文件的开头，用于指定设备树语法的版本。
+
++ 核心作用与语法规范
+
+	1. 版本声明
+
+		+ `/dts-v1/`表示当前文件遵循`设备树语法版本1`
+		+ 这是设备树编译器的标准要求，用于确保语法兼容性。若省略或版本不匹配，可能导致编译错误或解析失败
+		
+	2. 位置要求: 必须置于文件首行，且不允许在任何节点或属性之后。
+
+		```dts
+		/dts-v1/;  // 正确：首行声明
+		/ {
+			// 根节点及子节点定义
+		};
+		```
+
++ 常见问题与注意事项
+
+	1. 编译错误场景: 若未在首行声明`/dts-v1/;`，`dtc`会报语法错误，提示版本缺失
+	2. 历史兼容性：
+		+ 早期内核(如Linux 2.6)未强制要求此声明，但Linux 3.x及以上版本的设备树文件必须包含
+		+ 现代工具链(如uboot和内核的make dtbs)会严格校验
+	
++ 实际应用示例
+
+	典型的设备树文件架构如下：
+
+	```dts
+	/dts-v1/;                          // 版本声明（首行）
+	#include "soc-base.dtsi"           // 包含公共硬件描述
+	#include "custom-board.dtsi"        // 包含板级配置
+
+	/ {                                 // 根节点
+		compatible = "vendor,board-x";  // 平台标识
+		memory@80000000 {               // 内存节点
+			reg = <0x80000000 0x20000000>; // 512MB内存
+		};
+		uart0: serial@101f0000 {        // 串口设备
+			compatible = "ns16550a";
+			reg = <0x101f0000 0x1000>;
+		};
+	};
+	```
+
+#### 3.1.2 `/ {};`语法解析
+
+##### 3.1.2.1 根节点符号解析
+
+1. `/`的含义
+
+	+ 根节点标识: `/`标识设备树的顶级节点，代表整个硬件系统平台
+	+ 路径起点：类似文件系统的根目录，所有子节点均从`/`派生，形成树状结构
+	+ 唯一性： 每个设备树文件有且仅有一个根节点，所有硬件描述均嵌套在其下
+	
+2. `{}`的含义
+
+	+ 作用域包裹：大括号`{}`定义根节点的作用范围，内部包含根节点的属性和子节点
+	
+##### 3.1.2.2 根节点的核心作用
+
+1. 系统级描述
+
+	+ 平台标识：通过`compatible`属性匹配内核支持的硬件平台(如`"fsl,imx6ull"`)
+	+ 型号定义：`model`属性声明具体板卡型号(如`"Freescale i.MX6ULL Board"`)
+
+2. 资源规范
+
+	+ 地址/长度编码：`#address-cells`和`#size-cell`属性定义子节点reg的地址和长度字段地址格式(如`<1>标识1个u32整数`)
+	+ 内存布局：`memory`子节点描述物理内存范围(如reg = <0x80000000 0x20000000>表示512MB内存)
+	
+#### 3.1.3 根节点结构示例
+
+```dts
+/dts-v1/;	// 设备树版本声明（必须首行）
+/ {			// 根节点开始
+    compatible = "vendor,board-x"; 
+    model = "My Hardware Platform";
+    #address-cells = <1>;        // 子节点地址字段占1个u32
+    #size-cells = <1>;           // 子节点长度字段占1个u32
+
+    memory@80000000 {            // 内存子节点
+        device_type = "memory";
+        reg = <0x80000000 0x20000000>;  // 起始地址0x80000000，大小512MB
+    };
+};			// 根节点结束
+```
+	
+## 3.2 子节点
+
+
+	
