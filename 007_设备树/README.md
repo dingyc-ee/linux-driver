@@ -681,5 +681,308 @@ my_device {
 	};
 	```
 
-### 3.5 设备树的层级结构
+### 3.5 `#address-cells`和`#size-cells`属性
 
+address-cells和#size-cells属性，用于指定reg属性地址单元和大小单元的位数。他们提供了设备树解析所需的元数据，以正确解释设备的地址和大小信息。
+
+#### 3.5.1 `#address-cells`属性
+
++ 含义：指定子节点reg属性中地址值(`address`)所占的32位整数数量
++ 取值：通常为1(32位地址)、2(64位地址)
+
+#### 3.5.2 `#size-cells`属性
+
++ 含义：指定子节点reg属性中长度值(`size`)所占的32位整数数量
++ 取值：通常为0(无长度字段)、1(32位长度)、2(64位长度)
+
+### 3.6 `model`属性
+
+`model`是设备树中的标准属性，用来描述设备的厂商型号或板级标识，提供人类可读的设备信息。
+
++ 一、model属性的定义与语法规则
+
+	1. 语法格式
+
+		```dts
+		model = "manufacturer board-model";
+		```
+
+		1. manufacturer: 厂商名称(如samsung、nvidia)
+		2. board-model: 设备型号(如smdk2440、am335x)
+
+	2. 层级位置
+
+		1. 根节点：通常位于设备树根节点`/`下，描述整个硬件平台
+
+		```dts
+		/ {
+			model = "NVIDIA Jetson Nano Developer Kit";
+			compatible = "nvidia,p3450-0000";
+			...
+		};
+		```
+
+		2. 子节点：也可以用于特定设备(如SoC或外设)，但比较少见
+
+	3. `model`与`complatible`的关系
+
+		二者经常配合使用，`compatible`用于机器识别，`model`用于友好显示
+
+		| 属性 | 用途 | 示例 |
+		| - | - | - |
+		| model | 提供设备型号的描述信息，用于日志、调试或用户界面显示 | model = "Raspberry Pi 4 Model B"; |
+		| compatible | 定义驱动匹配的硬件标识，是内核绑定驱动的关键依据 | compatible = "brcm,bcm2711"; |
+
++ 二、核心使用场景
+
+	1. 硬件平台识别
+	
+		+ 启动阶段：uboot或内核通过解析根节点的`model`显示板级信息
+		
+			![](./src/0002.jpg)
+			
+		+ 动态适配：结合compaatible实现多板卡支持
+		
+	2. 调试与日志
+	
+		+ 问题追踪：当系统崩溃时，model信息帮助定位硬件配置问题
+		+ 用户空间工具：`/proc/device-tree/model`文件暴露该属性，供脚本或应用读取
+		
+			![](./src/0003.jpg)
+
+	3. 量产设备管理
+	
+		+ 固件升级：根据`model`值选择对应的固件包(如`firmware-${model}.bin`)
+		+ 自动化测试：测试脚本依据`model`加载不同的测试用例
+		
++ 三、与内核代码的结合方式
+
+	1. 内核启动阶段
+	
+		在`setup_arch()`函数中，内核解析设备树并提取`model`：
+		
+		```c
+		// arch/arm/kernel/setup.c
+		void __init setup_arch(char **cmdline_p) {
+			const char *model;
+			model = of_get_property(of_root, "model", NULL); // 获取根节点的model属性[8,13](@ref)
+			pr_info("Machine model: %s\n", model);          // 打印到内核日志
+		}
+		```
+	
+	2. 驱动代码中的使用
+	
+		驱动可通过设备树接口读取`model`实现差异化配置：
+		
+		```c
+		// 示例：GPIO 驱动根据板型号调整引脚映射
+		static int my_driver_probe(struct platform_device *pdev) {
+			struct device_node *np = pdev->dev.of_node;
+			const char *model;
+
+			of_property_read_string(np, "model", &model); // 读取model属性[11,13](@ref)
+			
+			if (strstr(model, "Raspberry Pi 4")) {
+				// 应用树莓派4专用配置
+				configure_pins_for_rpi4();
+			} else if (strstr(model, "Jetson Nano")) {
+				// 应用Jetson Nano专用配置
+				configure_pins_for_nano();
+			}
+			return 0;
+		}
+		```
+		
+	3. 用户空间访问
+	
+		通过sysfs或procfs接口：
+		
+		```c
+		// 用户程序读取 /proc/device-tree/model
+		FILE *f = fopen("/proc/device-tree/model", "r");
+		fread(buffer, sizeof(char), 128, f);
+		printf("Board Model: %s\n", buffer);
+		```
+
++ 四、开发实践建议
+
+	1. 命名规范
+	
+		+ 优先采用<vendor>,<product>-<version>格式(如ti,beaglebone-black)
+		+ 避免空格，用连字符替代(如raspberry-pi-4b 而非 Raspberry Pi 4B)
+		
+	2. 与`.dtsi`文件的协作
+	
+		+ 在SoC级`.dtsi`中定义`.compatible`，板级`.dts`中补充`model`
+		
+			```dts
+			/* imx6ull.dtsi (SOC级) */
+			/ { compatible = "fsl,imx6ull"; ... };
+
+			/* my-board.dts (板级) */
+			/ { model = "MyTech IMX6ULL Industrial Board"; ... };
+			```
+
++ 五、总结
+
+	通过合理使用`model`属性，开发者能显著提升硬件描述的清晰度与系统可维护性，实现硬件配置与软件逻辑的高效解耦。
+	
+### 3.7 `status`属性
+
+设备树的`status`属性，用来描述设备节点的运行状态。是设备树中控制设备使能/禁用的核心机制。
+
+#### 3.7.1 语法规则与属性值
+
+若未显式定义status，设备默认为"okay"状态
+
+| 属性值 | 含义 |
+| - | - |
+| "okay" | 设备可操作(默认状态)，驱动可正常加载 |
+| "disabled" | 设备当前不可操作，但未来可能变为可用(如热插拔设备未插入、时钟未就绪) |
+| "fail" | 设备因严重错误永久不可用(如硬件故障) |
+| "fail-sss" | 同fail，sss为具体错误描述(如fail-power表示电源故障) |
+
+#### 3.7.2 典型使用场景
+
+##### 3.7.2.1 动态启动/禁用设备
+
++ 场景：同一硬件设计支持可选外设(如开发板的扩展接口)
++ 示例：禁用未使用的耳机检测模块
+
+```dts
+&rk_headset {
+    status = "disabled";  // 关闭耳机检测功能
+};
+```
+
+##### 3.7.2.2 热插拔设备管理
+
++ 场景：支持热插拔的设备(如USB设备、SD卡)
++ 示例：SD卡槽初始状态为"disabled"，插入后由驱动改为"okay"
+
+##### 3.7.2.3 硬件故障处理
+
++ 场景：检测到硬件异常(如传感器通信失败)
++ 示例：标记故障设备避免重复初始化
+
+```dts
+&temp_sensor {
+    status = "fail-i2c";  // I2C通信失败
+};
+```
+
+#### 3.7.3 与内核代码的结合方式
+
+##### 3.7.3.1 内核状态检测函数
+
+驱动通过以下API检测`status`属性：
+
+```c
+#include <linux/of.h>
+
+bool of_device_is_available(const struct device_node *node);
+```
+
++ 逻辑：返回true，仅当status为okay、ok或未定义(隐含okay)
++ 源码逻辑：
+
+```c
+// drivers/of/base.c
+bool of_device_is_available(const struct device_node *device) {
+    const char *status = of_get_property(device, "status", NULL);
+    return (status == NULL) || !strcmp(status, "okay") || !strcmp(status, "ok");
+}
+```
+
+##### 3.7.3.2 驱动中的典型应用
+
+在设备探测`probe`函数中，检查设备状态：
+
+```c
+static int my_driver_probe(struct platform_device *pdev) {
+    struct device_node *np = pdev->dev.of_node;
+    
+    // 检查设备是否可用
+    if (!of_device_is_available(np)) {
+        dev_info(&pdev->dev, "Device disabled in DTS\n");
+        return -ENODEV;  // 退出探测
+    }
+    
+    // 正常初始化设备...
+    return 0;
+}
+```
+
+##### 3.7.3.3 用户空间访问
+
+通过sysfs查看设备状态：
+
+![](./src/0004.jpg)
+
+#### 3.7.4 开发实践建议
+
+1. 优先使用okay/disabled
+	
+	fail状态需谨慎使用，通常由驱动在运行时动态设置，非静态配置
+	
+2. 与`compatible`配合使用
+
+	即使`status = disabled`，内核人会解析节点兼容性，但不会触发probe
+	
+3. 动态修改状态
+
+	驱动可通过`of_node->status`动态更新状态(需同步通知子系统)
+	
+#### 3.7.5 status属性在系统运行的动态修改
+
+设备树的status属性，支持在系统运行过程中动态修改，这是嵌入式系统实现硬件配置热更新的关键机制。
+
+##### 3.7.5.1 内核模块中修改
+
++ 原理：通过内核模块调用设备树API，直接修改节点属性
++ 示例代码：
+
+```c
+#include <linux/module.h>
+#include <linux/of.h>
+static int __init my_init(void) {
+    struct device_node *node = of_find_node_by_path("/soc/i2c@13860000");
+    if (node) of_property_write_string(node, "status", "disabled");
+    return 0;
+}
+module_init(my_init);
+```
+
+##### 3.7.5.2 uboot阶段修改
+
++ 原理：在系统启动前，通过uboot的fdt命令修改内存中的设备树
++ 操作步骤：
+
+```sh
+# U-Boot命令行中：
+fdt set /soc/i2c@13860000 status "disabled"
+bootm  # 启动内核
+```
+
+##### 3.7.5.3 技术限制与注意事项
+
+1. 内核支持依赖：sysfs节点默认为只读，不可直接写入
+2. 硬件行为影响：
+
+	+ 修改status可能导致驱动卸载或设备断电，例如：
+	
+		+ status = "disabled" -> 触发驱动的remove()函数，释放硬件资源
+		+ 错误修改可能引发总线冲突或系统崩溃
+		
+3. 状态持久性问题
+
+	+ 动态修改不会保存到存储设备，重启后失效
+	+ 永久生效需修改原始DTB文件，并更新固件
+	
+#### 3.7.6 总结
+
+status属性通过声明式配置，实现了硬件资源的动态管理。其核心价值在于：
+
++ 硬件抽象：解耦硬件状态与驱动逻辑
++ 动态控制：支持热插拔、故障隔离等场景
++ 资源优化：避免初始化无用设备，加速启动
