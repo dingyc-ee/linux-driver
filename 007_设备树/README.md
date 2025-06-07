@@ -986,3 +986,136 @@ status属性通过声明式配置，实现了硬件资源的动态管理。其�
 + 硬件抽象：解耦硬件状态与驱动逻辑
 + 动态控制：支持热插拔、故障隔离等场景
 + 资源优化：避免初始化无用设备，加速启动
+
+### 3.8 `compatible`属性
+
+linux设备的`compatible`属性，用来识别设备节点与驱动程序的匹配关系。
+
+#### 3.8.1 `compatible`属性的定义与语法规则
+
+##### 3.8.1.1 基本定义
+
++ 核心作用：`compatible`是设备节点的关键属性，用来绑定硬件设备与内核驱动。其值是一个字符串列表，操作系统通过匹配字符串加载对应的驱动程序。
+
++ 语法规则
+
+	```dts
+	compatible = "<manufacturer>,<model>", "<generic-driver>";
+	```
+
+	+ manufacturer: 厂商缩写(如fsl表示Freescale/NXP，brcm表示Broadcom)
+	+ model: 设备型号(如imx6q-pwm表示i.MX6Q的PWM控制器)
+	+ generic-driver: 通用兼容驱动(如simple-bus)，用于驱动降级匹配
+
+##### 3.8.1.2 关键规则
+
++ 唯一性要求：厂商缩写需唯一，避免不同厂商设备冲突
++ 多兼容机制：支持多个字符串，内核按从左到右优先级匹配驱动(若第一项无匹配，则尝试第二项)
++ 禁止通配符：禁止使用模糊匹配(如fsl,mpc83xx-uart)，必须明确具体型号
+	
+#### 3.8.2 核心使用场景
+
+##### 3.8.2.1 驱动与设备绑定
+
++ 精确匹配：设备树节点通过`compatible`指定设备型号，驱动代码定义`of_match_table`声明支持的设备列表。匹配成功时触发驱动的`probe()`函数。
++ 示例：
+
+	```dts
+	serial@101f0000 {
+		compatible = "arm,pl011"; // 绑定 ARM PL011 驱动
+		reg = <0x101f0000 0x1000>;
+	};
+	```
+	
+##### 3.8.2.2 硬件兼容性设计
+
++ 新旧驱动兼容：若硬件与现有驱动寄存器兼容，可追加通用驱动字符串实现服用
++ 示例：
+
+	```dts
+	compatible = "fsl,imx6q-pwm", "brcm,bcm2835-pwm"; // 优先匹配 i.MX6 驱动，失败则回退到 BCM2835 驱动[11](@ref)。
+	```
+	
+##### 3.8.2.3 板级与SoC描述
+
++ 根节点标识：根节点的`compatible`描述整个硬件平台，用于内核选择初始化策略
+
+```dts
+/ {
+    compatible = "raspberrypi,3-model-b", "brcm,bcm2837"; // 板级型号 + SoC 型号[12](@ref)
+};
+```
+
+#### 3.8.3 与内核代码的结合方式
+
+##### 3.8.3.1 驱动匹配表定义：驱动通过`of_match_table`声明支持的设备列表，使用`of_device_id`结构体存储匹配字符串
+
+```c
+// PWM 驱动示例
+static const struct of_device_id pwm_of_match[] = {
+    { .compatible = "fsl,imx6q-pwm" },   // 精确匹配 i.MX6Q PWM
+    { .compatible = "brcm,bcm2835-pwm" }, // 兼容 BCM2835 PWM
+    { /* Sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, pwm_of_match);
+```
+
+##### 3.8.3.2 驱动注册与匹配流程
+
+1. 注册驱动
+
+	```c
+	static struct platform_driver imx_pwm_driver = {
+		.driver = {
+			.name = "imx-pwm",
+			.of_match_table = pwm_of_match, // 绑定匹配表
+		},
+		.probe = imx_pwm_probe, // 匹配成功后调用
+	};
+	platform_driver_register(&imx_pwm_driver);
+	```
+	
+2. 内核匹配逻辑：内核遍历设备树节点，调用`of_match_device()`比较节点`compatible`与驱动的`of_match_table`。完全匹配时返回`of_device_id`，触发`probe()`
+
+#### 3.8.4 开发实践与最佳实践
+
+1. 命名一致性：使用厂商官方推荐的型号名(如NXP的fsl, imx6ul-uart)
+2. 版本控制：硬件修订时追加版本号(如fsl,imx6q-pwm-v2)
+3. 避免冗余：同意驱动支持的设备型号，应在`of_match_table`中穷举，而非设备树中重复定义
+
+#### 3.8.5 设备树`of`缩写开头
+
+Linux设备树中，`of`是`Open Firmware`的缩写。
+
+##### 3.8.5.1 of的来源与含义
+
++ 设备树的概念，最初由`Open Firmware(开放固件)`标准引入，该标准由IBM开发。`Open Firmware`是一种固件接口，用于在计算机启动时描述硬件配置，实现硬件与操作系统的解耦
++ Linux内核在支持ARM、PowerPC等架构时，借鉴了`Open Firmware`的设备描述机制，将硬件信息从内核代码剥离到独立的设备树文件
++ Linux为保持历史兼容性，内核中与设备树操作相关的函数均已`of_前缀命名`，如`of_find_node_by_path()`、`of_property_read_u32()`等函数
+
+##### 3.8.5.2 of在Linux内核的体现
+
+1. 设备树操作函数(of api)：内核提供了一系列以`of_`开头的函数，用于解析设备树节点和属性。这些函数定义在`include/linux/of.h`中，实现在`drivers/of/`目录下。
+
+	+ 节点查找：`of_find_node_by_name()`、`of_find_compatible_node()`
+	+ 属性读取：`of_property_read_u32()`、`of_property_read_string()`
+	+ 地址转换：`of_address_to_resource()`
+	
+2. 核心数据结构
+
+	+ `struct device_node`：描述设备树中的节点(如名称、属性、父/子节点)
+	+ `struct property`：描述节点的属性(如名称、值、长度)
+
+### 3.9 总结
+
+以下是Linux设备树中关键属性的结构化总结，结合技术规范和实际应用场景。
+
+| 属性 | 作用 | 依赖关系 |
+| - | - | - |
+| 根节点 | 全局硬件框架 | 必须包含`#address-cells`和`size-cells` |
+| 子节点 | 描述具体设备 | 继承父节点地址规则 |
+| reg | 定义设备地址范围 | 需父节点`#address-cells`和`size-cells` |
+| `#address-cells`和`size-cells` | 指定地址/长度的数值单元数 | 父节点定义、子节点遵守 |
+| model | 精确硬件型号标识 | 独立属性 |
+| status | 设备启用、禁用状态 | 动态控制硬件 |
+| compatible | 设备与驱动匹配的关键字 | 驱动需声明匹配表 |
