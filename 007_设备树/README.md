@@ -1202,14 +1202,16 @@ Linux设备树中，`of`是`Open Firmware`的缩写。
 
 ##### 4.1.4.1 编译区别
 
-`label`用于设备树内部引用，`sliases`用于全局标识与跨层访问。
+`label`用于设备树内部引用，`sliases`用于全局标识与跨层访问。虽然两者均用于简化室节点引用，但设计目的和机制截然不同。
 
 | 特性 | aliases | label |
 | - | - | - |
 | 定义位置 | 独立节点(/aliases) | 节点前标签(uart0: serial@0) |
-| 作用范围 | 全局(内核/用户空间) | 设备树文件内部 |
+| 作用范围 | 全局(内核/用户空间)，包括内核运行时 | 设备树源文件.dts内部 |
+| 编译后保留 | 保留在DTB中 | 替换为节点路径或phandle |
 | 主要用途 | 跨模块引用、设备编号分配 | 设备树内节点覆盖或扩展 |
-| 示例 | serial0 = &uart0; | &uart0 { status = "okay" }; |
+| 示例 | 提供系统及设备标识符(如控制台、总线) | 设备树内部节点引用(覆盖、添加属性) |
+| 唯一性要求 | 全局唯一 | 全局唯一 |
 
 编译差异：
 
@@ -1218,12 +1220,89 @@ Linux设备树中，`of`是`Open Firmware`的缩写。
 
 ##### 4.1.4.2 典型场景对比
 
-1. 节点标签`label`的作用场景
+1. `label`的典型场景：label主要用于​​设备树内部的节点引用和属性操作​​
 
-	+ 设备树内部引用简化：在`.dts`文件中，通过@label直接引用节点，避免冗长路径
+	+ 覆盖或添加节点属性：通过`&label`修改已有节点的属性，无需重复定义节点路径
 	
 	```dts
-	uart0: serial@ff000000 { /* 节点定义 */ };
-	&uart0 { status = "okay"; }; // 通过标签修改节点属性
+	/* 定义节点 */
+	uart0: serial@ff000000 { status = "disabled"; };
+
+	/* 在另一位置启用UART0 */
+	&uart0 { status = "okay"; };  // 直接通过标签引用[1,2](@ref)
 	```
+	
+	+ 跨文件引用节点：在.dts或.dtsi文件中引用其他文件定义的节点
+	
+	```dts
+	#include "soc.dtsi"
+	&i2c1 { ... };  // 引用soc.dtsi中的i2c1节点[3](@ref)
+	```
+	
+	+ 简化复杂路径：避免重复书写长路径(如`&intc`替代`/interrupt-controller@00a01000`)
+	
+2. aliases的典型场景：Aliases提供​​全局设备标识符​​，服务于内核驱动和用户空间
+
+	+ 系统关键设备标识：定义标准设备名(如`serial0`为默认控制台)，内核通过`stdout-path`或`bootargs`关联
+	
+	```dts
+	aliases { serial0 = &uart0; };  // 内核用 serial0 查找控制台[1,5](@ref)
+	chosen { stdout-path = "serial0:115200n8"; };
+	```
+	
+	+ 用户空间设备映射：在`/sys/firmware/devicetree/base/aliases`生成别名文件，用户程序可直接读取设备路径
+	
+	```dts
+	cat /sys/firmware/devicetree/base/aliases/serial0  // 输出uart0节点路径[1,8](@ref)
+	```
+
+	+ 多实例设备排序：为同类设备分配有序别名(如`i2c0、i2c1`)，驱动通过序号匹配硬件实例
+	
+	```dts
+	aliases { 
+		i2c0 = &i2c_main;  // 主控制器
+		i2c1 = &i2c_aux;   // 从控制器
+	};
+	```
+	
+	驱动代码通过`of_alias_get_id(np, "i2c")`获取设备序号
+	
+	+ 硬件抽象与兼容性：当节点路径因重构改变时，只需更新`aliases`映射，无需修改驱动代码
+	
+3. 技术实现差异
+
+	| 特性 | label | aliases |
+	| - | - | - |
+	| 语法示例 | `uart0: serial@ff000000 { ... }` | `aliases { serial0 = &uart0; }` |
+	| 内核访问API | 无需API(编译时替换) | `of_find_node_by_alias(NULL, "serial0")` |
+	| 用户空间可见性 | 不可见 | 通过`sysfs`暴露 |
+	
+4. 设计哲学总结
+
+	+ label: 本质是源码级语法糖，解决设备树内部的冗余书写问题，提升.dts可维护性
+	+ aliases: 是硬件抽象层(HAL)的关键设计，为系统提供稳定的设备标识符，降低内核/用户空间对硬件路径的耦合
+	
+5. 何时选择
+
+	+ 需修改节点属性或跨文件引用: 用label
+	+ 需在运行时动态查找设备或定义系统及设备名: 用aliases
+	
+#### 4.1.5 `aliases`节点与`sysfs`路径
+
+在linux设备树中，aliases节点通过内核在启动时的解析，会在用户空间的`sysfs`文件系统中生成设备映射别名文件。这些文件提供了从别名到设备节点路径的直接映射，方便用户空间程序动态获取硬件设备信息。
+
+##### 4.1.5.1 生成机制与`sysfs`路径
+
+1. 内核自动创建映射文件
+
+	设备树编译后，内核在解析DTB时会识别`/aliases`节点下的所有属性。每个属性(别名)会在sysfs中生成一个文件：
+	
+	```bash
+	/sys/firmware/devicetree/base/aliases/<别名>
+	```
+
+	![](./src/0005.jpg)
+
+2. 文件内容格式
+
 
