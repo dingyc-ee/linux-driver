@@ -1303,6 +1303,359 @@ Linux设备树中，`of`是`Open Firmware`的缩写。
 
 	![](./src/0005.jpg)
 
-2. 文件内容格式
+2. 文件内容格式：别名文件的内容，就是字符串形式的设备树节点路径
+	
+	![](./src/0006.jpg)
 
+### 4.2 `chosen`节点
 
+Linux设备树中的`chosen`节点是一个关键的特殊节点，用于在uboot和kernel之间传递配置信息和运行时参数。它不描述真实硬件，而是提供系统启动和初始化的全局设置。
+
+![](./src/0007.jpg)
+
+#### 4.2.1 语法规则
+
+`chosen`节点位于设备树根目录下，语法遵循标准设备树节点格式，但无物理地址(没有@unit-address)
+
+```dts
+/chosen {
+    bootargs = "console=ttyS0,115200 root=/dev/mmcblk0p2 rw"; // 内核启动参数
+    stdout-path = "serial0:115200n8";                         // 标准输出设备路径
+};
+```
+
++ 核心属性：
+
+	+ `bootargs`：字符串类型，传递内核命令行参数(如控制台设备、根文件系统位置)
+	+ `stdout-path`：字符串类型，指定内核标准输出设备(格式：  设备:波特率:数据位)
+	
++ 自定义属性：
+
+	支持扩展(如firmware-name指定固件路径)，需内核驱动支持
+	
+#### 4.2.2 工作原理
+
+##### 4.2.2.1 uboot阶段的动态修改
+
++ 传递启动参数：uboot在加载内核前，读取环境变量`bootargs`，并将其写入设备树`chosen`节点的`bootargs`属性中
+
++ 代码流程：
+
+	```c
+	// U-Boot源码：common/fdt_support.c
+	int fdt_chosen(void *fdt) {
+		int node = fdt_find_or_add_subnode(fdt, 0, "chosen"); // 创建/定位chosen节点
+		char *bootargs = getenv("bootargs");                  // 获取环境变量
+		fdt_setprop(fdt, node, "bootargs", bootargs, strlen(bootargs)+1); // 写入属性
+	}
+	```
+	
++ 动态性：设备树源文件`.dts`中chosen可能为空，uboot启动时动态填充bootargs
+
+##### 4.2.2.2 内核解析流程
+
+内核在初始化节点(start_kernel -> setup_arch) 扫描`chosen`节点：
+
++ 提取`bootargs`：复制到全局变量`boot_commanf_line`，供内核后续解析(如初始化控制台、挂在根文件系统)
++ 设置标准输出：根据`stdout-path`顶顶控制台设备(如串口)
+
+关键函数调用链：
+
+```txt
+start_kernel()
+  → setup_arch(&command_line)
+    → setup_machine_fdt(__fdt_pointer)       // 映射设备树
+      → early_init_dt_scan_nodes()           // 扫描节点
+        → early_init_dt_scan_chosen()        // 解析chosen节点
+          → 提取bootargs → 写入command_line
+          → 解析stdout-path → 初始化控制台
+        → early_init_dt_scan_memory()        // 解析memory节点
+```
+
+#### 4.2.3 典型使用场景
+
+1. 内核启动参数传递
+
+	+ 功能：传递根文件系统位置、网络配置、调试等级
+	+ 示例：`bootargs = "root=/dev/nfs ip=192.168.1.10 nfsroot=192.168.1.1:/opt/rootfs"` 用于网络根文件系统启动
+	
+2. 控制台设备指定
+
+	+ 场景：多串口系统中，明确调试输出目标
+	+ 示例：`stdout-path = "serial1:115200n8"` 将输出重定向到第2个串口
+	
+### 4.3 `device_type`节点
+
+`device_type`是linux设备树中，用于表示设备类别的关键属性，在内核初始化过程中帮助识别硬件角色。
+
+#### 4.3.1 语法规则与属性定义
+
+1. 属性格式
+
+	+ 值类型：字符串(如"cpu"、"memory"、"serial")
+	+ 命名规范：小写字母+无空格(如"i2c-controller"标识i2c控制器)
+	+ 位置：位于设备节点内部，与`compatible`、`reg`等属性并列
+	
+	```dts
+	cpu0: cpu@0 {
+		device_type = "cpu";          // 标识为CPU设备
+		compatible = "arm,cortex-a53";
+		reg = <0x0>;
+	};
+	```
+
+2. 必须场景
+
+	+ CPU节点(device_type = "cpu")
+	+ 内存结点(device_type = "memory")
+	+ 若缺失，内核无法初始化关键硬件(如内存)，导致启动失败
+	
+3. 可选场景：其他设备(如网络控制器、串口)可省略，内核优先通过`compatible`匹配驱动
+
+4. 与`compatible`的区别
+
+	| 属性 | 作用 | 优先级 |
+	| - | - | - |
+	| device_type | 设备粗分类(如"cpu") | 低(历史遗留) |
+	| compatible | 精确匹配驱动(如具体型号) | 高(现代标准) |
+	
+#### 4.3.2 内核解析机制
+
+1. 启动阶段扫描：内核初始化时遍历设备树，通过`device_type`快速定位关键设备
+
+	+ CPU拓扑：收集所有`device_type = "cpu"`的节点，构建多核调度框架(SMP)
+	+ 内存布局：查找`device_type = "memory"`节点，解析reg属性获取物理内存范围
+	
+2. 驱动匹配辅助：部分总线型设备(如Open Firmware总线)使用`device_type`作为初识筛选条件，再结合`compatible`选择驱动
+
+	```dts
+	i2c@021a0000 {
+		device_type = "i2c-controller";  // 总线类型标识
+		compatible = "fsl,imx6q-i2c";   // 具体驱动型号
+	};
+	```
+	
+	内核先按`i2c-controller`分类，再匹配具体驱动
+	
+#### 4.3.3 典型应用场景
+
+1. CPU节点
+
+	+ 作用：描述处理器核心的架构、时钟和功耗管理
+	+ 示例：
+	
+		```dts
+		cpus {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			cpu0: cpu@0 {
+				device_type = "cpu";                // 标识CPU设备
+				compatible = "arm,cortex-a53";
+				reg = <0x0>;                        // 核心编号
+				clocks = <&cru ARMCLKL>;            // 关联时钟
+			};
+		};
+		```
+		
+	+ 内核通过`device_type`快速识别所有CPU节点，为多核调度提供基础
+	
+2. 内存结点
+
+	+ 作用：定义物理内存的起始地址和大小
+	+ 示例：
+	
+		```dts
+		memory@80000000 {
+			device_type = "memory";         // 标识内存设备
+			reg = <0x80000000 0x40000000>;  // 起始地址0x80000000，大小1GB
+		};
+		```
+	
+	+ 若未定义`device_type = "memory"` 内核报错"No memory node in device tree"
+	
+3. 特殊总线设备
+
+	+ 场景：早期设备树或特定总线(如PCI)需显式声明类型：
+	
+		```dts
+		pci@1fc00000 {
+			device_type = "pci";            // 标识PCI控制器
+			#address-cells = <3>;
+			#size-cells = <2>;
+			reg = <0x1fc00000 0x2000>;
+		};
+		```
+		
+	+ 现代内核逐渐弃用此方式，改用`compatible`精确匹配
+	
+#### 4.3.4 设计注意事项
+
+1. 避免冗余。现代内核优先使用`compatible`匹配驱动，非必要场景(如非CPU/内存设备)可省略`device_type`，减少设备树复杂度
+2. 历史兼容性。旧版设备树可能依赖`device_type`标识串口、网络控制器等，新设计应迁移至`compatible`标准
+
+#### 4.3.5 总结
+
+在嵌入式开发中，准确使用 device_type 可避免启动故障，并为复杂硬件（如异构计算架构）提供清晰的设备分类基础。现代设计中，其角色逐渐被 compatible 替代，但在CPU/内存等核心节点中仍是不可或缺的基石
+
+### 4.4 自定义属性
+
+#### 4.4.1 语法规则
+
+1. 命名规范：
+
+	+ 长度限制：属性名长度需为1-31字符，仅允许使用ASCII字符
+	+ 唯一性：统一节点内属性名不可重复
+	
+2. 值类型：
+
+	+ 控制：仅声明属性名(如custom-prop) 用于标记存在性
+	+ 字符串：双引号包裹(如`description = "Custom Sensor"`)
+	+ 数值：
+	
+		+ 32位整数：使用尖括号`< >`，如<0x1000>或<512>
+		+ 8位字节整数或数组：使用中括号`[ ]`，如`config = [00 0A FF]`
+		
+3. 位置要求：属性必须定义在节点内部，与标准属性(如`compatible`)并列
+
+	```dts
+	sensor@0 {
+		compatible = "vendor,custom-sensor";
+		custom-range = <100>;        // 整数属性
+		calibration-data = [01 02 03]; // 字节数组
+	};
+	```
+
+#### 4.4.2 工作原理
+
+1. 内核存储与访问
+
+	+ 设备树编译为DTB后，所有属性以键值对形式存入内存。内核解析时，将节点转换为`struct device_node`，属性转换为`struct property`链表
+	+ 驱动通过of api读取属性：
+	
+		```c
+		// 读取整数属性
+		of_property_read_u32(dev->of_node, "custom-range", &value);
+		// 读取字节数组
+		of_property_read_u8_array(dev->of_node, "calibration-data", buf, len);
+		```
+
+2. 属性解析机制
+
+	+ 驱动在`probe()`函数中解析自定义属性，动态配置硬件参数
+	+ 内核不自动处理自定义属性，需驱动主动解析
+	
+#### 4.4.3 典型使用场景
+
+1. 硬件参数配置
+
+	+ 传感器校准：存储校准值(如偏移量、温度系数)
+	
+		```dts
+		temperature-sensor@48 {
+			custom-offset = <25>;  // 温度偏移校准值
+		};
+		```
+
+	+ 外设模式选择：指定工作模式(如通信协议)
+	
+		```dts
+		spi-device@0 {
+			data-mode = "quad"; // 设置SPI为四线模式
+		};
+		```
+		
+2. 驱动行为控制
+
+	+ 调试开关：启用调试日志(如debug-enable;)
+	+ 功耗管理：定义休眠超时时间(如sleep-timeout-ms = <5000>;)
+	
+3. 平台特定数据传递
+
+	+ 私有数据传递：传递板级配置(如GPIO映射)
+	
+		```dts
+		leds {
+			led1-gpio = <&gpio 10 GPIO_ACTIVE_HIGH>;
+		};
+		```
+		
+	+ 兼容层扩展：为旧驱动添加新参数
+	
+#### 4.4.4 总结
+
+自定义属性是设备树灵活性的核心体现，通过键值对扩展硬件描述能力。其核心价值在于：
+
+1. 解耦硬件配置：将板级细节从驱动代码剥离，提升跨平台复用性
+2. 动态适应性：结合设备树覆盖或内核模块，支持运行时调整
+3. 调试便捷性：通过sysfs直接访问属性，加速硬件验证
+
+### 4.5 设备树括号`< >和[ ]`区别
+
+在Linux设备树中，尖括号(`< >`)和中括号(`[ ]`)是两种不同的语法接口，用于表示不同类型的属性值。他们的核心区别在于数据类型和解析方式。
+
+#### 4.5.1 尖括号`< >`：32位整数数组
+
+##### 4.5.1.1 语法与用途
+
++ 数据类型：用于表示`32位无符号整数(u32)`组成的数组，每个元素占用4字节
++ 语法格式：`<value1 value2 value3 ...>` 元素间用空格分隔(不可用逗号)
++ 典型应用场景：
+
+	+ 寄存器地址与长度(reg属性):
+	
+		```dts
+		reg = <0x4000C000 0x1000>;  // 起始地址 0x4000C000，长度 0x1000
+		```
+	
+	+ 中断号与触发类型(interrupt属性)：
+	
+		```dts
+		interrupts = <0 24 4>;      // 中断号 0，24 号中断，边沿触发[3,8](@ref)
+		```
+
+	+ phandle引用(节点间引用)
+	
+		```dts
+		gpios = <&gpio1 10 GPIO_ACTIVE_LOW>; // 引用 gpio1 节点，引脚 10，低电平有效[11](@ref)
+		```
+
+##### 4.5.1.2 内核解析方式
+
++ 通过`of_property_read_u32_array()`等API读取
++ 每个元素被解析为独立的32位整数，长度需要对齐4字节
+
+#### 4.5.2 中括号`[ ]`：8位原始字节数组
+
+##### 4.5.2.1 语法与用途
+
++ 数据类型：用于表示原始字节序列(8位数据)，不限定数据类型
++ 语法格式：`[byte1 byte2 byte3 ...]` 元素间用空格分隔，支持十六进制(无需0x前缀)
++ 典型应用场景：
+
+	+ MAC地址
+	
+		```dts
+		local-mac-address = [00 0A 35 02 1C D0]; // 6 字节 MAC 地址[6](@ref)
+		```
+		
+	+ 校准数据(如传感器校准值)
+	
+		```dts
+		calibration-data = [01 23 45 67]; // 4 字节校准值[9](@ref)
+		```
+		
+	+ 固件二进制数据
+	
+		```dts
+		firmware-blob = [DE AD BE EF ...]; // 固件二进制片段
+		```
+		
+##### 4.5.2.2 内核解析方式
+
++ 通过`of_property_read_u8_array()`等API读取
++ 数据按原始字节流处理，长度无对齐要求
+
+#### 4.5.3 总结
+
++ `< >​​`是32位整数数组​​的专用语法，用于硬件资源描述（地址、中断、引用）
++ ​​`[ ]​​`是​​原始字节数组​​的专用语法，用于非结构化数据（MAC、校准值、二进制块）
