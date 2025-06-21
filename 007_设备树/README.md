@@ -1659,3 +1659,381 @@ start_kernel()
 
 + `< >​​`是32位整数数组​​的专用语法，用于硬件资源描述（地址、中断、引用）
 + ​​`[ ]​​`是​​原始字节数组​​的专用语法，用于非结构化数据（MAC、校准值、二进制块）
+
+## 第5章 设备树实例分析-中断
+
+Linux设备树的中断描述，是硬件抽象的核心机制，它通过层级化的属性描述硬件中断拓扑，实现驱动与硬件解耦。
+
+```dts
+gpio5: gpio@020ac000 {
+	compatible = "fsl,imx6ul-gpio", "fsl,imx35-gpio";
+	reg = <0x020ac000 0x4000>;
+	interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>,
+			 <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>;
+	gpio-controller;
+	#gpio-cells = <2>;
+	interrupt-controller;
+	#interrupt-cells = <2>;
+};
+```
+
+### 5.1 `#interrupt-cells`属性
+
+`#interrupt-cells`是Linux设备树的中断控制器阶段的关键属性，用于定义描述一个中断源所需的数据单元cell数量，其值直接影响关联设备的`interrupt`属性格式
+
+#### 5.1.1 核心作用
+
+1. 定义中断描述符格式
+
+`#interrupt-cells`指定了引用该中断控制器时，描述一个中断源所需的32位整数数量。例如：
+
++ `#interrupt-cells = <1>`：仅需中断号 如`<5>`
++ `#interrupt-cells = <2>`：需中断号+触发类型 如`<5 IRQ_TYPE_LEVEL_HIGH>`
++ `#interrupt-cells = <3>`：可能包含中断域+中断号+标志位 如`<0 5 4>`
+
+2. 与中断控制器绑定
+
+	此属性必须与`interrupt-controller`属性共存，后者声明节点位中断控制器
+	
+	```dts
+	gpio5: gpio@020ac000 {
+		compatible = "fsl,imx6ull-gpio";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+	```
+
+#### 5.1.2 工作原理
+
+1. 设备节点引用中断控制器
+	
+	设备通过`interrupt-parent`指定父控制器，并通过`interrupts`提供中断描述符，其长度由父控制器的`#interrupt-cells`决定
+	
+	```dts
+	gpio5: gpio@020ac000 {
+		compatible = "fsl,imx6ull-gpio";
+		interrupt-controller;
+		#interrupt-cells = <2>;
+	};
+	
+	&i2c1 {
+		fxls8471@1e {
+			compatible = "fsl,fxls8471";
+			reg = <0x1e>;
+			interrupt-parent = <&gpio5>;
+			interrupts = <0 8>;
+		};
+	};
+	```
+	
+	解释以下这段设备树代码：
+	
+	1. `gpio5`定义了一个中断控制器。`#interrupt-cells`为2，那么引用此中断控制器的设备，需要2个cell值，对应`interrupts = <0 8>`
+	2. 第1个cell：中断线编号(此处为0)
+	3. 第2个cell：中断触发类型(此处为8 IRQ_TYPE_LEVEL_LOW)
+	
+2. 中断触发类型编码
+
+	常见标志位含义(第2个cell)：
+	
+	| 值 | 内核宏 | 触发类型 |
+	| - | - | - |
+	| 1 | IRQ_TYPE_EDGE_RISING | 上升沿触发 |
+	| 2 | IRQ_TYPE_EDGE_FALLING | 下降沿触发 |
+	| 4 | IRQ_TYPE_LEVEL_HIGH | 高电平触发 |
+	| 8 | IRQ_TYPE_LEVEL_LOW | 低电平触发 |
+	
+#### 5.1.3 多级中断控制器场景
+
+1. 次级控制器(如GPIO)
+
+	次级控制器(如GPIO模块)，既是中断控制器又是中断产生设备
+	
+	```dts
+	gpio5: gpio@020ac000 {
+		interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>,	// 自身中断 引用(GIC)
+				 <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;		// 声明为中断控制器
+		#interrupt-cells = <2>;		// 子设备需2个cell
+	};
+	```
+
+#### 5.1.4 设计注意事项
+
+1. 一致性校验：设备节点的`interrupts`属性长度，必须严格匹配其`interrupt-parent`指向的控制器的`#interrupt-cells`值，否则设备树编译报错
+2. 内核驱动解析：驱动通过`platform_get_irq()`获取Linux中断号时，内核依据`#interrupt-cells`中的硬件中断号，并通过`irq_domain`映射为`virq`
+
+#### 5.1.5 总结
+
+| 关键点 | 说明 |
+| - | - |
+| 位置 | 仅存在于中断控制器节点 |
+| 作用 | 定义子设备`interrupts`属性的中断描述符长度 |
+| 常见值 | 1(仅中断号) 2(中断号+触发类型) 3(扩展参数) |
+| 依赖关系 | 与interrupt-controller属性必须共存 |
+| 多级中断 | 刺激控制器需自身声明#interrupt-cells并正确映射到父控制器 |
+	
+### 5.2 `interrupt-controller`属性
+
+```dts
+intc: interrupt-controller@00a01000 {
+	compatible = "arm,cortex-a7-gic";
+	#interrupt-cells = <3>;
+	interrupt-controller;
+	reg = <0x00a01000 0x1000>,
+		  <0x00a02000 0x100>;
+};
+```
+
+`interrupt-controller`属性，用于表示当前节点所描述的设备是一个中断控制器。它本身没有特定的属性值，只需出现在节点的属性列表中即可。
+
+### 5.3 `interrupt-parrent`属性
+
+`interrupt-parrent`是描述中断控制器层级关系的关键属性，用于指定设备的中断信号应该路由到哪个中断控制器
+
+#### 5.3.1 核心作用
+
+1. 中断路由定义
+
+	`interrupt-parrent`的值是一个`phandle`(指针句柄)，指向设备树中的某个中断控制器节点
+	
+	```dts
+	key@0 {
+		interrupt-parent = <&gpio1>;  // 引用标签为gpio1的中断控制器
+		interrupts = <5 IRQ_TYPE_EDGE_FALLING>;
+	};
+	```
+	
+2. 层级化中断管理
+
+	现代SoC通常存在多级中断控制器(如GPIO -> GPC -> IGC)，`interrupt-parrent`建立设备与直接父控制器的连接，形成树状中断路由结构
+	
+#### 5.3.2 属性继承机制
+
++ 显式指定：若设备节点中定义了`interrupt-parrent` 则直接使用该值
++ 隐式继承：若未定义，则自动继承设备树节点的`interrupt-parrent` 此机制减少冗余配置
+
+```dts
+soc {
+    interrupt-parent = <&gic>;  // 所有子节点默认继承此控制器
+    serial@101f0000 {
+        interrupts = <1 0>;    // 实际中断父节点为gic
+    };
+};
+```
+
+#### 5.3.3 与`interrupts`属性的配合
+
+1. 中断描述符格式：`interrupts`属性的长度和语义，由父控制器的`#interrupt-cells`决定
+
+	+ `#interrupt-cells = <1>`：仅需中断号
+	+ `#interrupt-cells = <2>`：需中断号+触发类型
+	
+2. 触发类型编码：
+
+	| 值 | 内核宏 | 触发类型 |
+	| - | - | - |
+	| 1 | IRQ_TYPE_EDGE_RISING | 上升沿触发 |
+	| 2 | IRQ_TYPE_EDGE_FALLING | 下降沿触发 |
+	| 4 | IRQ_TYPE_LEVEL_HIGH | 高电平触发 |
+	| 8 | IRQ_TYPE_LEVEL_LOW | 低电平触发 |
+	
+#### 5.3.4 中断控制器的层级示例
+
+次级中断控制器(如GPIO模块)，自身也需声明中断父节点：
+
+```dts
+gpio5: gpio@020ac000 {
+	compatible = "fsl,imx6ul-gpio", "fsl,imx35-gpio";
+	reg = <0x020ac000 0x4000>;
+	interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>,
+			 <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>;
+	gpio-controller;
+	#gpio-cells = <2>;
+	interrupt-controller;
+	#interrupt-cells = <2>;
+};
+```
+
+此处GPIO既是中断生产者(向GIC发中断)，又是中断控制器(管理子设备中断)
+
+### 5.4 `interrupts`属性
+
+`interrupts`属性是描述设备中断源的核心机制，用于定义设备产生的中断信号如何路由到中断控制器。
+
+#### 5.4.1 语法规则
+
+1. 基本结构：`interrupts`属性由中断说明符组成，每个说明符包含若干32位整数(cell)，其长度由父中断控制器的`#interrupt-cells`属性决定
+
+	+ 若`#interrupt-cells = <1>`：仅需中断号(如<5>)
+	+ 若`#interrupt-cells = <2>`：需中断号+触发类型(如<5 1>表示中断号5+上升沿触发)
+	+ 若`#interrupt-cells = <3>`：可能包含中断域、中断号、标志位(如<0 5 4>)
+	
+2. 中断触发类型编码：触发类型值对应内核预定义的宏，常用编码如下：
+
+	| 值 | 内核宏 | 触发类型 |
+	| - | - | - |
+	| 1 | IRQ_TYPE_EDGE_RISING | 上升沿触发 |
+	| 2 | IRQ_TYPE_EDGE_FALLING | 下降沿触发 |
+	| 4 | IRQ_TYPE_LEVEL_HIGH | 高电平触发 |
+	| 8 | IRQ_TYPE_LEVEL_LOW | 低电平触发 |
+	| 值可组合(如3=1+2表示双边沿触发) | |
+	
+3. 多中断源表示：若设备由多个中断源(如网卡包含TX/EX中断)，需用逗号分隔多个说明符
+
+	```dts
+	ethernet@0 {
+		interrupts = <0 1>, <1 2>;  // 中断0（上升沿），中断1（下降沿）
+	};
+	```
+
+#### 5.4.2 中断控制器层次结构
+
++ 中断控制器通过`interrupt-controller`属性声明自身身份，并通过`#interrupt-cells`定义子设备的中断描述符格式
++ 设备通过`interrupt-parrent`指向父控制器(如`&gpio5`)，未显式指定是继承设备树父节点的控制器
++ 多级中断示例：
+
+	```dts
+	gpio5: gpio@020ac000 {
+		reg = <0x020ac000 0x4000>;
+		interrupt-parent = <&gic>;						// 自身中断路由到GIC
+		interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>,	// 中断号74和75 高电平触发
+					 <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>;
+		interrupt-controller;		// 声明自身是中断控制器
+		#interrupt-cells = <2>;		// 子设备需2个参数
+	};
+	```
+
+	此处GPIO控制器既是中断生产者(向GIC发中断)，又是中断控制器(管理子设备中断)
+		
+#### 5.4.3 典型使用场景
+
+1. GPIO按键中断
+
+	```dts
+	key@0 {
+		interrupt-parent = <&gpio1>;      // 父控制器为GPIO1
+		interrupts = <5 IRQ_TYPE_EDGE_FALLING>;  // GPIO引脚5，下降沿触发
+	};
+	```
+	
+	驱动通过`gpiod_to_irq()`获取虚拟中断号，并注册中断处理函数
+	
+2. 多级中断控制器
+
+	在SoC常见`GIC -> GPIO -> 设备`的三级结构：
+	
+	+ 设备终端路由到GPIO控制器
+	+ GPIO控制器中断路由到GIC
+	+ GIC最终将中断递交给CPU
+
+### 5.5 总结
+
+	对比发现，不同厂商对于中断属性的配置都是类似的，只是参数有些许区别
+	
+## 第6章 设备树实例分析-GPIO
+
+### 6.1 GPIO控制器基础属性
+
+```dts
+gpio5: gpio@020ac000 {
+	compatible = "fsl,imx6ul-gpio", "fsl,imx35-gpio";
+	reg = <0x020ac000 0x4000>;
+	interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>,
+				<GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>;
+	gpio-controller;
+	#gpio-cells = <2>;
+	interrupt-controller;
+	#interrupt-cells = <2>;
+};
+```
+
+#### 6.1.1 `gpio-controller`属性
+
++ 作用：声明节点位GPIO控制器，管理一组GPIO引脚
++ 语法：空属性，仅需在节点中添加`gpio-controller`
++ 原理：内核通过此表示识别GPIO控制器，初始化其资源(如寄存器映射)
++ 示例：
+
+	```dts
+	gpio1: gpio@e000a000 {
+		gpio-controller;
+	};
+	```
+
+#### 6.1.2 `gpio-cells`属性
+
++ 作用：定义描述一个GPIO引脚所需的参数数量(cell个数)
++ 语法：`#gpio-cells = <N>` 通常N=2
++ 参数含义：
+	+ `cell 1`：引脚编号(如0、12)
+	+ `cell 2`：标志位(如激活电平 GPIO_ACTIVE_HIGH/LOW)
++ 示例：
+	```dts
+	#gpio-cells = <2>;  // 如 <&gpio1 5 GPIO_ACTIVE_LOW>
+	```
+
+#### 6.1.3 `reg`属性
+
++ 作用：指定控制器的寄存器基地址和大小
++ 语法：`reg = <基地址 长度>`
++ 原理：内核通过物理地址映射寄存器，实现GPIO方向/电平控制
++ 示例：
+	```dts
+	reg = <0xe000a000 0x1000>;  // 基址 0xe000a000，范围 4KB
+	```
+
+### 6.2 GPIO中断相关属性
+
+#### 6.2.1 `interrupt-controller`属性
+
++ 作用：声明GPIO控制器同时是中断控制器(支持引脚中断)
++ 语法：空属性，添加`interrupt-controller`
++ 原理：GPIO引脚状态变化可触发中断，需与`#interrupt-cells`配合
+
+#### 6.2.2 `interrupt-cells`属性
+
++ 作用：定义中断描述符的cell数量(通常cell为2)
++ 参数含义：
+	+ `cell 1`：引脚编号
+	+ `cell 2`：中断触发类型(如IRQ_TYPE_DEGE_RISING)
+
+#### 6.2.3 `interrupt-parent`和`interrupts`属性
+
++ 作用：若GPIO控制器自身需要中断，指定父控制器及其中断号
++ 示例：
+	```dts
+	gpio1: gpio@0209c000 {
+		interrupt-parent = <&gic>;  // 父中断控制器
+		interrupts = <GIC_SPI 66 IRQ_TYPE_LEVEL_HIGH>; // 自身中断配置
+	};
+	```
+
+### 6.3 引脚复用(`pinctrl`)属性
+
+### 6.4 GPIO引用语法
+
+1. 外设引用GPIO的规则
+
+	+ 属性命名：`[功能名]-gpios` 比如(`led-gpios`、`phy-reset-gpios`)
+	+ 语法：`<&控制器标签label 引脚编号 标志>`
+	+ 示例：
+		```dts
+		leds {
+			led0 {
+				gpios = <&gpio1 5 GPIO_ACTIVE_LOW>;  // 低电平点亮 LED
+			};
+		};
+		```
+
+2. 多引脚引用
+
+	+ 作用：设备需要多个GPIO时，用数组形式列出
+	+ 示例：
+		```dts
+		data-gpios = <&gpio1 12 0>,  // 数据线 0
+             		 <&gpio1 13 0>;  // 数据线 1
+		```
+
+### 6.5 典型应用场景
+
