@@ -2037,3 +2037,67 @@ gpio5: gpio@020ac000 {
 
 ### 6.5 典型应用场景
 
+## 第7章 设备树实例分析-clock时钟
+
+时钟用于描述硬件设备和系统中的时钟源以及时钟相关的配置和连接关系。时钟在计算机系统中至关重要，用于同步和定时各种硬件设备的操作。
+
+设备树时钟clock的配置分为：时钟生产者(`clock provider`)和时钟消费者(`clock consumer`)
+
+### 7.1 时钟生产者(`clock provider`)
+
+`clock provider`在设备书中描述时钟源(如晶振、PLL、分频器)的硬件特性，他是负责生成和提供时钟信号的硬件或软件模块。
+
+#### 7.1.2 `#clock-cells`
+
+`#clock-cells`的值定义了时钟消费者引用该提供者时所需的 ​**标识符数量**
+
+1. `​​#clock-cells = <0>`
+
+	+ 含义：时钟提供者仅输出单一路时钟，无需索引标识
+	+ 消费者语法：直接使用`phandle`引用，无需附加参数
+
+	```dts
+	// 提供者定义（如晶振）
+	osc24m: osc24m {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;  // 单路输出
+		clock-frequency = <24000000>;
+	};
+
+	// 消费者引用
+	uart0: serial@a000 {
+		clocks = <&osc24m>;  // 仅需 phandle
+	};
+	```
+
+2. `#clock-cells = <1>`
+
+	+ 含义：时钟提供者有​​**多路时钟输出​**​，需通过整数索引标识具体输出
+	+ 消费者语法：需附加索引值，如`<&phandle index>`
+
+	```dts
+	// 提供者定义（如 PLL 分频器）
+	pll: pll@4c000 {
+		compatible = "vendor,pll";
+		#clock-cells = <1>;  // 多路输出
+		clocks = <&osc24m>;
+		clock-output-names = "pll", "pll_switched";
+	};
+
+	// 消费者引用
+	uart0: serial@a000 {
+		clocks = <&pll 1>;  // 引用第二路输出 "pll_switched"
+	};
+	```
+
+#### 7.1.2 `clock-frequency`
+
+指定时钟频率(单位:Hz)，适用于固定频率时钟(如晶振)
+
+```dts
+osc32k: osc32k {
+    compatible = "fixed-clock";
+    clock-frequency = <32768>; // 32.768kHz RTC 时钟
+};
+```
+
