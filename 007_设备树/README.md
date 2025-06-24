@@ -2092,12 +2092,96 @@ gpio5: gpio@020ac000 {
 
 #### 7.1.2 `clock-frequency`
 
-指定时钟频率(单位:Hz)，适用于固定频率时钟(如晶振)
+1. 属性定义与作用
 
-```dts
-osc32k: osc32k {
-    compatible = "fixed-clock";
-    clock-frequency = <32768>; // 32.768kHz RTC 时钟
-};
-```
+	`clock-frequency`属性，指定时钟节点(`clock provider`)的固定输出频率，适用于无需动态调整的时钟源(如晶振、固定分频器)
+
+	```dts
+	osc32k: osc32k {
+		compatible = "fixed-clock";
+		clock-frequency = <32768>; // 32.768kHz RTC 时钟
+	};
+	```
+
+2. 典型场景
+
+	+ 外部晶振(如24MHz振荡器)：`clock-frequency = <24000000>;`
+	+ 实时时钟(RTC)的32.768kHz时钟：`clock-frequency = <32768>;`
+	
+3. 约束：频率值一旦设定，系统启动时即生效，不支持运行时修改
+
+#### 7.1.3 `assigned-clocks和assigned-clock-rates`属性
+
+##### 7.1.3.1 属性定义与作用机制
+
+1. `assigned-clocks`
+	
+	+ 功能：标识设备需动态配置的时钟源列表，通过生产者节点的`phandle`和时钟标识符`specifier`，指定目标时钟
+	+ 数据类型：整数数组，每个元素对应一个时钟源的引用(如`<&rcu ACLK_VOP>`)
+	
+2. `assigned-clock-rates`
+
+	+ 功能：为`assigned-clocks`指定的时钟源**设定运行频率(单位:Hz)** 需与时钟源顺序严格对应
+	+ 数据类型：整数数组，每个元素表示一个频率值
+	
+3. 示例：`assigned-clock-rates`与`assigned-clocks`匹配，分别设置两个时钟的频率
+
+	```dts
+	clock {
+		assigned-clocks = <&pmucru CLK_RTC_32K>, <&cru ACLK_RKVDEC_PRE>;
+		assigned-clock-rates = <32768>, <300000000>; // 32.768kHz 和 300MHz
+	}
+	```
+
+##### 7.1.3.2 典型应用场景
+
+1. 动态频率覆盖静态配置：当设备需要覆盖时钟生产者的默认频率
+
+	+ 视频解码器需将ACK时钟，从默认200MHz提升到300MHz
+	+ CPU核心需在启动时调整PLL输出频率
+	
+2. 多级时钟树配置
+
+	+ 在复杂时钟树中，子时钟频率依赖父时钟(如PLL分频)，需动态设定各级频率
+	
+	```dts
+	assigned-clocks = <&pll 2>;          // 引用PLL输出
+	assigned-clock-rates = <1200000000>; // 设置PLL输出为1.2GHz
+	```
+	
+3. 外设特定频率需求：如UART波特率时钟需精确匹配115.2KHz 避免依赖固定时钟源的偏差
+
+##### 7.1.3.3 设备树语法规则
+
+1. 位置与节点类型
+
+	+ 通常位于**时钟消费者节点(外设)**或**时钟控制器节点(CPU)**
+	+ 时钟控制器节点中，可同时配置自身输出的时钟频率
+	
+2. 数组顺序与匹配
+
+	+ `assigned-clock-rates`必须与`assigned-clocks`的时钟源顺序和数量一致
+	+ 若部分时钟无需设频，可用0占位(表示不修改)
+	
+3. 引用格式
+
+	+ 时钟标识符(`specifier`)需与时钟生产者的`#clock-cells`匹配
+	+ `#clock-cells = <0>`：单路时钟，引用时不加标识符
+	+ `#clock-cells = <1>`：多路时钟，需指定索引(如`<&cru 5>`)
+	
+##### 7.1.3.4 与相关属性的协作关系
+
+1. `​​assigned-clock-parents`
+
+	+ 作用：指定时钟的父源(如切换PLL输入)，需与`assigned-clocks`顺序匹配
+	+ 示例：
+	```dts
+	assigned-clock-parents = <&pll2>; // 将第一个时钟的父源设为pll2
+	```
+	
+2. `​​clock-frequency`的局限性
+
+	+ 仅用于静态定义固定时钟(如晶振)，无法动态修改；而`assigned-clock-rates`支持运行时调频
+	
+3. 驱动依赖：需时钟驱动实现`.set_rate`回调函数，否则配置无效
 
