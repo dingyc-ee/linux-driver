@@ -2110,9 +2110,38 @@ gpio5: gpio@020ac000 {
 	
 3. 约束：频率值一旦设定，系统启动时即生效，不支持运行时修改
 
-#### 7.1.3 `assigned-clocks和assigned-clock-rates`属性
+#### 7.1.3 `clock-output-names`
 
-##### 7.1.3.1 属性定义与作用机制
+`clock-output-names`是时钟提供者节点的可选属性，其值是一个字符串列表。语法如下：
+
+```dts
+clock-output-names = "name1", "name2", ...;
+```
+
++ 单路时钟：当`#clock-cells = <0>`时，通常只定义一个名称
+
+	```dts
+	osc24m: osc24m {
+		compatible = "fixed-clock";
+		clock-frequency = <24000000>;
+		clock-output-names = "osc24m"; // 单路输出
+		#clock-cells = <0>;
+	};
+	```
+
++ 多路时钟：当`#clock-cells = <1>`时，需为每一路输出指定名称
+
+	```dts
+	pll: pll@4c000 {
+		compatible = "vendor,pll";
+		#clock-cells = <1>;
+		clock-output-names = "pll", "pll_switched"; // 两路输出
+	};
+	```
+
+#### 7.1.4 `assigned-clocks和assigned-clock-rates`属性
+
+##### 7.1.4.1 属性定义与作用机制
 
 1. `assigned-clocks`
 	
@@ -2133,7 +2162,9 @@ gpio5: gpio@020ac000 {
 	}
 	```
 
-##### 7.1.3.2 典型应用场景
+	简单理解一下：使用`pmucru`模块输出了`CLK_RTC_32K`时钟信号，使用`cru`模块输出了`ACLK_RKVDEC_PRE`时钟信号。这两个时钟信号的频率分别是32768和300MHz
+
+##### 7.1.4.2 典型应用场景
 
 1. 动态频率覆盖静态配置：当设备需要覆盖时钟生产者的默认频率
 
@@ -2151,7 +2182,7 @@ gpio5: gpio@020ac000 {
 	
 3. 外设特定频率需求：如UART波特率时钟需精确匹配115.2KHz 避免依赖固定时钟源的偏差
 
-##### 7.1.3.3 设备树语法规则
+##### 7.1.4.3 设备树语法规则
 
 1. 位置与节点类型
 
@@ -2169,19 +2200,23 @@ gpio5: gpio@020ac000 {
 	+ `#clock-cells = <0>`：单路时钟，引用时不加标识符
 	+ `#clock-cells = <1>`：多路时钟，需指定索引(如`<&cru 5>`)
 	
-##### 7.1.3.4 与相关属性的协作关系
+### 7.2 时钟消费者(`clock consumer`)
 
-1. `​​assigned-clock-parents`
+#### 7.2.1 `clocks`和`clock-names`属性
 
-	+ 作用：指定时钟的父源(如切换PLL输入)，需与`assigned-clocks`顺序匹配
-	+ 示例：
-	```dts
-	assigned-clock-parents = <&pll2>; // 将第一个时钟的父源设为pll2
-	```
-	
-2. `​​clock-frequency`的局限性
+`clocks`和`clock-names`属性，用来指定消费者需要使用的时钟源和名字。意思就是，消费者确实需要这些时钟信号才能正常工作。如果`clocks`设置了多个时钟，意味着该外设确实需要多个独立的时钟信号，才能正常工作。
 
-	+ 仅用于静态定义固定时钟(如晶振)，无法动态修改；而`assigned-clock-rates`支持运行时调频
-	
-3. 驱动依赖：需时钟驱动实现`.set_rate`回调函数，否则配置无效
+```dts
+clock:clock {
+	clocks = <&cru CLK_VOP>;
+	clock-names = "clk_vop";
+};
+```
+
+分析如下：
+
+1. `CLK_VOP`其实就是宏定义，它使用宏定义替换了数字1、2、3....，就是索引号
+2. `cru`的全称：`clock & reset unit`
+3. `pmu`的全称：`power management unit`
+
 
