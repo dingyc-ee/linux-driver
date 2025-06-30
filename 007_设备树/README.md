@@ -2219,4 +2219,38 @@ clock:clock {
 2. `cru`的全称：`clock & reset unit`
 3. `pmu`的全称：`power management unit`
 
+## 第8章 设备树实例分析-CPU
+
+cpu的层次结构，是通过不同的节点来描述系统中物理cpu的布局，是操作系统识别和管理多核架构的基础。
+
+### 8.1 `cpus`节点
+
+`cpus`节点是所有cpu节点的父容器，位于设备树根部`/cpus`。必须定义以下属性：
+
++ `#address-cells`：指定子节点reg属性中`地址字段`的单元数(通常为1或2)
++ `#size-cells`：指定子节点`reg`属性中`大小字段`的单元数(通常为0 因为CPU大小无需显式定义)
++ `imx6ull`示例：
+
+	```dts
+	cpus {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			cpu0: cpu@0 {
+				compatible = "arm,cortex-a7";
+				device_type = "cpu";
+				reg = <0>;
+			};
+		};
+	```
+
+### 8.2 `cpu@x`节点(树立起属性)
+
+描述单个cpu核心，是cpus的直接子节点。关键属性包括：
+
++ `device_type = cpu`：指定设备类型为cpu
++ `reg`：cpu核心的唯一id。如`reg = <0>`标识第一个cpu核
++ `compatible`：指定cpu架构。如`compatible = "arm,cortex-a7"`
++ `clocks`：关联的时钟源
+
 
