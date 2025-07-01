@@ -2299,3 +2299,179 @@ VCC和VDD用来供电，VSS就是GND接地端。
 
 ![](./src/0012.jpg)
 
+## 第10章 `pinctrl`
+
+### 10.1 `pinctrl`简介
+
+Linux内核提供了pinctrl子系统，pinctrl是`pin controller`的缩写，目的是为了统一各芯片原厂的pin脚管理。所以一般pinctrl子系统的驱动，由芯片原厂的BSP工程师实现。
+
+有了pinctrl子系统以后，驱动工程师就可以通过配置设备树使用pinctrl子系统，来设置管脚服用以及管脚的电气属性。
+
+### 10.2 语法规则：客户端与服务端分离
+
+pinctrl的语法，我们可以看做由2部分构成：客户端client和服务端service。
+
+#### 10.2.1 客户端(设备节点)
+
+客户端的语法格式是固定的，所有硬件平台的语法都一样。必须记住。
+
+1. `pinctrl-names`：表示设备的状态。如"default"、"sleep"，表示设备在不同工作模式下的配置
+2. `pinctrl-0、princtrl-1`：按索引引用服务端service中的引脚
+
+```dts
+// client客户端
+&i2c1 {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_i2c1>;
+
+	mag3110@0e {
+		compatible = "fsl,mag3110";
+		reg = <0x0e>;
+	};
+};
+
+// service服务端
+&iomuxc {
+	pinctrl_i2c1: i2c1grp {
+		fsl,pins = <
+			MX6UL_PAD_UART4_TX_DATA__I2C1_SCL 0x4001b8b0
+			MX6UL_PAD_UART4_RX_DATA__I2C1_SDA 0x4001b8b0
+		>;
+	};
+};
+```
+
+分析下面的设备树客户端代码：
+
+1. 这里有default和wake up两个状态。default为第0个状态，wake up为第1个状态
+2. pinctrl-0 = <&pinctrl_hog_1>表示第0个状态default对应的引脚，在pinctrl_hog_1节点中配置
+3. pinctrl-1同理
+
+```dts
+pinctrl-names = "default", "wake up;
+pinctrl-0 = <&pinctrl_hog_1>;
+pinctrl-1 = <&pinctrl_hog_2>;
+```
+
+#### 10.2.2 服务端(pinctrl节点)
+
+服务端pinctrl节点，定义具体的引脚服用功能和电气属性，平台相关。
+
+```dts
+// service服务端
+&iomuxc {
+	pinctrl_i2c1: i2c1grp {
+		fsl,pins = <
+			MX6UL_PAD_UART4_TX_DATA__I2C1_SCL 0x4001b8b0
+			MX6UL_PAD_UART4_RX_DATA__I2C1_SDA 0x4001b8b0
+		>;
+	};
+};
+```
+
+以上面的代码为例。分析如下：
+
+1. NXP有个规律：前面`MX6UL_PAD`这一部分不用管，中间`UART4_TX_DATA`代表的是引脚名称，后面`I2C1_SCL`表示我们把引脚设置成什么功能
+2. `MX6UL_PAD_UART4_TX_DATA__I2C1_SCL`实际上是一个宏定义。我们看一下具体代码。可以看到，`UART4_TX_DATA`这个引脚可以用作多个功能，具体由复用寄存器来配置。复用寄存器的值为0x2表示`ALT2`
+
+	`imx6ul-pinfunc.h`
+	```c
+	/*
+	* The pin function ID is a tuple of
+	* <mux_reg conf_reg input_reg mux_mode input_val>
+	*/
+	#define MX6UL_PAD_UART4_TX_DATA__UART4_DCE_TX                     0x00B4 0x0340 0x0000 0x0 0x0
+	#define MX6UL_PAD_UART4_TX_DATA__UART4_DTE_RX                     0x00B4 0x0340 0x063C 0x0 0x0
+	#define MX6UL_PAD_UART4_TX_DATA__ENET2_TDATA02                    0x00B4 0x0340 0x0000 0x1 0x0
+	#define MX6UL_PAD_UART4_TX_DATA__I2C1_SCL                         0x00B4 0x0340 0x05A4 0x2 0x1
+	#define MX6UL_PAD_UART4_TX_DATA__CSI_DATA12                       0x00B4 0x0340 0x04F4 0x3 0x0
+	#define MX6UL_PAD_UART4_TX_DATA__CSU_CSU_ALARM_AUT02              0x00B4 0x0340 0x0000 0x4 0x0
+	#define MX6UL_PAD_UART4_TX_DATA__GPIO1_IO28                       0x00B4 0x0340 0x0000 0x5 0x0
+	#define MX6UL_PAD_UART4_TX_DATA__ECSPI2_SCLK                      0x00B4 0x0340 0x0544 0x8 0x1
+	```
+	这个宏定义展开是5个值。分别对应`复用寄存器(复用功能)`、`配置寄存器(电气属性)`、`输入寄存器(某些外设需通过此寄存器配置输入路径)`、`复用值`、`输入寄存器值(仅当input_reg≠0时有效，否则忽略)`。
+	
+	我们对着芯片手册来看下：
+	```c
+	#define MX6UL_PAD_UART4_TX_DATA__I2C1_SCL                         0x00B4 0x0340 0x05A4 0x2 0x1
+	```
+	*`0x00B4`为复用寄存器偏移地址，`0x2`为复用寄存器的值，正好为`ATL2`*
+	![](./src/0013.jpg)
+	*`0x0340`为设置电气属性的寄存器*
+	![](./src/0014.jpg)
+	*`0x05A4`为输入寄存器地址，0x1为选择`ALT2`*
+	![](./src/0015.jpg)
+
+#### 10.2.3 `pinctrl`电气属性
+
+	`pinctrl`最后一个值为电气属性，我们要根据芯片手册来进行设置。
+
+### 10.3 `hog(独占)`引脚
+
+pinctrl的hog机制，在内核初始化阶段具有特殊作用，主要用于强制锁定关键引脚配置，确保系统基础功能在驱动加载前可用。
+
+```dts
+&iomuxc {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_hog_1>;
+	imx6ul-evk {
+		pinctrl_hog_1: hoggrp-1 {
+			fsl,pins = <
+				MX6UL_PAD_UART1_RTS_B__GPIO1_IO19	0x17059 /* SD1 CD */
+				MX6UL_PAD_GPIO1_IO05__USDHC1_VSELECT	0x17059 /* SD1 VSELECT */
+				MX6UL_PAD_GPIO1_IO09__GPIO1_IO09        0x17059 /* SD1 RESET */
+			>;
+		};
+	};
+};
+
+&iomuxc_snvs {
+	pinctrl-names = "default_snvs";
+	pinctrl-0 = <&pinctrl_hog_2>;
+	imx6ul-evk {
+	pinctrl_hog_2: hoggrp-2 {
+			fsl,pins = <
+				MX6ULL_PAD_SNVS_TAMPER0__GPIO5_IO00      0x80000000
+			>;
+		};
+	}
+};
+```
+
+#### 10.3.1 `pinctrl hog`特殊之处
+
+1. `hog`引脚在内核启动早期被强制配置并锁定，禁止其他驱动重复占用或修改。例如：调试串口uart引脚被标记为hog，确保内核日志输出不受后续驱动影响
+2. 配置时机早于驱动加载。`hog`引脚的配置发生在内核初始化阶段，早于任何外设驱动的`probe()`函数。例如：复位引脚、关键电源控制引脚需在系统启动时立即生效
+3. `hog`引脚在设备树中，通常以`pinctrl_hog_x`命名(如`pinctrl_hog_1`)，并通过根节点的`pinctrl-0`引用。例如：
+
+	```dts
+	&iomuxc {
+		pinctrl-names = "default";
+		pinctrl-0 = <&pinctrl_hog_1>; // 引用hog组
+		imx6ul-evk {
+			pinctrl_hog_1: hoggrp {
+				fsl,pins = <MX6UL_PAD_GPIO1_IO00__GPIO1_IO00 0x17059>; // 关键引脚
+			};
+		};
+	};
+	```
+
+#### 10.3.2 `hog`与`非hog`配置的对比
+
+| 类型 | 处理时机 | 是否独占 | 典型场景 |
+| - | - | - | - |
+| hog引脚 | 内核启动早期 | √ | 调试串口、复位引脚 |
+| default状态 | 驱动probe()前 | × | 外设(i2c spi)使能 |
+| sleep状态 | 驱动运行时切换 | × | 低功耗模式 |
+
+#### 10.3.3 设计意义与最佳实践
+
++ 避免冲突：`hog`机智解决多驱动竞争关键引脚的问题(如多个驱动误配置同一复位引脚)
++ 保障启动可靠性：确保调试串口等核心功能在驱动初始化前可用，便于问题追踪
++ 开发建议：
+
+	+ 仅将全局关键引脚(时钟、复位、调试接口)设为hog，避免过度占用影响外设灵活性
+	+ 非关键外设(传感器、扩展IO)应使用default状态，在驱动加载时按需配置
+
+
+
