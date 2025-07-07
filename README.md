@@ -14,4 +14,4 @@
 
 [platform总线](006_platform总线/README.md)
 
-[设备树](007_设备树/README.md)
+[设备树](007_设备树原理/README.md)
