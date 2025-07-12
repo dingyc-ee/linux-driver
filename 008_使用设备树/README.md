@@ -303,4 +303,30 @@ struct fdt_reserve_entry {
 2. 偏移量引用：在结构块中，属性的名称是通过偏移量来引用字符串块中的相应字符串的
 3. 对齐约束：字符串块没有对齐约束，这意味着它可以出现在设备树dcb的任何偏移处
 
+## 第2章 `dtb`展开成`device_node`
+
+### 2.1 `device_node`设备节点
+
+Linux内核中`device_node`结构体，是设备树的核心数据结构，用于描述设备树中的节点信息。
+
+```c
+struct device_node {
+	const char *name;   // 节点名称(非完整路径)，取自设备树节点名的首段
+	const char *type;   // 设备类型，取自节点中的 device_type 属性(可选)
+	phandle phandle;    // 节点的唯一标识符，用于跨节点引用(如中断映射)
+	const char *full_name;
+	struct fwnode_handle fwnode;
+
+	struct	property *properties;
+	struct	property *deadprops;	/* removed properties */
+	struct	device_node *parent;
+	struct	device_node *child;
+	struct	device_node *sibling;
+	struct	kobject kobj;
+	unsigned long _flags;
+	void	*data;
+};
+```
+
+
 

@@ -2473,5 +2473,102 @@ pinctrl的hog机制，在内核初始化阶段具有特殊作用，主要用于�
 	+ 仅将全局关键引脚(时钟、复位、调试接口)设为hog，避免过度占用影响外设灵活性
 	+ 非关键外设(传感器、扩展IO)应使用default状态，在驱动加载时按需配置
 
+## 第11章 `phandle`机制
 
+在设备树中，phandle是一种唯一标识符，用于节点间的引用(如中断控制器、时钟源)。其分配方式分为自动分配(隐式)和手动分配(显式)两种。
 
+### 11.1 phandle的分配机制
+
+#### 11.1.1 自动分配(隐式)
+
++ 触发条件：在`.dts`源文件中使用label标签来引用节点(如&label)，不显式定义phandle
++ 编译过程：设备树编译器dct在生成.dtb时，自动为被引用的节点生成唯一phandle，并插入到二进制中
++ 示例：
+
+	```dts
+	// DTS 源码（未显式定义 phandle）
+	pic: interrupt-controller@1000 {  // 标签 pic
+		interrupt-controller;
+	};
+
+	uart0: serial@2000 {
+		interrupts = <10>;
+		interrupt-parent = <&pic>;  // 通过标签引用
+	};
+	```
+
+	编译后的dtb中，dtc自动为pic节点分配`phandle = <1>` 并将`<&pic>`替换成`<1>`
+
+#### 11.1.2 手动分配(显式)
+
++ 触发条件：在`.dts`中显式定义phandle属性(需确保全局唯一)
++ 注意事项：易冲突且难维护，通常不推荐
++ 示例：
+
+	```dts
+	interrupt-controller@1000 {
+		phandle = <1>;  // 显式指定值
+		interrupt-controller;
+	};
+
+	serial@2000 {
+		interrupts = <10>;
+		interrupt-parent = <1>;  // 直接使用 phandle 值
+	};
+	```
+
+### 11.2 关键设计要点
+
+1. 唯一性要求：phandle必须在整个设备树中唯一，dtc自动分配时通过全局计数器保证(如1、2、3...)
+2. 应用方式
+	+ 标签语法(&label)：提高可读性，避免硬编码
+	+ 直接数值：仅用于特殊场景(如覆盖补丁设备树)
+
+### 11.3 phandle生成流程
+
+1. 编译入口：开发者执行编译命令 `dtc -I dts -O dtb -o output.dtb input.dts`，dtc开始解析dts文件
+2. 扫描引用关系：dct遍历设备树所有节点，识别被标签引用的节点(如&pic指向的节点)，并标记为需分配phandle
+3. 分配与替换
+	+ 为被引用节点分配phandle值(按全局计数器顺序，从1开始)
+	+ 替换引用点：将`&pic`替换为`<1>`，即`interrupt-parent = <1>`
+
+### 11.4 多引用场景的处理
+
++ 同一节点被多次引用：无论被引用多少次(如多个设备引用同一个中断控制器)，dtc仅分配一个phandle，所有引用点共享同一值
++ 未引用的节点：未被标签引用的节点不会自动生成phandle，以减少二进制体积
+
+### 11.5 实例演示
+
+设备树源码.dts
+
+```dts
+/dts-v1/;
+/ {
+    intc: interrupt-controller@1000 {   // 标签 intc
+        interrupt-controller;
+    };
+    uart0: serial@2000 {                 // 标签 uart0
+        interrupt-parent = <&intc>;      // 引用 intc
+    };
+};
+```
+
+编译后dtb的反编译结果(.dts)格式
+
+```dts
+/dts-v1/;
+/ {
+    interrupt-controller@1000 {
+        phandle = <0x00000001>;          // 自动分配 phandle=1
+        interrupt-controller;
+    };
+    serial@2000 {
+        interrupt-parent = <0x00000001>; // 替换为 phandle 值
+    };
+    // 若编译时加 -@，此处会生成 __symbols__ 节点
+    __symbols__ {
+        intc = "/interrupt-controller@1000";
+        uart0 = "/serial@2000";
+    };
+};
+```
