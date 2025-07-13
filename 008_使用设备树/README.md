@@ -640,5 +640,87 @@ static int probe(struct platform_device *pdev) {
 
 3. 电源管理回调：在suspend/resume回调中，通过`data`快速访问设备状态寄存器，减少重复解析设备树的开销
 
+### 2.2 `struct property`属性
+
+在Linux设备树机制中，`struct property`用来存储硬件资源的键值对信息(诶寄存器地址、中断号、兼容性字符串)。
+
+```c
+struct property {
+	char	*name;          // 属性名称(如"compatible"、"reg")
+	int	length;             // 属性值长度(字节数)
+	void	*value;         // 指向属性值的指针
+	struct property *next;  // 指向同一节点的下一个属性
+};
+```
+
+#### 2.2.1 结构体定义与成员解析
+
+##### 2.2.1.1 `name`成员
+
++ 作用：标识属性类型(字符串)，如`compatible`表示驱动匹配标识，`reg`表示寄存器地址和大小
++ 实例："gpios"、"interrupts"
+
+##### 2.2.1.2 `length`成员
+
++ 作用：属性值的字节长度。例如：
+    + 字符串数组`"arm,pl011"`的长度为12(包括终止符\0)
+    + 32位整数数组`<0x80000000 0x1000>`的长度为8字节(2个u32)
+
+##### 2.2.1.3 `value`成员
+
++ 作用：指向属性值原始数据的指针，数据类型需结合name解析
+    + 字符串：如`compatible = "ti,tmp75"`，value指向字符串存储地址
+    + 数值数组：如`reg = <0x101f0000 0x1000>`，value指向u32数组
+
+##### 2.2.1.4 `next`成员
+
++ 作用：构成单向链表，链接同一节点的所有属性。遍历节点属性时通过next逐个访问
+
+#### 2.2.2 典型使用场景
+
+##### 2.2.2.1 驱动匹配(`compatible`属性)
+
++ 设备树示例
+
+    ```dts
+    i2c1 {
+        temperature-sensor@48 {
+            compatible = "ti,tmp75";
+            reg = <0x48>;
+        };
+    };
+    ```
+
++ 内核中的`struct property`：
+    + name = "compatible"，value = "ti,tmp75"， length = 9(含\0)
+    + 驱动通过of_match_device()匹配compatible值，触发probe()函数
+
+##### 2.2.2.2 资源获取(`reg/interrupts`属性)
+
++ 设备树示例
+
+    ```dts
+    serial@101f0000 {
+        compatible = "arm,pl011";
+        reg = <0x101f0000 0x1000>;
+        interrupts = <0 12 4>;
+    };
+    ```
+
++ 内核解析流程
+
+    ```c
+    // 获取 reg 属性
+    struct resource *res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    // 实际调用 of_address_to_resource()，依赖 reg 的 struct property
+    ```
+
+    + reg属性生成`struct property`：length = 8(2个u32)，value指向`[0x101f0000, 0x1000]`
+
+##### 2.2.2.3 状态控制(`status`属性)
+
++ 设备树示例：`status = "disabeld"`
++ 内核行为：解析为`struct property`后，内核跳过该设备初始化
+
 
 
