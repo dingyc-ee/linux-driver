@@ -981,5 +981,445 @@ of_root (根节点)
       └─ sibling: NULL
 ```
 
+## 第3章 `device_node`转为`platform_device`
+
+Linux内核中`device_node`到`platform_device`的转换，是设备树机制的核心环节，实现了硬件描述与驱动的动态匹配。
+
+### 3.1 转换条件：哪些`device_node`会被转换？
+
+并非所有节点都会被转换，需满足以下条件：
+
+1. 必须属性：节点必须包含`compatible`属性(根节点除外)
+2. 节点层级：
+    + 根的直接子节点。如`/child-node`
+    + 特殊总线节点的子节点。若父节点的`compatible`包含以下值之一，其子节点(也需包含`compatible`)会被递归转换：`simple-bus`、`simple-mfd`、`isa`、`arm-amba-bus`
+3. 排除情况：
+    + 根节点(/)、memory、chosen节点不转换
+    + i2c/spi等总线下的子节点(如i2c@xxx/at24c02)由总线驱动处理(转换为i2c_client而非platform_device)
+
+示例说明：
+
+```dts
+/ {
+    led { compatible = "jz2440-led"; };          // ✔️ 转换（根子节点）
+    i2c: i2c@44e0b000 {
+        compatible = "ti,omap4-i2c";             // ✔️ 转换（根子节点）
+        at24c02 { compatible = "at24c02"; };    // ❌ 不转换（由i2c总线处理）
+    };
+    mytest {
+        compatible = "mytest", "simple-bus";     // ✔️ 转换（含simple-bus）
+        child { compatible = "child-device"; };   // ✔️ 转换（父为特殊总线）
+    };
+};
+```
+
+### 3.2 完整转换流程与函数调用链
+
+1. `mach-soc_xxx.c`文件，`init_machine`函数指针调用了`of_platform_populate()`函数
+
+    以imx6ull为例。`mach-imx6ul.c`文件的部分代码如下：
+
+    ```c
+    // 默认的总线匹配表，传给of_platform_populate函数作为入参
+    const struct of_device_id of_default_bus_match_table[] = {
+        { .compatible = "simple-bus", },
+        { .compatible = "simple-mfd", },
+        {} /* Empty terminated list */
+    };
+
+    // init_machine函数，调用了of_platform_populate()函数
+    // polulate单词的含义是，(给文件)输入数据
+    static void __init imx6ul_init_machine(void)
+    {
+        struct device *parent;
+
+        parent = imx_soc_device_init();
+        if (parent == NULL)
+            pr_warn("failed to initialize soc device\n");
+
+        of_platform_populate(NULL, of_default_bus_match_table/*默认总线匹配表*/, NULL, NULL);
+    }
+
+    // 注册machine_desc描述符
+    DT_MACHINE_START(IMX6UL, "Freescale i.MX6 Ultralite (Device Tree)")
+	.map_io		= imx6ul_map_io,
+	.init_irq	= imx6ul_init_irq,
+	.init_machine	= imx6ul_init_machine,
+	.init_late	= imx6ul_init_late,
+	.dt_compat	= imx6ul_dt_compat,
+    MACHINE_END
+    ```
+
+2. `of_platform_populate()`函数
+
+    + 获取设备树根节点(`of_find_node_by_path("/")`)
+    + 遍历根节点的所有一级子节点，对每个节点调用`of_platform_bus_create()`函数
+
+    ```c
+    int of_platform_populate(struct device_node *root,
+			const struct of_device_id *matches,
+			const struct of_dev_auxdata *lookup,
+			struct device *parent)
+    {
+        struct device_node *child;
+        int rc = 0;
+
+        root = root ? of_node_get(root) : of_find_node_by_path("/");
+        if (!root)
+            return -EINVAL;
+
+        for_each_child_of_node(root, child) {
+            rc = of_platform_bus_create(child, matches, lookup, parent, true);
+            if (rc)
+                break;
+        }
+        of_node_set_flag(root, OF_POPULATED_BUS);
+
+        of_node_put(root);
+        return rc;
+    }
+    ```
+
+3. `of_platform_bus_create()`函数
+
+    关键参数：
+    + `bus`：当前节点指针。如`/soc`
+    + `matches`：匹配表(在`mach-imx6ul.c`中定义)，定义哪些节点被视为总线，如`simple-bus`
+    + `strict`：若为true，则要求节点必须有`compatible`属性才处理
+
+    ```c
+    static int of_platform_bus_create(struct device_node *bus,
+				  const struct of_device_id *matches,
+				  const struct of_dev_auxdata *lookup,
+				  struct device *parent, bool strict)
+    {
+        const struct of_dev_auxdata *auxdata;
+        struct device_node *child;
+        struct platform_device *dev;
+        const char *bus_id = NULL;
+        void *platform_data = NULL;
+        int rc = 0;
+
+        /* Make sure it has a compatible property */
+        if (strict && (!of_get_property(bus, "compatible", NULL))) {
+            return 0;
+        }
+
+        if (of_device_is_compatible(bus, "arm,primecell")) {
+            of_amba_device_create(bus, bus_id, platform_data, parent);
+            return 0;
+        }
+
+        dev = of_platform_device_create_pdata(bus, bus_id, platform_data, parent);
+        if (!dev || !of_match_node(matches, bus))
+            return 0;
+
+        for_each_child_of_node(bus, child) {
+            pr_debug("   create child: %s\n", child->full_name);
+            rc = of_platform_bus_create(child, matches, lookup, &dev->dev, strict);
+            if (rc) {
+                of_node_put(child);
+                break;
+            }
+        }
+        of_node_set_flag(bus, OF_POPULATED_BUS);
+        return rc;
+    }
+    ```
+
+    我们来分析下这段代码：
+
+    1. 判断节点有没有`compatible`属性。没有的话直接退出(不满足转换条件的必须属性)
+
+        ```c
+        if (strict && (!of_get_property(bus, "compatible", NULL))) {
+            return 0;
+        }
+        ```
+
+    2. 判断节点有没有`arm,primecell`属性。有的话直接创建`amba_device`
+
+        ```c
+        if (of_device_is_compatible(bus, "arm,primecell")) {
+            of_amba_device_create(bus, bus_id, platform_data, parent);
+            return 0;
+        }
+        ```
+
+    3. 运行到这里，所有条件都满足，我们就应该创建`platform_device`了。如果创建成功且没有找到`默认总线匹配项`，返回
+
+        ```c
+        dev = of_platform_device_create_pdata(bus, bus_id, platform_data, parent);
+        if (!dev || !of_match_node(matches, bus))
+            return 0;
+        ```
+
+    4. 如果节点属性与`默认总线匹配项`匹配，那还需要对节点下的所有子节点，递归的进行转换。转换流程与当前函数一致(子节点有`compatible`属性就创建`platform_device`，否则退出)
+
+        ```c
+        for_each_child_of_node(bus, child) {
+            pr_debug("   create child: %s\n", child->full_name);
+            rc = of_platform_bus_create(child, matches, lookup, &dev->dev, strict);
+            if (rc) {
+                of_node_put(child);
+                break;
+            }
+        }
+        ```
+
+4. `of_platform_device_create_pdata()`函数
+
+    Linux内核中将`设备树节点(device_node)`转换为`platform_device`的核心函数。功能定位：
+
+    + 解析节点属性(`reg、interrputs`)并填充resources数组
+    + 关联`device_node`到`platform_device.dev.of_node`
+    + 将设备注册到平台总线(`platform_bus_type`)，供驱动匹配
+
+    ```c
+    static struct platform_device *of_platform_device_create_pdata(
+					struct device_node *np,
+					const char *bus_id,
+					void *platform_data,
+					struct device *parent)
+    {
+        struct platform_device *dev;
+
+        if (!of_device_is_available(np))
+            return NULL;
+
+        dev = of_device_alloc(np, bus_id, parent);
+
+        dev->dev.bus = &platform_bus_type;
+        dev->dev.platform_data = platform_data;
+
+        of_device_add(dev);
+
+        return dev;
+    }
+    ```
+
+    这个函数做的事情比较多，我们来逐一分析：
+
+    1. 设备节点有效性检查：节点状态`status != okay(ok)`时跳过
+
+        ```c
+        static bool __of_device_is_available(const struct device_node *device)
+        {
+            const char *status;
+            int statlen;
+
+            status = __of_get_property(device, "status", &statlen);
+            if (status == NULL)
+                return true;
+
+            if (statlen > 0) {
+                if (!strcmp(status, "okay") || !strcmp(status, "ok"))
+                    return true;
+            }
+
+            return false;
+        }
+        ```
+
+    2. 调用`of_device_alloc(np)`函数，分配并初始化`platform_device`
+
+        ```c
+        struct platform_device *of_device_alloc(struct device_node *np,
+				  const char *bus_id,
+				  struct device *parent)
+        {
+            struct platform_device *dev;
+            int rc, i, num_reg = 0, num_irq;
+            struct resource *res, temp_res;
+
+            dev = platform_device_alloc("", -1);
+
+            /* count the io and irq resources */
+            while (of_address_to_resource(np, num_reg, &temp_res) == 0)
+                num_reg++;
+            num_irq = of_irq_count(np);
+
+            /* Populate the resource table */
+            if (num_irq || num_reg) {
+                res = kzalloc(sizeof(*res) * (num_irq + num_reg), GFP_KERNEL);
+                if (!res) {
+                    platform_device_put(dev);
+                    return NULL;
+                }
+
+                dev->num_resources = num_reg + num_irq;
+                dev->resource = res;
+                for (i = 0; i < num_reg; i++, res++) {
+                    rc = of_address_to_resource(np, i, res);
+                    WARN_ON(rc);
+                }
+                if (of_irq_to_resource_table(np, res, num_irq) != num_irq)
+                    pr_debug("not all legacy IRQ resources mapped for %s\n",
+                        np->name);
+            }
+
+            dev->dev.of_node = of_node_get(np);
+            dev->dev.parent = parent ? : &platform_bus;
+
+
+            of_device_make_bus_id(&dev->dev);
+
+            return dev;
+        }
+        ```
+
+        这个函数非常复杂。理解了这个函数，就理解了`device_node`转为`platform_device`的流程。我们详细分析：
+
+        1. 申请`platform_device`的内存：`dev = platform_device_alloc("", -1)`
+        2. 调用`of_address_to_resource()`函数，解析节点的`reg`属性，获取num_reg
+
+            ```c
+            // 获取节点的reg属性，有多组reg属性时，index就是数组下标
+            const __be32 *of_get_address(struct device_node *dev, int index, u64 *size,
+		    unsigned int *flags)
+            {
+                const __be32 *prop;
+                unsigned int psize;
+                struct device_node *parent;
+                struct of_bus *bus;
+                int onesize, i, na, ns;
+
+                /* Get parent & match bus type */
+                parent = of_get_parent(dev);
+                bus = of_match_bus(parent);
+                bus->count_cells(dev, &na, &ns);
+
+                /* Get "reg" or "assigned-addresses" property */
+                prop = of_get_property(dev, "reg", &psize);
+                if (prop == NULL)
+                    return NULL;
+                psize /= 4;
+
+                onesize = na + ns;
+                for (i = 0; psize >= onesize; psize -= onesize, prop += onesize, i++)
+                    if (i == index) {
+                        if (size)
+                            *size = of_read_number(prop + na, ns);
+                        if (flags)
+                            *flags = IORESOURCE_MEM;
+                        return prop;
+                    }
+                return NULL;
+            }            
+
+            // 把reg属性里面的一组(地址 + 长度)，转换成resources[]的成员start和end，flag设为IORESOURCE_MEM
+            static int __of_address_to_resource(struct device_node *dev,
+                    const __be32 *addrp, u64 size, unsigned int flags,
+                    const char *name, struct resource *r)
+            {
+                u64 taddr;
+
+                if ((flags & (IORESOURCE_IO | IORESOURCE_MEM)) == 0)
+                    return -EINVAL;
+                memset(r, 0, sizeof(struct resource));
+                if (flags & IORESOURCE_IO) {
+                    unsigned long port;
+                    port = pci_address_to_pio(taddr);
+                    if (port == (unsigned long)-1)
+                        return -EINVAL;
+                    r->start = port;
+                    r->end = port + size - 1;
+                } else {
+                    r->start = taddr;
+                    r->end = taddr + size - 1;
+                }
+                r->flags = flags;
+                r->name = name ? name : dev->full_name;
+
+                return 0;
+            }
+
+            int of_address_to_resource(struct device_node *dev, int index,
+			   struct resource *r)
+            {
+                const __be32	*addrp;
+                u64		size;
+                unsigned int	flags;
+                const char	*name = NULL;
+
+                // 1. 获取reg数组的第index组数据 reg = <addr size>
+                addrp = of_get_address(dev, index, &size, &flags);
+                if (addrp == NULL)
+                    return -EINVAL;
+
+                // 把addr和size转为resources[]数组的一条内容
+                return __of_address_to_resource(dev, addrp, size, flags, name, r);
+            }
+            ```
+
+        3. 调用`of_irq_count()`函数，解析节点的`interrupts`属性，获取num_irq
+
+            ```c
+            int of_irq_count(struct device_node *dev)
+            {
+                struct of_phandle_args irq;
+                int nr = 0;
+
+                while (of_irq_parse_one(dev, nr, &irq) == 0)
+                    nr++;
+
+                return nr;
+            }
+            ```
+
+        4. 如果有`reg`或`interrupts`属性，申请`resource`内存，把`reg`和`interrupts`解析保存到`resource`中
+
+            ```c
+            if (num_irq || num_reg) {
+                res = kzalloc(sizeof(*res) * (num_irq + num_reg), GFP_KERNEL);
+                if (!res) {
+                    platform_device_put(dev);
+                    return NULL;
+                }
+
+                dev->num_resources = num_reg + num_irq;
+                dev->resource = res;
+                for (i = 0; i < num_reg; i++, res++) {
+                    rc = of_address_to_resource(np, i, res);
+                    WARN_ON(rc);
+                }
+                if (of_irq_to_resource_table(np, res, num_irq) != num_irq)
+                    pr_debug("not all legacy IRQ resources mapped for %s\n",
+                        np->name);
+            }
+            ```
+
+        5. 关联`device_node`到`platform_device.dev.of_node`
+
+            ```c
+            dev->dev.of_node = of_node_get(np);
+            ```
+
+        6. `platform_device`申请和初始化完成，返回
+
+    3. 设置总线类型为`platform_bus_type`，注册设备
+
+        ```c
+        struct bus_type platform_bus_type = {
+            .name		= "platform",
+            .dev_groups	= platform_dev_groups,
+            .match		= platform_match,   // 平台总线匹配函数
+            .uevent		= platform_uevent,
+            .pm		= &platform_dev_pm_ops,
+        };
+
+        dev->dev.bus = &platform_bus_type;
+
+        of_device_add(dev);
+        ```
+
+### 3.3 `device_node`转为`platform_device`流程总结
+
+1. 逐个扫描根节点的子节点，判断有没有`compatible`属性
+2. 如果节点有`compatible`属性，开始创建`platform_device`。跳过`status != okay`的节点，解析节点的`reg和interrupts`属性，添加到`platform_device`的resource资源中，并注册`platform_device`设备
+3. 如果节点的`compatible`与`默认总线匹配表`匹配上了，那递归解析子节点。只要子节点包含了`compatible`属性，就重复1~3的流程
+4. 我们的设备总线类型为`platform_bus_type`，其中`match`匹配函数为`platform_match`，用来匹配`平台设备`与`平台驱动`，下一章我们将会介绍之
+
+
 
 
