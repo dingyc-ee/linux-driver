@@ -722,5 +722,264 @@ struct property {
 + 设备树示例：`status = "disabeld"`
 + 内核行为：解析为`struct property`后，内核跳过该设备初始化
 
+### 2.3 `dtb`展开成`device_node`
+
+Linux内核将设备树二进制文件`.dtb`，解析为`device_node`结构树的过程，使设备驱动初始化的核心环节。该过程始于内核启动阶段的`start_kernel()`，经过多个关键步骤完成硬件描述的动态构建。
+
+#### 2.3.1 整体流程概述
+
+内核通过以下阶段完成dtb解析：
+
+1. 启动入口：`start_kernel()`调用`setup_arch()`初始化架构相关配置
+2. DTB验证与保留：`setup_machine_fdt()`验证dtb有效性，`arm_memblock_init()`保留dtb内存防止覆盖
+3. 设备树展开：`unflatten_device_tree()`将dtb转换为`device_node`树结构
+4. 节点属性填充：递归解析每个节点及其属性，构建树形关系
+
+流程图解：
+
+```
+start_kernel() -> setup_arch() -> setup_machine_fdt()(验证dtb) -> arm_memblock_init()(保留内存) -> unflatten_device_tree()(核心解析)
+```
+
+#### 2.3.2 关键函数源码解析
+
+##### 2.3.2.1 `__atags_pointer 设备树地址`
+
+`__atags_pointer`是内核启动时用于存储uboot传递的设备树dtb物理地址的关键变量。其来源涉及uboot和kernel的启动约定，、汇编阶段的寄存器传递及内核初始化流程。
+
+1. uboot启动内核阶段：需通过arm寄存器传递参数
+
+    + r0：通常为0(历史遗留，无实际用途)
+    + r1：传统方式中存放Machine ID(使用设备树是通常忽略)
+    + r2：存放dtb的物理起始地址
+
+    ```c
+    // U-Boot 的 bootm 命令实现（arch/arm/lib/bootm.c）
+    if (使用设备树) {
+        r2 = (unsigned long)images->ft_addr; // DTB 物理地址
+    } else {
+        r2 = gd->bd->bi_boot_params;        // ATAGS 物理地址
+    }
+    kernel_entry(0, machid, r2);             // 跳转到内核入口
+    ```
+
+2. 内核汇编阶段：接收r2并保存至`__atags_pointer`
+
+    + 初始化cpu和内存管理
+    + 在`__mmap_switched`中保存启动参数，将r2的值存入变量`__atags_pointer`
+    
+    ```asm
+    __mmap_switched:
+        adr     r3, __mmap_switched_data
+        ldmia   r3!, {r4, r5, r6, r7}         // 加载符号地址
+        str     r9, [r4]                       // 保存 CPU ID
+        str     r1, [r5]                       // 保存 Machine ID（传统方式）
+        str     r2, [r6]                       // ↓ 将 r2 存入 __atags_pointer
+        b       start_kernel                   // 跳转到 C 语言入口
+
+    __mmap_switched_data:
+        .long   __mmap_switched                // 函数自身地址（无用）
+        .long   __bss_start                    // BSS 起始
+        .long   _end                           // BSS 结束
+        .long   processor_id                   // CPU ID 变量地址
+        .long   __machine_arch_type            // Machine ID 变量地址
+        .long   __atags_pointer                // ATAGS/DTB 指针变量地址 ← 关键！
+    ```
+
+##### 2.3.2.2 `启动入口：setup_arch()`
+
+`__atags_pointer`，存储了dtb的物理地址，由uboot传递
+
+```c
+// arch/arm/kernel/setup.c
+void __init setup_arch(char **cmdline_p) {
+    const struct machine_desc *mdesc;
+    mdesc = setup_machine_fdt(__atags_pointer); // 验证DTB并获取硬件描述
+    arm_memblock_init(mdesc);                  // 保留DTB内存区域
+    unflatten_device_tree();                   // 解析为device_node树
+}
+```
+
+##### 2.3.2.3 `dtb验证：setup_machine_fdt()`
+
+```c
+// arch/arm/kernel/devtree.c
+const struct machine_desc *__init setup_machine_fdt(void *dt_virt)
+{
+    const struct machine_desc *mdesc, *mdesc_best = NULL;
+
+    if (!dt_virt || !early_init_dt_verify(phys_to_virt(dt_phys)))   // 检查DTB魔数（0xd00dfeed）
+        return NULL;
+    initial_boot_params = dt_virt;                                  // 全局变量存储DTB地址(虚拟地址)
+
+    of_flat_dt_match_machine(mdesc_best, arch_get_next_mach);       // 匹配compatible与硬件描述
+    
+    early_init_dt_scan_nodes();                  // 扫描chosen/memory等关键节点
+}
+```
+
+这个函数比较复杂，我们重点看函数的功能实现：
+
+1. `early_init_dt_verify`调用了子函数`fdt_check_header`，校验dtb的合法性
+
+    ```c
+    bool __init early_init_dt_verify(void *params)
+    {
+        /* check device tree validity */
+        if (fdt_check_header(params))
+            return false;
+
+        /* Setup flat device-tree pointer */
+        initial_boot_params = params;
+        return true;
+    }
+    ```
+
+2. `of_flat_dt_match_machine(mdesc_best, arch_get_next_mach)` 根据设备树(dtb)匹配硬件平台
+
+    通过比较设备树根节点`compatible`属性，与内核预编译的`machine_desc`结构体列表，选择最匹配当前硬件的平台描述符，为初始化提供板级专属配置
+
+    ![](./src/0012.jpg)
+
+    输入参数列表：
+
+    1. `default_match`：默认的`machine_desc`指针
+    2. `arch_get_next_mach`：回调函数，用于遍历内核中的`machine_desc`列表。下面是源码实现：
+
+        ```c
+        static const void * __init arch_get_next_mach(const char *const **match)
+        {
+            static const struct machine_desc *mdesc = __arch_info_begin;
+            const struct machine_desc *m = mdesc;
+
+            if (m >= __arch_info_end)
+                return NULL;
+
+            mdesc++;
+            *match = m->dt_compat;
+            return m;
+        }
+        ```
+
+    接下来，我们看下`compatible`属性匹配过程：
+
+    1. 获取设备树根节点
+    2. 调用回调函数，获取下一个`machine_desc`，这个过程会遍历内核`DT_MACHINE_START`表
+    3. 调用`of_flat_dt_match`，返回值score表示匹配成功的个数。如果字符串完全匹配，得分最优
+        + 若为前缀匹配(如设备树为"ti,am335x-bone"，内核支持"ti,am335x")，得分递增
+        + 得分越低匹配度越高，最终选择得分最小的`machine_desc`
+    4. 匹配成功后，打印硬件型号：Machine model: xxx(取自设备树model属性)
+
+    ```c
+    const void * __init of_flat_dt_match_machine(const void *default_match,
+		const void * (*get_next_compat)(const char * const**))
+    {
+        const void *data = NULL;
+        const void *best_data = default_match;
+        const char *const *compat;
+        unsigned long dt_root;
+        unsigned int best_score = ~1, score = 0;
+
+        dt_root = of_get_flat_dt_root();
+        while ((data = get_next_compat(&compat))) {
+            score = of_flat_dt_match(dt_root, compat);
+            if (score > 0 && score < best_score) {
+                best_data = data;
+                best_score = score;
+            }
+        }
+        pr_info("Machine model: %s\n", of_flat_dt_get_machine_name());
+
+        return best_data;
+    }
+    ```
+
+    这个函数执行完成后，我们就获得了与设备树匹配的内核描述符`machine_desc`
+
+3. `early_init_dt_scan_nodes` 处理`/chosen(启动参数)`、`/memory(内存布局)`等节点
+
+    ```c
+    void __init early_init_dt_scan_nodes(void)
+    {
+        /* Retrieve various information from the /chosen node */
+        of_scan_flat_dt(early_init_dt_scan_chosen, boot_command_line);
+
+        /* Initialize {size,address}-cells info */
+        of_scan_flat_dt(early_init_dt_scan_root, NULL);
+
+        /* Setup memory, calling early_init_dt_add_memory_arch */
+        of_scan_flat_dt(early_init_dt_scan_memory, NULL);
+    }
+    ```
+
+##### 2.3.2.4 `核心解析：unflatten_device_tree()`
+
+```c
+void __init unflatten_device_tree(void)
+{
+	__unflatten_device_tree(initial_boot_params, &of_root/*全局变量，设备树根节点*/,
+				early_init_dt_alloc_memory_arch);
+}
+```
+
+实际的解析功能，是由函数`__unflatten_device_tree`完成的。这个函数的执行流程如下：
+
+1. 第1次执行`unflatten_dt_node`函数，最后一个传参`dryrun = true`表示预演，模拟解析过程，仅计算所需内存大小size(包括所有的device_node和property结构体及字符串空间)
+2. 调用`dt_alloc`申请内存`mem`，末尾追加`magic number`用于越界检测
+3. 第2次执行`unflatten_dt_node`函数，最后一个传参`dryrun = false`表示实际解析。使用`mem`内存填充`device_node`和`property`结构体。解析完成后，把`mem`赋值给`of_root根节点`
+
+```c
+static void __unflatten_device_tree(void *blob,
+			     struct device_node **mynodes,
+			     void * (*dt_alloc)(u64 size, u64 align))
+{
+	unsigned long size;
+	int start;
+	void *mem;
+
+	/* First pass, scan for size */
+	start = 0;
+	size = (unsigned long)unflatten_dt_node(blob, NULL, &start, NULL, NULL, 0, true);
+	size = ALIGN(size, 4);
+
+	/* Allocate memory for the expanded device tree */
+	mem = dt_alloc(size + 4, __alignof__(struct device_node));
+	memset(mem, 0, size);
+	*(__be32 *)(mem + size) = cpu_to_be32(0xdeadbeef);
+
+	/* Second pass, do actual unflattening */
+	start = 0;
+	unflatten_dt_node(blob, mem, &start, NULL, mynodes, 0, false);
+}
+```
+
+##### 2.3.2.5 总结
+
+两次遍历机制：首次计算内存需求，第二次实际构建节点树，避免内存浪费。
+
+以下设备树片段为例：
+
+```dts
+/ { 
+    serial@101f0000 {
+        compatible = "arm,pl011";
+        reg = <0x101f0000 0x1000>;
+    };
+};
+```
+
+解析后生成的结构关系：
+
+```
+of_root (根节点)
+  |
+  └─ child: serial@101f0000 (device_node)
+      ├─ properties: 
+      │   ├─ compatible: "arm,pl011"
+      │   └─ reg: <0x101f0000 0x1000>
+      ├─ parent: of_root
+      └─ sibling: NULL
+```
+
 
 
