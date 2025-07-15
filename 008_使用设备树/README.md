@@ -2122,3 +2122,121 @@ static int imx_pinctrl_parse_groups(struct device_node *np,
 1. `iomuxc`节点下的`imx6uil-evk`节点，对imx6ull平台是必须的，但是节点名可以自定义，只要不破坏层级结构就可以
 2. 每个平台的pinctrl写法都不同，但大体是类似的，我们应该参考官方demo板的做法
 
+## 第5章 设备树下`platform_device`和`platform_driver`匹配实验
+
+前面的章节都在介绍设备树的理论知识，现在开始实战。我们先从最简单的开始，在设备树中添加一个设备，然后写一个驱动来匹配它。
+
+### 5.1 设备树下写`platform_device`设备
+
+我们在设备树中新增了一个topeet节点。下面来详细分析：
+
+1. `topeet`节点位于根目录下，所以会被解析为`platform_device`设备
+2. `topeet`节点的`compatible`属性值为`simple-bus`，所以会递归的继续解析`topeet`的子节点`myled`
+3. `myled`包含`compatible`属性，所以`myled`也符合条件，会被解析为`platform_device`设备
+
+`imx6ull_iot.dts`
+
+```dts
+/ {
+	model = "Freescale i.MX6 ULL 14x14 EVK Board";
+	compatible = "fsl,imx6ull-14x14-evk", "fsl,imx6ull";
+
+	chosen {
+		stdout-path = &uart1;
+	};
+
+	memory {
+		reg = <0x80000000 0x20000000>;
+	};
+
+    // 新增一个topeet节点
+	topeet {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		myled {
+			compatible = "my device tree";
+			reg = <0x02290008 0x00000004>;
+		};
+	};
+};
+```
+
+### 5.2 设备树下写`platform_driver`驱动
+
+这是一个最简单的`platform_driver`驱动框架。我们来仔细分析一下：
+
+1. `insmod`加载驱动模块时，执行`platform_driver_register()`注册驱动。此时内核会把驱动的`of_match_table表的compatible`属性与设备进行匹配
+2. `of_match_table`中的`compatible`属性值为`my device tree`，与设备树`led`节点的`compatible`匹配。所以加载驱动模块时会执行probe函数
+3. 匹配成功执行`probe`函数，此时入参`struct platform_device *pdev = myled`。因为`myled`节点在内核启动时，先解析设备树转成了`device_node`，再进一步把`device_node`转成了`platform_device`，最终传给probe函数的就是`myled`节点
+4. 我们在`probe()`函数中打印`platform_device`的名称(`printk(KERN_INFO "%s probe\n", pdev->name)`)，platform_device名就是`myled`节点的名称
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/platform_device.h>
+
+static int my_probe(struct platform_device *pdev)
+{
+    printk(KERN_INFO "%s probe\n", pdev->name);
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    printk(KERN_INFO "%s remove\n", pdev->name);
+    return 0;
+}
+
+static const struct of_device_id my_of_id_table[] = {
+    { .compatible = "my device tree" },
+    { /* sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .probe  = my_probe,
+    .remove = my_remove,
+    .driver = {
+        .owner = THIS_MODULE,
+        .name = "my_platform_device",
+        .of_match_table = my_of_id_table,
+    },
+};
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "register %s driver\n", my_driver.driver.name);
+    platform_driver_register(&my_driver);
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk(KERN_INFO "unregister %s driver\n", my_driver.driver.name);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+### 5.3 实测结果
+
+我们重新编译设备树，启动内核。先不加载驱动模块，来看下设备树中的内容。可以看到，设备树dts与`device_node`完全一致。
+
+![](./src/0013.jpg)
+
+接下来，我们看下`platform_device`确实有我们在设备树中添加的`topeet`和`myled`节点。另外，`of_node`关联到了`device_node`，这跟之前的代码分析一致。
+
+![](./src/0014.jpg)
+
+接下来我们`insmod`加载驱动模块，看看效果
+
+![](./src/0015.jpg)
+
+
+
