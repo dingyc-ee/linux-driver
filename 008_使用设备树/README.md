@@ -2238,5 +2238,123 @@ MODULE_AUTHOR("ding");
 
 ![](./src/0015.jpg)
 
+## 第6章 `of操作函数实验`：获取设备树节点
 
+在上一章的学习中，我们学会了设备树下`platform_device`和`platform_driver`匹配，到现在也只是让他们匹配到了一起。但这样显然是不够的，为了完成一些和硬件相关的需求，我们还需要获取到设备树中编写的一些属性。
+
+设备树节点就是`device_node`，所以`of操作函数`实际上就是获取`device_node`结构体，我们接下来学习的`of操作函数`的返回值，都是`device_node`结构体。
+
+### 6.1 `of_find_node_by_name()`函数
+
+#### 6.1.1 函数原型
+
+```c
+struct device_node *of_find_node_by_name(struct device_node *from, const char *name);
+```
+
+#### 6.1.2 参数详解
+
+1. from：指定搜索的起始节点
+    + 若为NULL，表示从设备树的根节点开始全局搜索
+    + 若指定某个节点(父节点)，则尽在该节点的子树范围内搜索
+2. name：目标节点的完整名称. 比如`uart@40011000`，不可简写成`uart`
+3. 返回值
+    + 成功：返回指向`struct device_node`的指针(包含节点所有信息)
+    + 失败：返回NULL，表示未找到匹配节点
+
+### 6.2 `of_find_node_by_path()`函数
+
+#### 6.2.1 函数原型
+
+```c
+struct device_node *of_find_node_by_path(const char *path);
+```
+
+#### 6.2.2 参数详解
+
+1. path：设备树中目标节点的完整路径或别名
+    + 绝对路径：`"/soc/i2c@40012000"`
+    + 别名：`"/i2c1"` 需在设备树中通过`aliases`节点定义
+2. 返回值
+    + 成功：返回指向`struct device_node`的指针(包含节点所有信息)
+    + 失败：返回NULL，表示未找到匹配节点
+
+### 6.3 `of_get_parent()`函数
+
+#### 6.3.1 函数原型
+
+```c
+struct device_node *of_get_parent(const struct device_node *node);
+```
+
+#### 6.3.2 参数详解
+
+1. node：目标子节点，需获取其父节点的设备节点指针。若为NULL，函数直接返回NULL
+2. 返回值
+    + 成功：返回指向`struct device_node`的指针(包含节点所有信息)
+    + 失败：返回NULL，表示未找到匹配节点
+
+#### 6.3.3 注意事项
+
+1. 引用计数管理：`of_get_parent()`会增加父节点的引用计数，必须通过`of_node_put()`释放，否则会导致内存泄露
+2. 根节点无父节点：对根节点调用将返回NULL
+3. 性能优化：频繁调用时建议缓存父节点指针，减少遍历开销
+
+### 6.4 `of_find_compatible_node()`函数
+
+#### 6.4.1 函数原型
+
+```c
+struct device_node *of_find_compatible_node(
+    struct device_node *from, 
+    const char *type, 
+    const char *compatible
+);
+```
+
+#### 6.4.2 参数详解
+
+1. from：搜索起点。若为NULL则从设备树根节点全局搜索。若指定节点，则仅搜索其子树
+2. type：匹配节点的`device_type`属性值。可以为NULL，表示忽略此条件
+3. compatible：兼容性字符串，需匹配的`compatible`属性值(如`fsl,imx6ul-gpt`)
+4. 返回值
+    + 成功：返回指向`struct device_node`的指针(包含节点所有信息)
+    + 失败：返回NULL，表示未找到匹配节点
+
+#### 6.4.3 注意事项
+
+1. 引用计数管理：每次成功调用后必须用`of_node_put()`释放节点，否则会导致内存泄露
+2. 若需精确路径匹配：改用`of_find_node_by_path()`
+
+### 6.5 代码实测
+
+接下来写代码调用这几个函数，来获取`myled`节点和`parent`节点。
+
+```c
+static int my_probe(struct platform_device *pdev)
+{
+    struct device_node *node = NULL;
+    struct device_node *parent = NULL;
+
+    printk(KERN_INFO "%s probe\n", pdev->name);
+
+    node = of_find_node_by_name(NULL, "myled");
+    printk(KERN_INFO "of_find_node_by_name() node.name:%s node.full_name:%s\n", node->name, node->full_name);
+
+    node = of_find_node_by_path("/topeet/myled");
+    printk(KERN_INFO "of_find_node_by_path() node.name:%s node.full_name:%s\n", node->name, node->full_name);
+
+    parent = of_get_parent(node);
+    printk(KERN_INFO "of_get_parent() parent.name:%s parent.full_name:%s\n", parent->name, parent->full_name);
+
+    node = of_find_compatible_node(NULL, NULL, "my device tree");
+    printk(KERN_INFO "of_find_compatible_node() node.name:%s node.full_name:%s\n", node->name, node->full_name);
+
+    return 0;
+}
+```
+
+测试结果：
+
+![](./src/0016.jpg)
 
