@@ -1420,6 +1420,705 @@ Linux内核中`device_node`到`platform_device`的转换，是设备树机制的
 3. 如果节点的`compatible`与`默认总线匹配表`匹配上了，那递归解析子节点。只要子节点包含了`compatible`属性，就重复1~3的流程
 4. 我们的设备总线类型为`platform_bus_type`，其中`match`匹配函数为`platform_match`，用来匹配`平台设备`与`平台驱动`，下一章我们将会介绍之
 
+## 第4章 `led`设备树示例
+
+前面我们分析了两大块内容：`dtb`转成`device_node`，`device_node`转成`platform_device`。本章我们以`imx6ull`芯片为例，写一个最简单的`led`设备树。
+
+### 4.1 设备树添加led的完整步骤与示例
+
+#### 4.1.1 引脚复用配置(`pinctrl`子系统)
+
+在iomuxc节点中，定义gpio的服用模式和电气属性：
+
+```dts
+&iomuxc {
+    pinctrl-names = "default";
+	imx6ul-evk {
+        pinctrl_led: ledgrp {
+            fsl,pins = <
+                MX6ULL_PAD_SNVS_TAMPER3__GPIO5_IO03 0x10b0 /* LED引脚配置 */
+            >;
+        };
+    };
+};
+```
+
+关键说明：
+
++ `MX6ULL_PAD_SNVS_TAMPER3__GPIO5_IO03`：将引脚服用为GPIO功能
++ `0x10b0`：电气属性值
+
+为什么`pinctrl`引脚定义，只能在`imx6ul-evk`节点下定义？思考一下几个问题：
+
+1. `imx6ul-evk`节点能否改名？
+2. `imx6ul-evk`节点能否删除，然后把节点里面的内容上移，直接放到`&iomuxc`节点下？
+
+这两个问题，我们在后面解答回复。
+
+#### 4.1.2 LED设备节点定义
+
+在根节点`/`下添加LED设备描述：
+
+```dts
+/ {
+    gpioled {
+        compatible = "myboard,gpioled";  // 驱动匹配标识
+        pinctrl-names = "default";       // 引脚状态名
+        pinctrl-0 = <&pinctrl_led>;      // 关联pinctrl配置
+        led-gpios = <&gpio5 3 GPIO_ACTIVE_LOW>; // GPIO组+引脚号+有效电平
+        status = "okay";                 // 启用设备
+    };
+};
+```
+
+关键属性：
+
++ `led-gpios`：指定GPIO控制器(gpio5)、引脚号(3)、有效电平(GPIO_ACTIVE_LOW)
++ `pinctrl-0`：引用之前定义的`pinctrl_led`配置组
+
+#### 4.1.3 检查引脚冲突
+
+搜索设备树中相同引脚(如GPIO5_IO03)是否被其他节点(如触摸屏、传感器)占用，若有则需注释冲突部分
+
+```dts
+&tsc {
+    // xnur-gpio = <&gpio5 3 ...>;  /* 注释冲突行 */
+};
+```
+
+#### 4.1.4 编译与验证
+
+1. 编译
+
+```bash
+make dtbs   # 生成dtb二进制文件
+```
+
+2. 启动后检查节点是否存在
+
+```bash
+cat /proc/device-tree/gpioled/status
+```
+
+### 4.2 为什么需要这样设计？ -- 设备树的优势与原理
+
+1. 硬件描述与驱动分离
+
++ 传统方式：寄存器地址(如0x0209c000)直接卸载驱动代码中，更改硬件需重写驱动
++ 设备树方案：寄存器地址、引脚配置等硬件信息移到设备树，驱动通过标准API(`of_get_named_gpio()`)动态获取，提高跨硬件兼容性
+
+2. gpio/pinctrl子系统的作用
+
+| 子系统 | 功能 | 优势 |
+| - | - | - |
+| pinctrl | 配置引脚复用和电气属性 | 避免手动计算寄存器值 |
+| gpio | 提供标准接口操作gpio，无需操作寄存器 | 驱动代码更简洁，避免底层差异 |
+
+3. 设备树的核心价值
+
++ 动态适配：同一驱动可支持不同板卡(如开发板A用GPIO1_IO03，板卡B用GPIO5_IO03)，只需修改设备树
++ 自描述性：内核启动时自动解析设备树，按需初始化硬件(如status = "okay"才启用设备)
++ 减少内核冗余：剥离板级硬件描述，使内核更精简
+
+### 4.3 驱动如何配合设备树工作？
+
+驱动中通过of函数，读取设备树属性：
+
+```c
+// 1. 查找设备节点
+struct device_node *nd = of_find_node_by_path("/gpioled");
+
+// 2. 获取GPIO编号
+int gpio = of_get_named_gpio(nd, "led-gpios", 0);
+
+// 3. 申请并使用GPIO
+gpio_request(gpio, "led"); 
+gpio_direction_output(gpio, 1);  // 初始化为高电平（因GPIO_ACTIVE_LOW）
+gpio_set_value(gpio, 0);         // 输出低电平，点亮LED
+```
+
+设计本质：通过设备树将硬件描述(引脚、寄存器、电平特性)与驱动逻辑解耦，借助pinctrl/gpio子系统标准化硬件访问。
+
+### 4.4 `iomuxc`的`imx6ul-evk`节点
+
+```dts
+&iomuxc {
+	pinctrl-names = "default";
+	pinctrl-0 = <&pinctrl_hog_1>;
+	imx6ul-evk {
+		pinctrl_hog_1: hoggrp-1 {
+			fsl,pins = <
+				MX6UL_PAD_UART1_RTS_B__GPIO1_IO19	0x17059 /* SD1 CD */
+				MX6UL_PAD_GPIO1_IO05__USDHC1_VSELECT	0x17059 /* SD1 VSELECT */
+				MX6UL_PAD_GPIO1_IO09__GPIO1_IO09        0x17059 /* SD1 RESET */
+			>;
+		};
+
+        pinctrl_uart1: uart1grp {
+			fsl,pins = <
+				MX6UL_PAD_UART1_TX_DATA__UART1_DCE_TX 0x1b0b1
+				MX6UL_PAD_UART1_RX_DATA__UART1_DCE_RX 0x1b0b1
+			>;
+		};
+    };
+};
+```
+
+#### 4.4.1 能否把`imx6ul-evk`节点重命名？
+
+##### 4.4.1.1 可行性
+
++ 完全可行且推荐：`imx6ul-evk`是nxp为评估板定义的默认名称。若开发板为自定义硬件(如正点原子、米尔)，重命名可提高可读性和维护性，避免与官方配置混淆
++ 不影响功能：节点名称本身不参与驱动匹配(依赖`compatible`属性)，重命名后只要子节点结构不变，引脚配置仍可正常被解析
+
+##### 4.4.1.2 重命名步骤
+
+1. 复制并修改设备树文件
+
+    + 复制imx6ull-14x14-evk.dts，重命名为自定义名称(如imx6ull-myboard.dts)
+    + 修改根节点的`compatible`属性。例如：
+    ```dts
+    / {
+        compatible = "mycompany,imx6ull-myboard", "fsl,imx6ull";
+    };
+    ```
+
+2. 调整设备树结构
+
+    在`&iomuxc`节点下，将`imx6ull-evk`改为自定义名称(如`myboard-pinctrl`)
+
+    ```dts
+    &iomuxc {
+        myboard-pinctrl {
+            pinctrl_hog_1: hoggrp-1 { /* 原有配置 */ };
+            pinctrl_led: ledgrp { /* 新增配置 */ };
+        };
+    };
+    ```
+
+#### 4.4.2 能否删除`imx6ull-evk`节点并上移子节点？
+
+有风险。下面是详细分析
+
+##### 4.4.2.1 设备树结构对比：原始设计 vs 错误修改
+
+1. 原始设计(分层结构)
+
+    ```dts
+    // 芯片级定义：描述SoC固有资源（位于imx6ull.dtsi）
+    &iomuxc {
+        compatible = "fsl,imx6ul-iomuxc";  // 匹配pinctrl驱动[6,7](@ref)
+    };
+
+    // 板级定义：描述开发板专属配置（位于imx6ul-evk.dts）
+    &iomuxc {
+        imx6ul-evk {
+            pinctrl_hog: hoggrp {
+                fsl,pins = <MX6UL_PAD_GPIO1_IO00__GPIO1_IO00 0x17059>; // 评估板专属引脚
+            };
+            pinctrl_uart1: uart1grp {
+                fsl,pins = <MX6UL_PAD_UART1_TX_DATA__UART1_DCE_TX 0x1b0b0>;
+            };
+        };
+    };
+    ```
+
+    分层清晰：
+
+    + `iomuxc`节点仅描述芯片级控制器(如寄存器地址范围)，由soc级`.dtst`定义
+    + `imx6ull-evk`节点描述板级配置(如GPIO复用、电气属性)，与具体硬件相关
+
+2. 错误修改(删除并上移子节点)
+
+    ```dts
+    // 破坏分层结构的设计
+    &iomuxc {
+        compatible = "fsl,imx6ul-iomuxc";
+        // 直接嵌入板级配置
+        pinctrl_hog: hoggrp {
+            fsl,pins = <MX6UL_PAD_GPIO1_IO00__GPIO1_IO00 0x17059>; 
+        };
+        pinctrl_uart1: uart1grp {
+            fsl,pins = <MX6UL_PAD_UART1_TX_DATA__UART1_DCE_TX 0x1b0b0>;
+        };
+    };
+    ```
+
+    问题本质：将板级专属配置硬编码到芯片级节点，违反设备树硬件描述与驱动解耦的设计原则。
+
+3. 设计原则：具体硬件要增加子节点
+
+    事实上，我们其他的硬件设备也是这么干的。比如i2c设备，时钟频率直接放在`&i2c1`下，而具体的i2c设备就要定义子节点，把设备的信息放在子节点中
+
+    ```dts
+    &i2c1 {
+        clock-frequency = <100000>;
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_i2c1>;
+        status = "okay";
+
+        // 具体的设备，定义到子节点中。不然的话，你都不知道哪些是公共属性，哪些是设备属性
+        mag3110@0e {
+            compatible = "fsl,mag3110";
+            reg = <0x0e>;
+            position = <2>;
+        };
+
+        // 具体的设备，定义到子结点中
+        fxls8471@1e {
+            compatible = "fsl,fxls8471";
+            reg = <0x1e>;
+            position = <0>;
+            interrupt-parent = <&gpio5>;
+            interrupts = <0 8>;
+        };
+    };
+    ```
+
+##### 4.4.2.2 驱动代码示例：`pinctrl`子系统如何解析设备树
+
+驱动匹配逻辑(关键代码)：Linux系统pinctrl通过`compatible`属性匹配设备树节点
+
+```c
+// 驱动代码（位于drivers/pinctrl/freescale/pinctrl-imx6ul.c）
+static const struct of_device_id imx6ul_pinctrl_of_match[] = {
+    { .compatible = "fsl,imx6ul-iomuxc" }, // 仅匹配SoC级控制器
+    { }
+};
+
+static int imx6ul_pinctrl_probe(struct platform_device *pdev) {
+    // 1. 解析iomuxc节点
+    struct device_node *np = pdev->dev.of_node;
+    // 2. 遍历其子节点（预期为板级配置节点）
+    for_each_child_of_node(np, child_np) {
+        // 3. 解析子节点中的fsl,pins属性
+        ret = imx_pinctrl_parse_group(child_np, &grp);
+    }
+}
+```
+
++ 原始设计的正确流程：驱动匹配`iomuxc`->遍历其子节点(imx6ull-evk)->解析pinctrl等配置
++ 错误修改的后果：
+    + 驱动直接解析`iomuxc`下的`pinctrl`，但板级配置被错误关键到芯片级节点
+    + 若其他办卡复用同一soc，其专属配置无法与芯片级节点共存，导致配置冲突或缺失
+
+##### 4.4.2.3 实际风险案例
+
+1. 原始设计：为自定义板卡添加新配置
+
+```dts
+&iomuxc {
+    myboard { // 新增板级节点
+        pinctrl_led: ledgrp {
+            fsl,pins = <MX6UL_PAD_SNVS_TAMPER0__GPIO5_IO00 0x10b0>;
+        };
+    };
+};
+```
+
+驱动仍可以通过`imx6ul-evk`或`my-board`区分不同硬件
+
+2. 错误修改后：冲突
+
+```dts
+&iomuxc {
+    // 已有其他板卡的配置
+    pinctrl_hog: hoggrp { ... }; // 来自imx6ul-evk
+    pinctrl_led: ledgrp { ... }; // 新增自定义配置
+};
+```
+
+#### 4.4.3 为何内核允许这种结构？
+
+设备树语法本身不禁止节点嵌套，但内核驱动依赖分层约定：
+
++ `pinctrl`驱动预期`fsl,pins`位于二级子节点，如`imx6ul-evk > pinctrl_hog`，而给直接位于控制器节点下
++ 强行上移子节点可能导致驱动跳过配置解析(因驱动未在于其位置查找`fsl,pins`)
+
+强烈建议：
+
+1. 重命名而非删除：将`imx6ul-evk`改为自定义名称(如myboard-pinctrl)，保留其作为板级配置容器
+2. 验证配置生效：编译后检查`/sys/firmware/devicetree/base`节点层次，确保`pinctrl_*`位于板级子节点下
+
+#### 4.4.4 `imx6ull-evk`这类节点，在`pinctrl`子系统中不是必须的(如am335x)
+
+下面以`am335x`为例。看下他的设备树怎么写的：
+
+设备树`am335x_boneblock.dts`，可以看到，am335x就是直接在`am33xx_pinmux`下写复用节点，不需要再定义`myboard`这种节点。
+
+```dts
+/dts-v1/;
+
+#include "am33xx.dtsi"
+#include "am335x-bone-common.dtsi"
+
+/ {
+	model = "TI AM335x BeagleBone Black";
+	compatible = "ti,am335x-bone-black", "ti,am335x-bone", "ti,am33xx";
+};
+
+&ldo3_reg {
+	regulator-min-microvolt = <1800000>;
+	regulator-max-microvolt = <1800000>;
+	regulator-always-on;
+};
+
+&mmc1 {
+	vmmc-supply = <&vmmcsd_fixed>;
+};
+
+&mmc2 {
+	vmmc-supply = <&vmmcsd_fixed>;
+	pinctrl-names = "default";
+	pinctrl-0 = <&emmc_pins>;
+	bus-width = <8>;
+	status = "okay";
+};
+
+&am33xx_pinmux {
+	nxp_hdmi_bonelt_pins: nxp_hdmi_bonelt_pins {
+		pinctrl-single,pins = <
+			0x1b0 0x03      /* xdma_event_intr0, OMAP_MUX_MODE3 | AM33XX_PIN_OUTPUT */
+			0xa0 0x08       /* lcd_data0.lcd_data0, OMAP_MUX_MODE0 | AM33XX_PIN_OUTPUT | AM33XX_PULL_DISA */
+			/* 省却部分引脚 */
+			0xe8 0x00       /* lcd_pclk.lcd_pclk, OMAP_MUX_MODE0 | AM33XX_PIN_OUTPUT */
+			0xec 0x00       /* lcd_ac_bias_en.lcd_ac_bias_en, OMAP_MUX_MODE0 | AM33XX_PIN_OUTPUT */
+		>;
+	};
+	nxp_hdmi_bonelt_off_pins: nxp_hdmi_bonelt_off_pins {
+		pinctrl-single,pins = <
+			0x1b0 0x03      /* xdma_event_intr0, OMAP_MUX_MODE3 | AM33XX_PIN_OUTPUT */
+		>;
+	};
+};
+
+&lcdc {
+	status = "okay";
+};
+```
+
+#### 4.4.5 `pinctrl`子系统的`function`和`group`
+
+在Linux内核的pinctrl子系统中，function和group的层次结构，是普遍采用的核心设计模式，但不同芯片厂商在设备树中的具体实现细节可能存在差异。
+
+##### 4.4.5.1 function和group的层次结构是标准设计
+
+1. 核心概念
+
+    + function(功能)：对应一个硬件逻辑模块的功能抽象(如UART、SPI、I2C)
+    + group(引脚组)：是实现某个function所需的物理引脚集合
+
+2. 层次关系在设备树中，通常表现为：
+
+```txt
+引脚控制器（如 iomuxc）
+└── Function 节点（如 uart0_func）
+    └── Group 节点（如 uart0_pins）
+        └── 引脚配置（如电气属性）
+```
+
+##### 4.4.5.2 主流芯片的设备树function和group实例
+
+1. NXP I.MX系列(如imx6ull)
+
+    + funciton节点：板级配置容器。位于`&iomuxc`下，以板卡名命名(如`imx6ull-evk`)
+
+        ```dts
+        &iomuxc {
+            imx6ul-evk {  // Function 节点
+                pinctrl_uart1: uart1grp { ... }; // Group 节点
+                pinctrl_i2c1: i2c1grp { ... };
+            };
+        };
+        ```
+
+    + group节点：引脚配置实体。关键属性：`fsl,pins`以6个u32描述复用寄存器、电气属性
+
+        ```dts
+        pinctrl_uart1: uart1grp {
+            fsl,pins = <
+                MX6UL_PAD_UART1_TX_DATA__UART1_DCE_TX 0x1b0b0 // 复用模式 + 电气属性
+                MX6UL_PAD_UART1_RX_DATA__UART1_DCE_RX 0x1b0b0
+            >;
+        };
+        ```
+
+2. rockchip RK系列(如RK3588)
+
+    + function节点：功能分类容器。直接以功能命名，省略板级容器层(`没有imx6ull-evk这层`)
+
+        ```dts
+        &pinctrl {
+            pinctrl_uart1: uart1 {  // Function 与 Group 合并
+                uart1_xfer: uart1-xfer {
+                    rockchip,pins = <1 RK_PB1 1 &pcfg_pull_up>,  // 引脚 + 电气模板
+                                    <1 RK_PB2 1 &pcfg_pull_none>;
+                };
+            };
+        };
+        ```
+
+    + group节点：电气属性模板化
+
+        + 关键属性：rockchip,pins引用预定义模板，如`&pcfg_pull_up`，简化配置
+        + 层级扁平化：function与group常合并为单层节点，如uart1_xfer直接包含引脚
+
+3. Ti AM335x系列(如BeagleBone)
+
+    + function节点：信号抽象层。描述外设信号，如mmc1_pins，而非物理功能
+
+        ```dts
+        &am33xx_pinmux {
+            mmc1_pins: pinmux_mmc1_pins {  // Function 节点
+                pinctrl-single,pins = <
+                    AM33XX_IOPAD(0x8f0, PIN_INPUT_PULLUP | MUX_MODE0) /* mmc1_dat0 */
+                    AM33XX_IOPAD(0x8f4, PIN_INPUT_PULLUP | MUX_MODE0) /* mmc1_dat1 */
+                >;
+            };
+        };
+        ```
+
+    + group节点：寄存器直接配置
+
+        + 关键属性：pinctrl-single,pins直接写入寄存器值(复用模式+电气标志)
+        + 驱动匹配：通过pinctrl-0 = <&mmc1_pins>引用
+
+##### 4.4.5.3 设计模式总结
+
+| 芯片平台 | function节点角色 | group节点配置方式 | 层级结构 |
+| - | - | - | - |
+| NXP I.MX | 板级容器(如`imx6ull-evk`) | `fsl,pins`直接寄存器值 | 严格分层(2级) |
+| RockChip RK | 功能分类(如`uart1`) | `rockchip,pins` + 电气模板引用 | 扁平化(1级为主) |
+| Ti AM335x | 信号抽象(如`mmc1_pins`) | `pinctrl-single,pins` 寄存器标志组合 | 单层 |
+
+#### 4.4.6 `imx6ull`的pinctrl子系统解析设备树
+
+`imx_pinctrl_probe()`是imxull芯片的pinctrl子系统驱动入口函数，负责初始化soc的引脚控制器iomuxc，解析设备树中的引脚配置，并注册到内核的`pinctrl`框架中。
+
+##### 4.4.6.1 函数功能与调用时机
+
+1. 功能定位：`imx_pinctrl_probe()`是标准的platform驱动probe函数，在设备树中`compatible = "fsl,imx6ul-iomuxc"`的节点与驱动匹配时触发。核心任务：
+    + 获取soc专属的引脚描述信息(imx6ul_pinctrl_info)
+    + 调用核心函数`imx_pinctrl_probe()`完成控制器注册
+
+2. 调用时机：当内核初始化时，通过`arch_initcall(imx6ul_pinctrl_init)`注册驱动。设备树中的`iomuxc`节点与驱动的`of_match_table`匹配后，触发probe函数
+
+##### 4.4.6.2 函数实现与关键步骤
+
+`imx_pinctrl_probe()`函数，调用了子函数`imx_pinctrl_probe_dt()`来实现设备树解析。
+
+```c
+int imx_pinctrl_probe(struct platform_device *pdev/* 设备树节点:&iomuxc */,
+		      struct imx_pinctrl_soc_info *info)
+{
+    // 1. 解析设备树节点 &iomuxc
+	imx_pinctrl_probe_dt(pdev, info);
+
+    // 2. 设置platform_device的专有数据
+	platform_set_drvdata(pdev, ipctl);
+
+    // 3. 注册pinctrl子系统
+	pinctrl_register(imx_pinctrl_desc, &pdev->dev, ipctl);
+
+	return 0;
+}
+```
+
+##### 4.4.6.3 `imx_pinctrl_probe_dt()`解析`iomuxc节点`
+
+以下面的设备树片段为例：
+
+```dts
+&iomuxc {
+    imx6ul-evk { // Function 节点
+        pinctrl_uart1: uart1grp { // Group 节点
+            fsl,pins = <
+                MX6UL_PAD_UART1_TX_DATA__UART1_DCE_TX 0x1b0b0 // 引脚配置
+                MX6UL_PAD_UART1_RX_DATA__UART1_DCE_RX 0x1b0b0
+            >;
+        };
+
+        pinctrl_xxx: ... // 其他group节点
+    };
+};
+```
+
+在上面的设备树中，function只有一个，就是板级容器`imx6ul-evk`，function下面的group有多个。我们看下`imx_pinctrl_probe_dt()`解析函数做了些什么
+
+1. 读取function个数`nfuncs`，如果没有子节点直接返回报错。所以如果我们直接移除`imx6ul-evk`，此处可能会报错
+2. 给`info->functions`申请内存，用来保存每个function
+3. 遍历每个function节点，获取每个function节点的子结点个数。即`imx6ull-evk`下面的group个数
+    ```c
+    for_each_child_of_node(np, child)
+		info->ngroups += of_get_child_count(child);
+    ```
+4. 给`info->groups`申请内存，用来保存全部function的所有group
+5. 遍历每个function节点，执行`imx_pinctrl_parse_functions()`函数，解析当前function下的group
+
+```c
+static int imx_pinctrl_probe_dt(struct platform_device *pdev,/* iomuxc节点 */
+				struct imx_pinctrl_soc_info *info)
+{
+	struct device_node *np = pdev->dev.of_node;
+	struct device_node *child;
+	u32 nfuncs = 0;
+
+	nfuncs = of_get_child_count(np);
+	if (nfuncs <= 0) {
+		dev_err(&pdev->dev, "no functions defined\n");
+		return -EINVAL;
+	}
+
+	info->nfunctions = nfuncs;
+	info->functions = devm_kzalloc(&pdev->dev, nfuncs * sizeof(struct imx_pmx_func), GFP_KERNEL);
 
 
+	info->ngroups = 0;
+	for_each_child_of_node(np, child)
+		info->ngroups += of_get_child_count(child);
+	info->groups = devm_kzalloc(&pdev->dev, info->ngroups * sizeof(struct imx_pin_group), GFP_KERNEL);
+
+
+	for_each_child_of_node(np, child)
+		imx_pinctrl_parse_functions(child, info, i++);
+
+	return 0;
+}
+```
+
+##### 4.4.6.3 `imx_pinctrl_parse_functions()`解析`function节点`下的group
+
+`imx_pinctrl_parse_functions()`这个函数，输入为function节点，他的功能是解析function节点下面的group。我们来看下是怎么做的：
+
+1. 获取当前function下的group个数`func->num_groups`，其实就是pinctrl_xxx子节点的个数
+2. 如果group个数为0，返回报错
+3. 遍历每个group子节点，执行`imx_pinctrl_parse_groups()`，解析当前的group
+    ```c
+    for_each_child_of_node(np/* imx6ul-evk节点 */, child/* pinctrl_xxx子节点 */) {
+		imx_pinctrl_parse_groups(child, grp, info, i++);
+	}
+    ```
+
+```c
+static int imx_pinctrl_parse_functions(struct device_node *np,/*np为每个function节点遍历，如imx6ul-evk*/
+				       struct imx_pinctrl_soc_info *info,
+				       u32 index)   /*index为function节点的索引值*/
+{
+	struct device_node *child;
+	struct imx_pmx_func *func;
+	struct imx_pin_group *grp;
+	u32 i = 0;
+
+	func = &info->functions[index]; 
+
+	/* Initialise function */
+	func->num_groups = of_get_child_count(np);
+	if (func->num_groups == 0) {
+		dev_err(info->dev, "no groups defined in %s\n", np->full_name);
+		return -EINVAL;
+	}
+
+	func->groups = devm_kzalloc(info->dev,
+			func->num_groups * sizeof(char *), GFP_KERNEL);
+
+	for_each_child_of_node(np, child) {
+		func->groups[i] = child->name;
+		grp = &info->groups[info->grp_index++];
+		imx_pinctrl_parse_groups(child, grp, info, i++);
+	}
+
+	return 0;
+}
+```
+
+##### 4.4.6.4 `imx_pinctrl_parse_groups()`解析`group`节点
+
+接下来我们要解析group节点，其实也就是pinctrl节点了。还是以具体的设备树pinctrl来说明：
+
+```dts
+pinctrl_uart1: uart1grp {
+    fsl,pins = <
+        MX6UL_PAD_UART1_TX_DATA__UART1_DCE_TX 0x1b0b1
+        MX6UL_PAD_UART1_RX_DATA__UART1_DCE_RX 0x1b0b1
+    >;
+};
+```
+
+下面我们来看下`imx_pinctrl_parse_groups()`函数的执行流程：
+
+1. 获取`fsl,pins`属性，读取数组大小。这里为`(5 + 1)(u32) * 4 * 2 = 48`字节
+2. 如果没有`fsl,pins`属性，直接返回报错
+3. 计算引脚个数`grp->npins = size / pin_size`，即`48 / 24 = 2`，2个引脚。正好是串口的TX和RX
+4. 遍历group节点每一个引脚，然后把pinctrl对应的寄存器一次取出并赋值
+    ```c
+    for (i = 0; i < grp->npins; i++) {
+		u32 mux_reg = be32_to_cpu(*list++);
+		u32 conf_reg;
+		pin_reg->conf_reg = conf_reg;
+		pin->input_reg = be32_to_cpu(*list++);
+		pin->mux_mode = be32_to_cpu(*list++);
+		pin->input_val = be32_to_cpu(*list++);
+		config = be32_to_cpu(*list++);
+	}
+    ```
+
+```c
+static int imx_pinctrl_parse_groups(struct device_node *np,
+				    struct imx_pin_group *grp,
+				    struct imx_pinctrl_soc_info *info,
+				    u32 index)
+{
+	int size, pin_size;
+	const __be32 *list;
+	int i;
+	u32 config;
+
+	/*
+	 * the binding format is fsl,pins = <PIN_FUNC_ID CONFIG ...>,
+	 * do sanity check and calculate pins number
+	 */
+	list = of_get_property(np, "fsl,pins", &size);
+	if (!list) {
+		dev_err(info->dev, "no fsl,pins property in node %s\n", np->full_name);
+		return -EINVAL;
+	}
+
+    // 6个u32，每条占用的字节数为4*6=24
+    pin_size = 24;  // Each pin represented in fsl,pins consists of 5 u32 PIN_FUNC_ID and * 1 u32 CONFIG, so 24 types in total for each pin.
+
+	/* we do not check return since it's safe node passed down */
+	if (!size || size % pin_size) {
+		dev_err(info->dev, "Invalid fsl,pins property in node %s\n", np->full_name);
+		return -EINVAL;
+	}
+
+	grp->npins = size / pin_size;
+	grp->pins = devm_kzalloc(info->dev, grp->npins * sizeof(struct imx_pin),
+				GFP_KERNEL);
+
+	for (i = 0; i < grp->npins; i++) {
+		u32 mux_reg = be32_to_cpu(*list++);
+		u32 conf_reg;
+		pin_reg->conf_reg = conf_reg;
+		pin->input_reg = be32_to_cpu(*list++);
+		pin->mux_mode = be32_to_cpu(*list++);
+		pin->input_val = be32_to_cpu(*list++);
+
+		/* SION bit is in mux register */
+		config = be32_to_cpu(*list++);
+		if (config & IMX_PAD_SION)
+			pin->mux_mode |= IOMUXC_CONFIG_SION;
+		pin->config = config & ~IMX_PAD_SION;
+	}
+
+	return 0;
+}
+```
+
+#### 4.4.7 总结
+
+前面分析了不同平台的pinmux复用pinctrl的语法，以及imx6ull的pinctrl解析设备树的过程。总结如下：
+
+1. `iomuxc`节点下的`imx6uil-evk`节点，对imx6ull平台是必须的，但是节点名可以自定义，只要不破坏层级结构就可以
+2. 每个平台的pinctrl写法都不同，但大体是类似的，我们应该参考官方demo板的做法
 
