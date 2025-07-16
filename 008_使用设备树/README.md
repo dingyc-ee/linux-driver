@@ -2358,3 +2358,249 @@ static int my_probe(struct platform_device *pdev)
 
 ![](./src/0016.jpg)
 
+## 第7章 `of操作函数实验`：获取属性
+
+通过第6章的学习，我们已经能够获取到设备节点`device_node`了，接下来我们要读取设备节点的属性。
+
+### 7.1 `of_find_property()`函数：获取属性
+
+#### 7.1.1 函数原型
+
+```c
+struct property *of_find_property(
+    const struct device_node *np, 
+    const char *name, 
+    int *lenp
+);
+```
+
+#### 7.1.2 参数详解
+
+1. np：目标设备节点指针，需通过`of_find_node_by_path()`等函数预先获取节点
+2. name：要查找的属性名称，如`compatible`、`reg`，要与设备树中的属性名严格匹配
+3. lenp：输出参数，接收属性值的字节长度(可为NULL，表示忽略长度)
+4. 返回值
+    成功：返回`struct property *`指针
+    失败：返回NULL
+
+#### 7.1.3 核心用途
+
+`of_find_property()`函数，最常用来检查节点是否包含指定属性(如检查`status`是否为`okay`)
+
+### 7.2 `of_property_count_elems_of_size()`函数：统计属性内元素数量
+
+#### 7.2.1 函数原型
+
+```c
+int of_property_count_elems_of_size(
+    const struct device_node *np, 
+    const char *propname, 
+    int elem_size
+);
+```
+
+#### 7.2.2 参数详解
+
+1. np：目标设备节点指针，需通过`of_find_node_by_path()`等函数预先获取节点
+2. propname：要查找的属性名称，如`compatible`、`reg`，要与设备树中的属性名严格匹配
+3. elem_size：单个元素的字节大小，如u32为4，u64为8
+4. 返回值
+    成功：返回属性值中的元素的个数
+    失败：返回负的错误码
+
+#### 7.2.3 核心用途
+
+1. 校验属性格式：验证属性值书否符合预期长度(如`interrupts`是否包含完整的`中断号+触发方式`组合)
+2. 预分配内存：根据元素数量动态分配数组内存，避免缓冲区溢出或浪费
+
+#### 7.2.4 关键注意事项
+
+1. 元素尺寸匹配`elem_size`，需与属性值的数据类型严格一致
+    + u32数组(32位地址系统)：`elem_size = 4`
+    + u64数组(64位地址系统)：`elem_size = 8`
+2. 复合属性处理：`reg`属性由多个`地址+长度`组成，实际元素数 = 属性总字节数 / (elem_size * 2)
+3. 结合父节点规则：数组元素的实际含义，可能依赖父节点的`#address-cells`和`#size-cells`. 如`reg`每组包含(`address-cells + size-cells`)个整数
+
+### 7.3 `of_property_read_u32_index()`函数：读取属性中指定索引的u32数据
+
+#### 7.3.1 函数原型
+
+```c
+int of_property_read_u32_index(
+    const struct device_node *np, 
+    const char *propname, 
+    u32 index, 
+    u32 *out_value
+);
+```
+
+#### 7.3.2 参数详解
+
+1. np：目标设备节点指针，需通过`of_find_node_by_path()`等函数预先获取节点
+2. propname：要查找的属性名称，如`compatible`、`reg`，要与设备树中的属性名严格匹配
+3. index：元素索引号(从0开始)，指定要读取的属性值在数组中的位置
+4. out_value：输出参数，存储读取到的u32值
+5. 返回值
+    + 成功：返回0，且`out_value`包含有效数据
+    + 失败：返回负的错误码
+
+#### 7.3.3 核心用途
+
+1. 警觉读取数组属性中的元素：避免一次性读取整个数组，仅提取所需索引的数据，节省内存并提升效率。典型场景：
+    + 解析reg属性中的特定寄存器地址或长度
+    + 读取interrupts属性中某个中断号和触发方式
+2. 处理动态长度的属性：结合`of_property_count_elems_of_size()`先获取元素总数，再按需读取指定索引值
+
+### 7.4 `of_property_read_u8_array()`函数：读取属性中的u8数组
+
+#### 7.4.1 函数原型
+
+```c
+int of_property_read_u8_array(
+    const struct device_node *np, 
+    const char *propname, 
+    u8 *out_values, 
+    size_t sz
+);
+```
+
+#### 7.4.2 参数详解
+
+1. np：目标设备节点指针，需通过`of_find_node_by_path()`等函数预先获取节点
+2. propname：要查找的属性名称，如`compatible`、`reg`，要与设备树中的属性名严格匹配
+3. out_values：输出缓冲区，存储读取到的u8数组数据
+4. sz：要读取的元素数量(非字节数)
+5. 返回值
+    成功：返回0，数据写入out_values缓冲区
+    失败：返回负的错误码
+
+#### 7.4.3 核心用途
+
+解析字节流配置：适用于需按字节序列配置的场景。如传感器的校准参数表(如ADC校准值)。
+
+### 7.4 `of_property_read_u32_array()`函数：读取属性中的u32数组
+
+#### 7.4.1 函数原型
+
+```c
+int of_property_read_u32_array(
+    const struct device_node *np, 
+    const char *propname, 
+    u32 *out_values, 
+    size_t sz
+);
+```
+
+#### 7.4.2 参数详解
+
+1. np：目标设备节点指针，需通过`of_find_node_by_path()`等函数预先获取节点
+2. propname：要查找的属性名称，如`compatible`、`reg`，要与设备树中的属性名严格匹配
+3. out_values：输出缓冲区，存储读取到的u32数组数据
+4. sz：要读取的元素数量(非字节数)
+5. 返回值
+    成功：返回0，数据写入out_values缓冲区
+    失败：返回负的错误码
+
+#### 7.4.3 核心用途
+
+1. 解析硬件资源数组：读取设备树中由多个u32值组成的属性。例如：
+    + reg：寄存器地址和长度对(如`<0x4001100 0x400>`)
+    + interrupts：中断号和触发方式组合(如`<10 IRQ_TYPE_LEVEL_HIGH>`)
+2. 避免手动解析原始数据：替代直接访问`property->value`，提供类型安全和边界检查，防止内存越界
+
+### 7.5 `of_property_read_string()`函数：读取属性中的字符串
+
+#### 7.5.1 函数原型
+
+```c
+int of_property_read_string(
+    const struct device_node *np, 
+    const char *propname, 
+    const char **out_string
+);
+```
+
+#### 7.5.2 参数详解
+
+1. np：目标设备节点指针，需通过`of_find_node_by_path()`等函数预先获取节点
+2. propname：要查找的属性名称，如`compatible`、`reg`，要与设备树中的属性名严格匹配
+3. out_string：存储指向属性字符串的指针(非拷贝，直接引用属性值)
+4. 返回值
+    成功：返回0，out_string指向有效的以\0结尾的字符串
+    失败：返回负的错误码
+
+#### 7.5.3 核心用途
+
+1. 读取关键标识属性：如`compatible`(驱动匹配依据)、`status`(设备启用状态)、`device_type`(设备分类)
+2. 避免手动解析原始数据：替代`of_get_property() + 内存拷贝 + 终止符检查`，简化代码并提升安全性
+
+### 7.6 `of_property_read_string_array()`函数：读取属性中的字符串数组
+
+#### 7.6.1 函数原型
+
+```c
+#include <linux/of.h>
+int of_property_read_string_array(
+    const struct device_node *np, 
+    const char *propname, 
+    const char **out_strings, 
+    size_t sz
+);
+```
+
+#### 7.6.2 参数详解
+
+1. np：目标设备节点指针，需通过`of_find_node_by_path()`等函数预先获取节点
+2. propname：要查找的属性名称，如`compatible`、`reg`，要与设备树中的属性名严格匹配
+3. out_string：存储指向属性字符串的指针数组(非拷贝，直接引用属性值)
+4. sz：预期读取的最大字符串数量，防止缓冲区溢出
+5. 返回值
+    成功：>=0 实际成功官渡区的字符串数量
+    失败：返回负的错误码
+
+#### 7.6.3 核心用途
+
+1. 解析多字符串配置：设备树中以下属性需用此函数：
+    + 时钟名列表：`clock-names = "tx", "rx", "reg"`
+    + 中断名：`interrupt-names = "irq0", "irq1"`
+2. 避免手动解析：替代`of_get_property() + 字符串分割`，直接返回字符串指针数组，提升安全性和可读性
+
+### 7.6 代码实测
+
+接下来写一个简单的测试程序，来读取`myled`节点的属性值
+
+```c
+static int my_probe(struct platform_device *pdev)
+{
+    struct device_node *node = NULL;
+    struct property *property = NULL;
+    int num = 0;
+    u32 i = 0, reg_val = 0;
+    const char *compatible_s = NULL;
+
+    printk(KERN_INFO "%s probe\n", pdev->name);
+
+    node = of_find_node_by_path("/topeet/myled");
+    printk(KERN_INFO "node name:%s\n", node->name);
+
+    property = of_find_property(node, "compatible", NULL);
+    printk("property name:%s\n", property->name);
+
+    num = of_property_count_elems_of_size(node, "reg", 4);
+    printk("reg num:%d\n", num);
+    for (i = 0; i < num; i++) {
+        of_property_read_u32_index(node, "reg", i, &reg_val);
+        printk("reg[%d]: 0x%08x\n", i, reg_val);
+    }
+
+    of_property_read_string(node, "compatible", &compatible_s);
+    printk("compatible: %s\n", compatible_s);
+
+    return 0;
+}
+```
+
+实测结果：
+
+![](./src/0017.jpg)
+
