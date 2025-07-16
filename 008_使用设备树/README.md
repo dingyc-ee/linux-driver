@@ -2604,3 +2604,279 @@ static int my_probe(struct platform_device *pdev)
 
 ![](./src/0017.jpg)
 
+## 第8章 `of操作函数`：获取中断资源
+
+设备节点经常会绑定中断，因此我们要从`device_node`中获取中断资源。
+
+### 8.1 `irq_of_parse_and_map()`函数：解析映射中断资源
+
+#### 8.1.1 函数原型
+
+```c
+#include <linux/of_irq.h>
+unsigned int irq_of_parse_and_map(struct device_node *dev, int index);
+```
+
+#### 8.1.2 参数详解
+
+1. dev：目标设备节点指针，需通过`of_find_node_by_path()`等函数预先获取节点
+2. index：中断索引号。用于指定设备树中`interrupts`属性的第几个中断(从0开始)
+3. 返回值
+    成功：>0 成功映射的中断号(IRQ) 可用于后续中断注册
+    失败：0 映射失败
+
+#### 8.1.3 核心用途
+
+1. 解析设备树中断属性：从Linux设备树节点的`interrupts`属性中提取中断号和触发类型
+2. 替代硬编码中断号：使驱动无需依赖固定中断号，提升跨平台兼容性
+
+#### 8.1.4 注意事项
+
+1. 依赖中断控制器声明：设备树中断控制器节点，需包含`interrupt-controller`和正确的`#interrupt-cells`属性
+2. 触发类型自动解析：函数会从`interrupts`属性中提取触发类型(如`IRQ_TYPE_LEVEL_HIGH`)，无需手动指定
+3. 与`request_irq()`配合使用：获取的irq需通过`request_irq()`注册处理函数，并在驱动退出时用`free_irq()`释放
+4. GPIO中断的特殊处理：若中断来自GPIO，可用`gpio_to_irq()`替代，但需先通过`of_get_named_gpio()`获取gpio编号
+
+### 8.2 `irq_get_trigger_type()`函数：获取已分配中断号的触发类型
+
+#### 8.2.1 函数原型
+
+```c
+#include <linux/irq.h>
+unsigned int irq_get_trigger_type(unsigned int irq);
+```
+
+#### 8.2.2 参数详解
+
+1. irq：中断号。通常由`irq_of_parse_and_map()`或`platform_get_irq()`解析设备树获得
+2. 返回值
+    + IRQF_TRIGGER_RISING：上升沿触发
+    + IRQF_TRIGGER_FALLING：下降沿触发
+    + IRQF_TRIGGER_HIGH：高电平触发
+    + IRQF_TRIGGER_LOW：低电平触发
+
+#### 8.2.3 核心用途
+
+1. 中断注册前的验证：在调用`request_irq()`前，确保触发类型与硬件设计一致
+2. 支持多硬件平台：同一驱动可适配不同设备树配置(如某平台用高电平触发，另一平台用上升沿触发)
+
+#### 8.2.4 注意事项
+
+1. 依赖中断号的有效性：必须先通过`irq_of_parse_and_map()`获取有效中断号
+2. 触发类型冲突处理：若实际硬件与设备树配置不符(如设备树定义为上升沿，但硬件实际需要高电平)，需在驱动中手动修正
+    ```c
+    trigger_type = IRQF_TRIGGER_HIGH;  // 覆盖设备树配置
+    ```
+
+### 8.3 `irq_get_irq_data()`函数：获取中断的底层硬件数据
+
+#### 8.3.1 函数原型
+
+```c
+#include <linux/irq.h>
+struct irq_data *irq_get_irq_data(unsigned int irq);
+```
+
+#### 8.3.2 参数详解
+
+1. irq：中断号。通常由`irq_of_parse_and_map()`或`platform_get_irq()`解析设备树获得
+2. 返回值
+    + 成功：指向`struct irq_data *`的指针，表示中断的硬件数据(包括中断控制器的ops、硬件中断号hwirq等关键信息)
+    + 失败：NULL
+
+#### 8.3.3 核心用途
+
+1. 访问中断控制器操作：通过`irq_data->chip`获取`struct irq_chip`指针，调用底层控制器函数(如屏蔽、使能中断、确认中断)
+    ```c
+    struct irq_chip *chip = irq_data->chip;
+    chip->irq_mask(irq_data); // 屏蔽中断
+    ```
+2. 获取硬件中断号(hwirq)：从`irq_data->hwirq`读取物理中断号，用于与硬件寄存器交互
+3. 级联中断处理：在多级中断控制器(如GPIO级联到GIC)中，通过`irq_data->parent_data`访问父控制器数据
+
+#### 8.3.4 代码示例
+
+```c
+#include <linux/interrupt.h>
+#include <linux/irq.h>
+
+static irqreturn_t button_handler(int irq, void *dev_id) {
+    // 获取按钮中断的硬件数据
+    struct irq_data *irq_data = irq_get_irq_data(irq);
+    if (!irq_data) {
+        return IRQ_NONE;
+    }
+
+    // 1. 读取硬件中断号（GPIO引脚号）
+    u32 gpio_pin = (u32)irq_data->hwirq;
+    printk("Button pressed on GPIO pin %u\n", gpio_pin);
+
+    // 2. 访问GPIO控制器的操作函数
+    struct irq_chip *chip = irq_data->chip;
+    chip->irq_ack(irq_data); // 确认中断（清除GPIO控制器状态）
+
+    // 3. 获取父中断控制器（GIC）的数据
+    struct irq_data *parent_data = irq_data->parent_data;
+    if (parent_data) {
+        u32 gic_irq = (u32)parent_data->hwirq; // GIC的中断号（30）
+        printk("Parent interrupt (GIC SPI %u)\n", gic_irq);
+    }
+
+    return IRQ_HANDLED;
+}
+
+static int button_probe(struct platform_device *pdev) {
+    int irq = platform_get_irq(pdev, 0);
+    return request_irq(irq, button_handler, IRQF_TRIGGER_FALLING, "button", NULL);
+}
+```
+
+该函数广泛用于GPIO按键、外设状态监控等需要精细控制中断的场景，使Linux中断子系统实现硬件无关性的关键基础。
+
+### 8.4 `gpio_to_irq()`函数：将GPIO引脚编号转换为回应的中断号，使GPIO引脚可配置为中断源
+
+#### 8.4.1 函数原型
+
+```c
+#include <linux/gpio.h>
+int gpio_to_irq(unsigned int gpio);
+```
+
+#### 8.4.2 参数详解
+
+1. gpio：GPIO引脚编号：需通过平台相关宏定义或设备树解析获得
+2. 返回值
+    成功： >0 成功转换后的中断号irq，可用于注册中断处理函数(如`request_irq()`)
+    失败：返回负的错误码
+
+#### 8.4.3 核心用途
+
+1. 启用GPIO中断功能：将普通GPIO引脚配置为中断输入源，例如按键按下、传感器数据就绪等事件触发
+2. 与中断子系统继承：转换后的irq可直接传递给`request_irq()`和`free_irq()`，实现中断注册与释放
+
+#### 8.4.4 设备树与驱动代码示例
+
+设备树片段：配置一个按键(GPIO引脚下降沿触发中断)
+
+```dts
+/ {
+    // 中断控制器节点
+    intc: interrupt-controller@10490000 {
+        compatible = "arm,gic";
+        interrupt-controller;
+        #interrupt-cells = <3>; // <中断类型 中断号 触发方式>
+    };
+
+    // GPIO 控制器节点
+    gpio_controller: gpio@11000000 {
+        compatible = "vendor,gpio-controller";
+        gpio-controller;
+        #gpio-cells = <2>;      // <引脚号 标志>
+        interrupt-parent = <&intc>;
+        interrupts = <0 30 IRQ_TYPE_LEVEL_HIGH>; // 级联到 GIC 的中断
+    };
+
+    // 按键设备节点
+    button {
+        compatible = "linux,button";
+        gpios = <&gpio_controller 5 GPIO_ACTIVE_LOW>; // GPIO 引脚5，低电平有效
+        interrupt-parent = <&gpio_controller>;
+        interrupts = <5 IRQ_TYPE_EDGE_FALLING>;      // 下降沿触发
+    };
+};
+```
+
+按键驱动代码：
+
+```c
+#include <linux/gpio.h>
+#include <linux/interrupt.h>
+#include <linux/of_gpio.h>
+
+static irqreturn_t button_handler(int irq, void *dev_id) {
+    printk("Button pressed! IRQ: %d\n", irq);
+    return IRQ_HANDLED;
+}
+
+static int button_probe(struct platform_device *pdev) {
+    struct device_node *np = pdev->dev.of_node;
+    int gpio, irq, ret;
+
+    // 从设备树获取 GPIO 编号
+    gpio = of_get_named_gpio(np, "gpios", 0);
+    if (gpio < 0) {
+        dev_err(&pdev->dev, "Failed to get GPIO\n");
+        return gpio;
+    }
+
+    // 申请 GPIO 资源
+    ret = gpio_request(gpio, "button_gpio");
+    if (ret) {
+        dev_err(&pdev->dev, "GPIO request failed\n");
+        return ret;
+    }
+
+    // 将 GPIO 转换为中断号
+    irq = gpio_to_irq(gpio);
+    if (irq < 0) {
+        dev_err(&pdev->dev, "GPIO to IRQ conversion failed\n");
+        gpio_free(gpio);
+        return irq;
+    }
+
+    // 注册中断处理函数
+    ret = request_irq(irq, button_handler, IRQF_TRIGGER_FALLING, "button_irq", NULL);
+    if (ret) {
+        dev_err(&pdev->dev, "Failed to request IRQ\n");
+        gpio_free(gpio);
+        return ret;
+    }
+
+    return 0;
+}
+
+// 设备树匹配表
+static const struct of_device_id button_of_match[] = {
+    { .compatible = "linux,button" },
+    {}
+};
+MODULE_DEVICE_TABLE(of, button_of_match);
+
+static struct platform_driver button_driver = {
+    .probe = button_probe,
+    .driver = {
+        .name = "button_driver",
+        .of_match_table = button_of_match,
+    },
+};
+module_platform_driver(button_driver);
+```
+
+### 8.5 `of_irq_get()`函数：获取设备中断号
+
+#### 8.5.1 函数原型
+
+```c
+#include <linux/of_irq.h>
+int of_irq_get(struct device_node *dev, int index);
+```
+
+#### 8.5.2 参数详解
+
+1. dev：目标设备节点指针，需通过`of_find_node_by_path()`等函数预先获取节点
+2. index：中断索引号。用于指定设备树中interrupts属性的第几个中断(从0开始)。若设备只有1个中断则设为0
+3. 返回值
+    成功：>0 成功获取的中断号，可用于后续中断注册(如`resuest_irq()`)
+    失败：<=0
+
+#### 8.5.3 注意事项
+
+1. 设备树依赖
+    + 节点需正确定义`interrupts`和`interrupts-parent`属性
+    + 中断控制器节点需声明`interrupt-controller`和`#interrupt-cells`
+2. 与`irq_of_parse_and_map`的区别：`of_irq_get()`是他的封装，更简洁但功能一致
+3. 资源释放：驱动卸载时需调用`free_irq()`释放中断，避免资源泄露
+
+实际开发中，该函数广泛应用于外设驱动(如UART、I2C设备)及中断密集型设备，是Linux设备树中断子系统的关键桥梁。
+
+
