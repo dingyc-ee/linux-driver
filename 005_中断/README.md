@@ -777,3 +777,30 @@ void GIC_DisableIRQ(IRQn_Type IRQn)
   gic->D_ICENABLER[((uint32_t)(int32_t)IRQn) >> 5] = (uint32_t)(1UL << (((uint32_t)(int32_t)IRQn) & 0x1FUL));
 }
 ```
+
+### 3.3 中断号
+
+Linux内核中的中断管理采用双重标识机制(`IRQ number`和`HW interrupt ID`)，来标识一个来自外设的中断。
+
+1. IRQ Number：CPU需要为每一个外设中断编号，我们称为IRQ Number。这个IRQ Number是一个虚拟的`interrupt ID`，和硬件无关，仅仅是被CPU用来标识一个外设中断
+2. HW interrupt ID：对于GIC中断控制器而言，它收集了多个外设的`interrupt request line`并向上传递，因此，GIC控制器需要对外设中断进行编码。GIC控制器用HW interrupt ID来标识外设的中断。入宫只有一个GIC中断控制器，那IRQ number和HW interrupt ID是可以一一对应的。
+
+![](./src/0010.jpg)
+
+#### 3.3.1 为什么需要双重中断号
+
+如果是在GIC控制器级联的情况下，仅仅用HW interrupt ID就不能唯一标识一个外设中断，还需要知道该HW interrupt ID所属的中断控制器(因为HW interrupt ID在不同的中断控制器上是会重复编码的)
+
+![](./src/0011.jpg)
+
+对于驱动工程师而言，我们只希望得到一个IRQ number，而不关心具体是哪个GIC中断控制器上的哪个HW interrupt ID。这样一个好处是，中断相关的硬件发生改变时，驱动软件不需要修改。因此，linux 内核的中断子系统需要提供一个将HW interrupt ID映射到IRQ Number的机制，也就是IRQ domain
+
+驱动无需感知HW ID，只需调用`platform_get_irq()`或`of_irq_get()`获取IRQ number
+
+#### 3.3.2 单片机为何只有一种中断号
+
+1. 硬件环境单一
+    + 固定中断控制器：单片机(如stm32)通常集成单一中断控制器(NVIC)，中断源数量有限且物理连接固定
+    + 无动态扩展需求：外设与中断线绑定在芯片设计时确定，无需多平台适配
+2. 资源限制：IRQ domain映射表需占用内存(约数KB) 在资源紧张的单片机中不必要
+

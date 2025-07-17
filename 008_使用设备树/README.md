@@ -2879,4 +2879,90 @@ int of_irq_get(struct device_node *dev, int index);
 
 实际开发中，该函数广泛应用于外设驱动(如UART、I2C设备)及中断密集型设备，是Linux设备树中断子系统的关键桥梁。
 
+### 8.6 `platform_get_irq()`函数：平台设备驱动中获取中断号
+
+#### 8.6.1 函数原型
+
+```c
+#include <linux/platform_device.h>
+int platform_get_irq(struct platform_device *pdev, unsigned int index);
+```
+
+#### 8.6.2 参数详解
+
+1. pdev：`platform_device`指针，通常通过驱动`probe()`函数的参数传入
+2. index：中断资源索引号，从0开始，对应设备树中`interrupts`属性的顺序
+3. 返回值
+    成功：>0 返回有效中断号
+    失败：<=0 
+
+#### 8.6.3 核心用途
+
+1. 动态获取中断号：从设备树(.dts)或传统平台资源(struct resource)中解析中断号，避免硬编码，提升跨平台兼容性
+2. 简化中断初始化流程：与`request_irq()`配合，构成驱动probe函数中的标准中断注册链路
+
+### 8.7 代码实测
+
+在设备树中，添加中断设备节点。引脚号为`gpio5, io01`
+
+```dts
+/ {
+    topeet {
+		compatible = "simple-bus";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		myled {
+			compatible = "my device tree";
+			reg = <0x02290008 0x00000004>;
+		};
+
+		myirq {
+			compatible = "my dts irq";
+			interrupt-parent = <&gpio5>;
+			interrupts = <1 IRQ_TYPE_EDGE_FALLING>;
+		};
+	};
+};
+```
+
+写代码获取中断号irq和中断触发类型：
+
+```c
+static int my_probe(struct platform_device *pdev)
+{
+    struct device_node *node = NULL;
+    struct irq_data *data = NULL;
+    unsigned int irq = 0, trigger_type = 0;
+
+    printk(KERN_INFO "%s probe\n", pdev->name);
+
+    node = of_find_node_by_name(NULL, "myirq");
+
+    irq = irq_of_parse_and_map(node, 0);
+    printk("irq_of_parse_and_map irq:%d\n", irq);
+
+    trigger_type = irq_get_trigger_type(irq);
+    printk("irq_get_trigger_type trigger_type:%d\n", trigger_type);
+
+    data = irq_get_irq_data(irq);
+    trigger_type = irqd_get_trigger_type(data);
+    printk("irqd_get_trigger_type trigger_type:%d\n", trigger_type);
+
+    irq = gpio_to_irq((5 - 1) * 32 + 1);  /* gpio5_io01 */
+    printk("gpio_to_irq irq:%d\n", irq);
+
+    irq = of_irq_get(node, 0);
+    printk("of_irq_get irq:%d\n", irq);
+
+    irq = platform_get_irq(pdev, 0);
+    printk("platform_get_irq irq:%d\n", irq);
+
+    return 0;
+}
+```
+
+测试结果：
+
+![](./src/0018.jpg)
 
