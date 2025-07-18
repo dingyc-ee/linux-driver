@@ -372,6 +372,70 @@ int kobject_init_and_add(struct kobject *kobj,
 
 #### 2.2.3 `kobject_put()`函数
 
-##### 2.2.3.1 
+##### 2.2.3.1 函数原型
 
+```c
+void kobject_put(struct kobject *kobj);
+```
+
+##### 2.2.3.2 核心功能与定位
+
+1. 引用计数管理：`kobject_put()`通过原子操作减少`kobj->kref`的引用计数。计数归零时，自动调用`kobj_type->release`回调函数释放资源
+2. 内存释放机制
+    + 若`kobject`是动态创建的(如通过`kobject_create`函数)，默认release函数为`dynamic_kobj_release`，直接`kfree(obj)`
+    + 若`kobject`嵌入在父结构中(`struct device`)，release需通过`container_of`释放父结构
+    ```c
+    void device_release(struct kobject *kobj) {
+        struct device *dev = container_of(kobj, struct device, kobj);
+        kfree(dev); // 释放包含kobject的父结构
+    }
+    ```
+    + 最终释放(`ktype->release`)：由开发者实现的回调负责释放内存
+
+#### 2.3 `kobject创建与销毁`：代码实测
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+
+static struct kobject *my_kobject_01;
+static struct kobject *my_kobject_02;
+static struct kobject *my_kobject_03;
+
+static struct kobj_type my_kobj_type;
+
+static int __init my_init(void)
+{
+    my_kobject_01 = kobject_create_and_add("my_kobject_01", NULL);
+    my_kobject_02 = kobject_create_and_add("my_kobject_02", my_kobject_01);
+
+    my_kobject_03 = kzalloc(sizeof(*my_kobject_03), GFP_KERNEL);
+    kobject_init_and_add(my_kobject_03, &my_kobj_type, NULL, "%s", "my_kobject_03");
+
+    printk(KERN_INFO "make_kobj init\n");
+
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    kobject_put(my_kobject_01);
+    kobject_put(my_kobject_02);
+    kobject_put(my_kobject_03);
+
+    printk(KERN_INFO "make_kobj exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果：
+
+![](./src/0003.jpg)
 
