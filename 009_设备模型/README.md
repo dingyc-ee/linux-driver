@@ -392,7 +392,7 @@ void kobject_put(struct kobject *kobj);
     ```
     + 最终释放(`ktype->release`)：由开发者实现的回调负责释放内存
 
-#### 2.3 `kobject创建与销毁`：代码实测
+### 2.3 `kobject创建与销毁`：代码实测
 
 ```c
 #include <linux/init.h>
@@ -438,4 +438,155 @@ MODULE_AUTHOR("ding");
 测试结果：
 
 ![](./src/0003.jpg)
+
+## 第3章 `kset`
+
+### 3.1 `kset`原理
+
+Linux设备模型中的kset(内核对象集合)，是组织和管理kobject的核心容器，用于构建设备层级结构、管理热插拔事件，并在sysfs中形成逻辑目录结构。
+
+#### 3.1.1 `kset`结构体成员详解
+
+```c
+struct kset {
+	struct list_head list;      // 管理所有关联kobject的双向链表头
+	spinlock_t list_lock;       // 保护链表的自旋锁（防止并发修改）
+	struct kobject kobj;        // 内嵌的kobject，代表kset本身在sysfs中的目录
+	const struct kset_uevent_ops *uevent_ops;   // 热插拔事件回调函数集
+};
+```
+
+`kset`结构体的核心成员：
+
++ `list`与`list_lock`: 所有属于该kset的kobject通过`kobject->entry`嵌入此链表，形成逻辑分组
++ `kobj`: `kset`本身也是`kobject`，因此具备名称、父对象等属性。在sysfs中表现为目录
++ `uevent_ops`: 控制热插拔时间的通知行为，包含三个回调函数：
+    + `filter()`: 决定是否发送事件(如过滤特定设备)
+    + `name()`: 自定义事件中对象的名称
+    + `uevent()`: 添加事件的环境变量
+
+#### 3.1.2 核心应用场景
+
+1. 设备分类管理：将同类设备组织在同一个kset下，形成逻辑分组。
+    + 所有PCI设备：`bus_set`的子集`pci_set` (路径: `/sys/bus/pci/devices/`)
+    + 所有输入设备：`input_kset` (路径：`/sys/class/input/`)
+2. 构建设备树层次结构
+    通过`kobject->parent`和`kset->kobj`构建父子关系：
+    ```
+    /sys/bus/pci/                 ← kset (bus_kset)
+        ├── devices/              ← kset (pci_devices_kset)
+        │   ├── 0000:00:1f.2/     ← kobject (PCI设备)
+        └── drivers/              ← kset (pci_drivers_kset)
+            ├── ahci/            ← kobject (驱动)
+    ```
+3. 热插拔事件管理
+
+#### 3.1.3 `kset`与`kobject`的交互机制
+
+1. 添加kobject到kset: 通过`kobject_add()`实现关联。实现效果: `kobject被加入kset->list链表，并在/sys/bus/pci/devices/下创建目录`
+
+    ```c
+    struct kobject *dev_kobj;
+    dev_kobj->kset = pci_devices_kset; // 指定所属kset
+    kobject_add(dev_kobj, NULL, "0000:00:1f.2"); // 添加到sysfs
+    ```
+
+2. 生命周期管理：`kobject`释放时 自动从`kset`链表移除
+
+    ```c
+    void kobject_put(struct kobject *kobj) {
+        if (kref_put(&kobj->kref, kobject_release)) {
+            list_del(&kobj->entry); // 从kset链表中移除
+            sysfs_remove_dir(kobj);
+        }
+    }
+    ```
+
+#### 3.1.4 内核源码实例分析
+
+    ```c
+    struct kset *pci_bus_kset;
+    pci_bus_kset = kset_create_and_add("pci", NULL, &bus_kset.kobj); // 创建/sys/bus/pci/
+
+    struct kset *pci_devs_kset;
+    pci_devs_kset = kset_create_and_add("devices", NULL, &pci_bus_kset->kobj); // 创建/sys/bus/pci/devices/
+
+    pci_devs_kset->uevent_ops = &pci_uevent_ops; // 设置热插拔回调
+    ```
+
+### 3.2 `kset`与`kobject`
+
+#### 3.2.1 关系
+
+// TODO
+
+#### 3.2.2 空`kset`初始状态
+
+```
++---------------------------+
+|        struct kset        |
+|---------------------------|
+| list:      ┌─────────────┐ |  
+|           →│ 空链表头     │←─────── list.prev/list.next均指向自身
+|            └─────────────┘ |  
+|---------------------------|
+| list_lock: 已初始化的自旋锁  |  ← 未上锁状态
+|---------------------------|
+| kobj:      ┌─────────────┐ |
+|            │ name: "xxx" │←── 创建时指定的名称（如"devices"）
+|            │ parent: ptr │←── 指向父kobject（参数指定）或NULL
+|            │ kset: NULL  │    ← 内嵌kobject不属于其他集合
+|            │ ktype:      │←── 固定为&kset_ktype（含默认release回调）
+|            └─────────────┘ |
+|---------------------------|
+| uevent_ops: 回调函数集      |  ← 由创建参数传入
++---------------------------+
+```
+
+#### 3.2.3 添加一个`kobject`后的状态
+
+```
++---------------------------+        +-----------------------+
+|        struct kset        |        |   struct kobject      |
+|---------------------------|        |-----------------------|
+| list:      ┌─────────────┐ | ┌───→│ entry.next → list     │
+|           →│ 链表头       │─┘ │    │ entry.prev → list     │
+|            └─────────────┘   │    | parent: &kset->kobj    |
+|---------------------------|  └───┐| kset: 指向当前kset     |
+| kobj:      ┌─────────────┐ |      +-----------------------+
+|            │ name: "xxx" │←┘
+|            │ parent: ...│          
+|            │ kset: NULL │          
+|            └─────────────┘          
++---------------------------+
+```
+
+#### 3.2.4 添加二个`kobject`后的状态
+
+```
++---------------------------+        +-----------------------+      +-----------------------+
+|        struct kset        |        |   kobject A           |      |   kobject B           |
+|---------------------------|        |-----------------------|      |-----------------------|
+| list:      ┌─────────────┐ | ┌───→│ entry.next → B.entry  │┌───→│ entry.next → list     │
+|           →│ 链表头       │─┘ │    │ entry.prev → list     ││    │ entry.prev → A.entry  │
+|            └─────────────┘   │    | parent: &kset->kobj    ││    | parent: &kset->kobj    |
+|---------------------------|   └───┐| kset: 当前kset        │└───┐| kset: 当前kset        |
+| kobj: (同上)              |        +-----------------------+      +-----------------------+
++---------------------------+
+```
+
+#### 3.2.5 添加三个`kobject`后的状态
+
+```
++---------------------------+        +-----------------------+      +-----------------------+      +-----------------------+
+|        struct kset        |        |   kobject A           |      |   kobject B           |      |   kobject C           |
+|---------------------------|        |-----------------------|      |-----------------------|      |-----------------------|
+| list:      ┌─────────────┐ | ┌───→│ entry.next → B.entry  │┌───→│ entry.next → C.entry  │┌───→│ entry.next → list     │
+|           →│ 链表头       │─┘ │    │ entry.prev → list     ││    │ entry.prev → A.entry  ││    │ entry.prev → B.entry  │
+|            └─────────────┘   │    | parent: &kset->kobj    ││    | parent: &kset->kobj    ││    | parent: &kset->kobj    |
+|---------------------------|   └───┐| kset: 当前kset        │└───┐| kset: 当前kset        │└───┐| kset: 当前kset        |
+| kobj: (同上)              |        +-----------------------+      +-----------------------+      +-----------------------+
++---------------------------+
+```
+
 
