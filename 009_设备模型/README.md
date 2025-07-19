@@ -516,11 +516,56 @@ struct kset {
 
 ### 3.2 `kset`与`kobject`
 
-#### 3.2.1 关系
+在2.2.2节介绍`kobject_init_and_add()`函数时，我们说这个函数可以手动绑定`kset`。回忆下当时是怎么做的：
 
-// TODO
+```c
+struct kobject *kobj = &my_device->kobj; // 假设kobject嵌入在自定义结构体中
+kobj->kset = my_kset; // 手动绑定到目标kset
+int ret = kobject_init_and_add(kobj, &my_ktype, NULL, "device%d", id);
+```
 
-#### 3.2.2 空`kset`初始状态
+OK。我们假设`kobject`已经手动绑定了`kset`，然后调用`kobject_init_and_add()`，并且`parent = NULL`。看下接下来发生什么：
+
+```c
+static int kobject_add_internal(struct kobject *kobj)
+{
+	int error = 0;
+	struct kobject *parent;
+
+	parent = kobject_get(kobj->parent);
+
+	/* join kset if set, use it as parent if we do not already have one */
+	if (kobj->kset) {
+		if (!parent)
+			parent = kobject_get(&kobj->kset->kobj);
+		kobj_kset_join(kobj);
+		kobj->parent = parent;
+	}
+}
+
+static inline void list_add_tail(struct list_head *new, struct list_head *head)
+{
+	__list_add(new, head->prev, head);
+}
+
+static void kobj_kset_join(struct kobject *kobj)
+{
+	if (!kobj->kset)
+		return;
+
+	kset_get(kobj->kset);
+	spin_lock(&kobj->kset->list_lock);
+	list_add_tail(&kobj->entry/* node */, &kobj->kset->list/* list */);
+	spin_unlock(&kobj->kset->list_lock);
+}
+```
+
+从上面的代码中可以看到2个重点：
+
+1. 当手动指定了`kset`时，会把当前`kobject`的`entry`作为节点，插入到`kset->list`的链表尾部
+2. 如果`parent = NULL`，会把`kobject`的`parent`父指针，指向`kset->kobj`内嵌的结构
+
+#### 3.2.1 空`kset`初始状态
 
 ```
 +---------------------------+
@@ -543,7 +588,13 @@ struct kset {
 +---------------------------+
 ```
 
-#### 3.2.3 添加一个`kobject`后的状态
+关键成员值：
+
++ `list`: 双向循环链表，`prev`和`next`都指向自身
++ `kobj.kset`: 固定为NULL，表示内嵌kobject独立存在
++ `kobj.parent`: 由`kset_create_and_add()`的父对象参数决定
+
+#### 3.2.2 添加一个`kobject`后的状态
 
 ```
 +---------------------------+        +-----------------------+
@@ -561,7 +612,14 @@ struct kset {
 +---------------------------+
 ```
 
-#### 3.2.4 添加二个`kobject`后的状态
+关键变化：
+
++ `链表链接`: `kobject`通过`entry`嵌入`kset->list`，形成`链表头 ⇄ kobject`的双向链表
++ `父子关系`:
+    + `kobject->parent`: 指向kset的内嵌`kobject`
+    + `kobject->set`: 指向当前`kset`，标识归属关系
+
+#### 3.2.3 添加二个`kobject`后的状态
 
 ```
 +---------------------------+        +-----------------------+      +-----------------------+
@@ -575,7 +633,12 @@ struct kset {
 +---------------------------+
 ```
 
-#### 3.2.5 添加三个`kobject`后的状态
+关键变化：
+
++ `链表扩展`: 新增`kobject`插入链表尾部，形成循环链表(`链表头 ⇄ kobject A ⇄ kobject B ⇄ 链表头`)
++ `统一父对象`: 所有`kobject`的`parent`均指向同一个`kset->kobj`，在sysfs中表现为同级目录(如`/sys/bus/pci/devices/`下的设备)
+
+#### 3.2.4 添加三个`kobject`后的状态
 
 ```
 +---------------------------+        +-----------------------+      +-----------------------+      +-----------------------+
@@ -589,4 +652,76 @@ struct kset {
 +---------------------------+
 ```
 
+关键变化：
 
++ `完整循环链表`: 链表结构变为`链表头 ⇄ A ⇄ B ⇄ C ⇄ 链表头`
++ `并发保护`: `list_lock`自旋锁确保多核环境下链表操作的原子性(如并发添加/删除)
+
+### 3.3 `kset_create_and_add()`函数：创建`kset`
+
+```c
+struct kset *kset_create_and_add(
+    const char *name,                           // [IN] kset在sysfs中的目录名
+    const struct kset_uevent_ops *uevent_ops,   // [IN] uevent事件回调函数集
+    struct kobject *parent_kobj                 // [IN] 父kobject指针（决定sysfs层级）
+);
+```
+
+1. `name`: 指定`kset`在sysfs中对应的目录名称，如`"devices"、"block"`
+    + 赋值逻辑：通过`kobject_set_name(&kset->jobj, name)`设置内嵌`kobject`的`name`字段
+2. `uevent_ops`: 暂时忽略
+3. `parent_kobj`: 指定`kset`在`sysfs`中的父目录。若为NULL，则创建在`/sys`根目录下
+    + `parent_kobj = kernel_kobj`: 目录位于`/sys/kernel/`
+    + `parent_kobj = NULL`： 目录位于`/sys/`
+
+### 3.4 代码实测
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+
+static struct kset *my_kset;
+
+static struct kobject *my_kobj_01;
+static struct kobject *my_kobj_02;
+
+static struct kobj_type my_ktype;
+
+static int __init my_init(void)
+{
+    my_kset = kset_create_and_add("my_kset", NULL, NULL);
+
+    my_kobj_01 = kzalloc(sizeof(struct kobject), GFP_KERNEL);
+    my_kobj_02 = kzalloc(sizeof(struct kobject), GFP_KERNEL);
+
+    my_kobj_01->kset = my_kset;
+    my_kobj_02->kset = my_kset;
+
+    kobject_init_and_add(my_kobj_01, &my_ktype, NULL, "%s", "my_kobj_01");
+    kobject_init_and_add(my_kobj_02, &my_ktype, NULL, "%s", "my_kobj_02");
+
+    printk(KERN_INFO "make_kset init\n");
+
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    kobject_put(my_kobj_01);
+    kobject_put(my_kobj_02);
+
+    printk(KERN_INFO "make_kset exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果：
+
+![](./src/0004.jpg)
