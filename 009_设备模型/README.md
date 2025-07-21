@@ -725,3 +725,272 @@ MODULE_AUTHOR("ding");
 测试结果：
 
 ![](./src/0004.jpg)
+
+## 第4章 为什么要引入设备模型
+
+Linux设备模型，是内核用于统一管理硬件设备的框架，其核心包含：总线(Bus)、设备(Device)、驱动(Driver)和类(Class)四个部分。他们共同构建了设备之间的层次关系，支持热插拔、电源管理、sysfs用户交互等功能。
+
+### 4.1 四个核心组件
+
+| 组件 | 定义与作用 | 内核数据结构 | 在sysfs中的位置 |
+| - | - | - | - |
+| 总线(Bus) | 设备与CPU之间的通信通道(物理或虚拟)，负责管理挂载其上的设备和驱动，并实现二者的匹配。例如PC、USB、I2C总线，以及虚拟的platform总线 | `struct bus_type` | `/sys/bus/` 如(`/sys/bus/pci`) |
+| 设备(Device) | 硬件设备的抽象描述(物理或逻辑设备)，包含设备属性、资源(内存地址、IRQ)，所属总线及驱动信息 | `struct device` | `/sys/devices/(按总线层次组织)` |
+| 驱动(Driver) | 控制设备的软件模块，实现设备的初始化(probe)、销毁(remove)、电源管理等操作。与设备通过总线匹配后绑定 | `struct device_driver` | `/sys/bus/(总线名)/drivers` 如`/sys/bus/i2c/drivers/tmp102/` |
+| 类(Class) | 按功能分配设备的抽象层(如输入设备、显示设备)，提供跨总线的统一接口，简化用户空间操作 | `struct class` | `/sys/class` 如`/sys/class/input/` |
+
+层次结构：总线(`/sys/bus/`)是根节点，设备和驱动挂载在总线下。
+
+![](./src/0005.jpg)
+
+1. 注册与匹配
+    + 总线注册(`bus_register`)后，设备和驱动分别通过`device_register`、`driver_register`挂载到总线
+    + 总线的`match()`函数比较设备ID(如设备的`compatible`值)与驱动支持的ID表，匹配成功则调用驱动的`probe()`
+2. 用户空间交互
+    + 通过sysfs暴露设备属性(如`/sys/class/net/eth0/speed`)，用户可直接读写配置
+3. 热插拔与电源管理
+    + 设备插入时，总线触发`uevent`生成`ACTION=add`事件，通知用户空间(如udev加载驱动)
+    + 电源管理时，总线按依赖顺序开关设备(如先启总线再启设备)
+
+### 4.2 总线结构体`struct bus_type`
+
+```c
+struct bus_type {
+	const char		*name;
+	const char		*dev_name;
+	struct device		*dev_root;
+	struct device_attribute	*dev_attrs;	/* use dev_groups instead */
+	const struct attribute_group **bus_groups;
+	const struct attribute_group **dev_groups;
+	const struct attribute_group **drv_groups;
+
+	int (*match)(struct device *dev, struct device_driver *drv);
+	int (*uevent)(struct device *dev, struct kobj_uevent_env *env);
+	int (*probe)(struct device *dev);
+	int (*remove)(struct device *dev);
+	void (*shutdown)(struct device *dev);
+
+	int (*suspend)(struct device *dev, pm_message_t state);
+	int (*resume)(struct device *dev);
+};
+```
+
+结构体成员详解：
+
++ `name`: 总线名称(如`i2c`、`platform`)，对应`/sys/bus/`下的目录名。命名需唯一且不含特殊字符
++ `dev_name`: 设备命名模板(如`i2c-%d`)，用于自动生成未命名设备的名称(如`I2C适配器编号`)
++ `dev_root`: 默认父设备指针，作为新注册设备的父对象(如`platform_bus`作为所有`platform_device`的父设备)
++ `dev_attrs/bus_groups/dev_groups/drv_groups`: 定义总线和设备的默认`sysfs`属性
++ `match`: 设备与驱动匹配的核心逻辑。当设备或驱动注册时调用，返回非0标识匹配成功
+    典型实现：
+    ```c
+    // Platform 总线匹配（drivers/base/platform.c）
+    static int platform_match(struct device *dev, struct device_driver *drv) {
+        // 检查设备树 compatible 或 ACPI ID
+        return of_driver_match_device(dev, drv);
+    }
+    ```
++ `uevent`: 生成热插拔事件的环境变量(如设备插入时添加`ACTION=add`)，如usb设备插入时触发udev加载驱动
++ `probe`: 设备匹配后初始化，调用驱动的probe函数
++ `remove/shutdown`: 设备移除或关机时的清理操作，如释放资源、断电
++ `suspend/resume`" 设备休眠唤醒时协调电源状态
+
+### 4.3 设备结构体`struct device`
+
+```c
+struct device {
+	struct device		*parent;
+	struct kobject kobj;
+	const char		*init_name; /* initial name of the device */
+	const struct device_type *type;
+	struct bus_type	*bus;		/* type of bus device is on */
+	struct device_driver *driver;	/* which driver has allocated this
+					   device */
+	void		*platform_data;	/* Platform specific data, device
+					   core doesn't touch it */
+	struct device_node	*of_node; /* associated device tree node */
+	dev_t			devt;	/* dev_t, creates the sysfs "dev" */
+	struct class		*class;
+};
+```
+
++ `struct device *parent`: 指向父设备(如总线控制器)。设备树中层级关系通过parent构建，例如：
+    ```dts
+    &i2c1 { // 父设备（I²C 控制器）
+        sensor@48 { // 子设备
+            compatible = "ti,tmp102";
+        };
+    };
+    ```
+    内核中，sensor@48的parent指向i2c1的设备实例
++ `struct kobject kobj`: 在`/sys`生成设备文件。如`/sys/devices/platform/my-device`，用于暴露设备属性
++ `const char *init_name`: 设备初始名称(如`tmp102`)。若未指定，内核自动生成`"bus_id"`
++ `struct bus_type *bus`: 设备所属总线(如`&i2c_bus_type`)。总线定义设备和驱动的匹配规则
++ `struct device_driver *driver`: 绑定后的驱动指针。当总线`match()`成功(如设备树`compatible`匹配驱动的`of_match_table`)，内核调用驱动的`probe()`
++ `void *platform_data`: 板级私有数据(如GPIO配置)。嵌入式开发中常用，避免硬编码
+    ```c
+    // 板级文件
+    static struct tmp102_platform_data my_board_data = {
+        .gpio_int = 47,
+    };
+    platform_device_register_data(dev, &my_board_data);
+    ```
++ `struct device_node *of_node`: 指向设备树节点，驱动通过`of_`函数解析资源
+    ```c
+    // 驱动中解析设备树
+    ret = of_property_read_u32(dev->of_node, "reg", &reg_addr); // 获取寄存器地址
+    irq = irq_of_parse_and_map(dev->of_node, 0); // 解析中断号
+    ```
++ `struct list_head	devres_head`: 设备资源链表(内存、IO)，通过`devm_API`自动管理
+    ```c
+    res = devm_ioremap_resource(dev, regs); // 自动释放的寄存器映射
+    ```
++ `struct class *class`: 设备分类(如`&input_class`)。所有键盘归入`/sys/class/input/`，统一生成uevent事件
++ `dev_t devt`: 设备号(主/次设备号)，用于创建设备文件`/dev/tmp102`
+    ```c
+    devt = MKDEV(MAJOR_NUM, MINOR_NUM);
+    device_create(class, dev, devt, NULL, "tmp102");
+    ```
+
+### 4.4 驱动结构体`struct device_driver`
+
+```c
+struct device_driver {
+	const char		*name;
+	struct bus_type		*bus;
+	struct module		*owner;
+	const struct of_device_id	*of_match_table;
+
+	int (*probe) (struct device *dev);
+	int (*remove) (struct device *dev);
+	void (*shutdown) (struct device *dev);
+	int (*suspend) (struct device *dev, pm_message_t state);
+	int (*resume) (struct device *dev);
+	const struct attribute_group **groups;
+};
+```
+
++ `const char *name`: 驱动名称(如`i2c-tmp102`)，在sysfs中生成`/sys/bus/<所属总线>/drivers/<name>`目录。命名需唯一，用于匹配或调试
++ `struct bus_type *bus`: 指向驱动所属的总线(如`&i2c_bus_type`)。总线负责管理设备与驱动的匹配规则
++ `struct module *owner`: 指向驱动所属的内核模块(如`THIS_MODELE`)，用于模块引用计数管理
++ `const struct of_device_id *of_match_table`: 设备树匹配表
++ `probe/remove/shutdown/suspend/resume`: 驱动的回调函数指针
++ `const struct attribute_group **groups`: 驱动默认属性组，在sysfs中自动生成文件。例如驱动暴露版本
+
+看到这里我们应该思考一个问题。`platform_driver`与`device_driver`有什么关联？
+
+看下`platform_driver`的结构体，和注册函数。做了以下内容：
+
+1. 把驱动所属的总线，设为`platform_bus`
+2. 把`platform_driver`的几个函数指针，设置给`device_driver`
+
+```c
+struct platform_driver {
+	int (*probe)(struct platform_device *);
+	int (*remove)(struct platform_device *);
+	void (*shutdown)(struct platform_device *);
+	int (*suspend)(struct platform_device *, pm_message_t state);
+	int (*resume)(struct platform_device *);
+	struct device_driver driver;
+	const struct platform_device_id *id_table;
+	bool prevent_deferred_probe;
+};
+
+int __platform_driver_register(struct platform_driver *drv,
+				struct module *owner)
+{
+	drv->driver.owner = owner;
+	drv->driver.bus = &platform_bus_type;
+	if (drv->probe)
+		drv->driver.probe = platform_drv_probe;
+	if (drv->remove)
+		drv->driver.remove = platform_drv_remove;
+	if (drv->shutdown)
+		drv->driver.shutdown = platform_drv_shutdown;
+
+	return driver_register(&drv->driver);
+}
+```
+
+### 4.5 类结构体`struct class`
+
+```c
+struct class {
+	const char		*name;
+	struct module		*owner;
+
+	struct class_attribute		*class_attrs;
+	const struct attribute_group	**dev_groups;
+	struct kobject			*dev_kobj;
+
+	int (*dev_uevent)(struct device *dev, struct kobj_uevent_env *env);
+	char *(*devnode)(struct device *dev, umode_t *mode);
+
+	void (*class_release)(struct class *class);
+	void (*dev_release)(struct device *dev);
+
+	int (*suspend)(struct device *dev, pm_message_t state);
+	int (*resume)(struct device *dev);
+};
+```
+
++ `const char *name`: 类名称(如`leds`、`input`)，对应`/sys/class/`下的目录名。命名需唯一，用于用户空间分类访问设备
++ `struct module *owner`: 指向拥有该类的内核模块(如`THIS_MODULE`)，用于模块引用计数管理
++ `class_attrs/dev_groups`: 属性文件
++ `char *(*devnode)(struct device *dev, umode_t *mode)`: 自定义设备节点路径(如`/dev/input/event0`)。默认在`/dev/`创建设备，可通过此回调修改路径或权限
+
+### 4.6 `/sys`目录实例分析
+
+我们进入到Linux系统的`/sys`目录下，可以看到如下文件夹。其中和设备模型有关的文件夹为：
+
+![](./src/0006.jpg)
+
++ `/sys/devices`: 该目录包含了系统中所有设备的子目录。每个设备子目录代表一个具体的设备，通过其路径层次结构和符号链接，反应设备的关系和拓扑结构
+
+    ![](./src/0007.jpg)
+
++ `/sys/bus`: 该目录包含了总线类型的子目录。每个子目录代表一个特定类型的总线，例如`i2c`、`spi`、`platform`。每个总线子目录中，包含与该总线相关的设备和驱动程序的信息
+
+    ![](./src/0008.jpg)
+
++ `/sys/class`: 该目录包含了设备类别的子目录。每个子目录代表一个设备类别，例如磁盘、网络接口等。每个设备类别子目录中，包含了属于该类别的设备的信息
+
+    ![](./src/0009.jpg)
+
+### 4.7 设备模型4部分的连接方式
+
+在Linux的sysfs文件系统中，`/sys/class`、`/sys/devices`和`/sys/bus`之间的关联，主要通过符号链接建立。这种设计实现了设备模型的多视角组织：物理拓扑(`/sys/devices`)、功能分类(`/sys/class`)、总线类型(`/sys/bus`)
+
+#### 4.7.1 核心目录的作用与关联方式
+
+以`ethernet`有线网为例说明。我们先看下设备树：有线网设备位于`/soc/aips2(aips-bus@02100000)/fec1(ethernet@02188000)/`这条总线下。
+
+![](./src/0010.jpg)
+
+1. `/sys/devices`: 物理设备的真实存储位置。这是Linux设备模型的核心目录，按硬件连接的物理层级(如总线、父设备)组织起所有设备。例如：
+    + 网卡设备路径：`/sys/devices/platform/soc/2100000.aips-bus/2188000.ethernet`
+    ![](./src/0011.jpg)
+2. `/sys/class`: 按功能分类的符号链接视图
+    + 作用：将设备按功能(如输入设备、网络设备)分类，不关心物理连接方式
+    + 符号链接：每个设备子目录(如`/sys/class/leds/led1`)中的`device`文件，是指向`/sys/devices`中真实设备的符号链接
+    ![](./src/0012.jpg)
+3. `/sys/bus`: 按总线类型组织的符号链接试图
+    + 作用：按总线类型(如PCI、USB、I2C)组织设备和驱动
+    + 符号链接：`/sys/bus/<总线名>/devices`子目录中的条目，是指向`/sys/devices`的符号链接
+    ![](./src/0013.jpg)
+
+#### 4.7.2 关联关系图示
+
+![](./src/0014.jpg)
+
+#### 4.7.3 关键点总结
+
+1. 符号链接是核心纽带：`/sys/class`和`/sys/bus/devices`中的条目，均通过符号链接指向`/sys/devices`中的真实设备目录
+2. 设计目的：
+    + `/sys/devices`: 描述硬件物理层级(如设备依赖关系)
+    + `/sys/class`: 提供功能抽象(如统一控制所有LED)
+    + `/sys/bus`: 管理总线相关的匹配与驱动绑定
+3. 用户空间操作示例：
+    + 通过`/sys/class/leds/led1/brightness`控制LED(功能视图)
+    + 通过`/sys/bus/pci/drivers/nvidia/bind`手动绑定设备(总线视图)
+
