@@ -994,3 +994,5 @@ struct class {
     + 通过`/sys/class/leds/led1/brightness`控制LED(功能视图)
     + 通过`/sys/bus/pci/drivers/nvidia/bind`手动绑定设备(总线视图)
 
+## 第5章 引用计数器
+
