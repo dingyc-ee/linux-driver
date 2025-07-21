@@ -994,5 +994,344 @@ struct class {
     + 通过`/sys/class/leds/led1/brightness`控制LED(功能视图)
     + 通过`/sys/bus/pci/drivers/nvidia/bind`手动绑定设备(总线视图)
 
-## 第5章 引用计数器
+## 第5章 `kref`引用计数器
 
+### 5.1 什么是引用计数
+
+引用计数是一种内存管理技术，用于跟踪对象或资源的应用数量。它通过在对线被引用时增加计数值，并在引用被减少时释放计数值，以确定何时可以安全的释放对象或资源。
+
+### 5.2 `kref引用计数器`
+
+`kref`是Linux内核中提供的一种引用计数器实现，它是一种轻量级的引用计数技术，用于管理内核中的对象的引用计数。
+
+```c
+struct kref {
+	atomic_t refcount;
+};
+```
+
+在使用引用计数器时，通常会将结构体`kref`嵌入到其他结构体中，例如`struct kobject`，以实现引用计数的管理。
+
+```c
+struct kobject {
+	const char		*name;
+	struct list_head	entry;
+	struct kobject		*parent;
+	struct kset		*kset;
+	struct kobj_type	*ktype;
+	struct kernfs_node	*sd;
+	struct kref		kref;   // 内嵌kref引用计数器
+};
+```
+
+### 5.3 `kref`常用API函数
+
+#### 5.3.1 `kref_init()`函数：初始化引用计数为1
+
+```c
+static inline void kref_init(struct kref *kref)
+{
+	atomic_set(&kref->refcount, 1);
+}
+```
+
+#### 5.3.2 `kref_get()`函数：引用计数+1
+
+```c
+static inline void kref_get(struct kref *kref)
+{
+	WARN_ON_ONCE(atomic_inc_return(&kref->refcount) < 2);
+}
+```
+
+#### 5.3.3 `kref_put()`函数：引用计数-1
+
+```c
+static inline int kref_put(struct kref *kref,
+	     void (*release)(struct kref *kref))
+{
+	if (atomic_sub_and_test((int) 1, &kref->refcount)) {
+		release(kref);
+		return 1;
+	}
+	return 0;
+}
+```
+
+### 5.4 引用计数的典型使用场景
+
+#### 5.4.1 多线程数据数据传递
+
+当对象需跨线程传递时，需在传递前增加引用计数，接收方使用后减少引用计数
+
+```c
+void worker_thread(void *data) {
+    struct my_data *d = data;
+    // 操作数据
+    kref_put(&d->refcount, data_release);  // 使用完毕释放引用
+}
+
+void create_thread() {
+    struct my_data *data = kmalloc(..., GFP_KERNEL);
+    kref_init(&data->refcount);
+    kref_get(&data->refcount);  // 传递前增加引用
+    kthread_run(worker_thread, data, "worker");  // 传递指针
+    // ... 主线程操作
+    kref_put(&data->refcount, data_release);  // 主线程释放引用
+}
+```
+
+#### 5.4.2 设备驱动资源管理
+
+设备驱动中，`kref`用于跟踪设备的打开次数。*每次open()时初始化计数，每次close()时减少计数，确保无人使用时释放硬件资源。*
+
+```c
+struct device_ctx {
+    struct kref ref;
+    void *hw_reg;
+};
+
+static void release_dev(struct kref *kref) {
+    struct device_ctx *dev = container_of(kref, struct device_ctx, ref);
+    iounmap(dev->hw_reg);  // 解除内存映射
+    kfree(dev);
+}
+
+int device_open() {
+    struct device_ctx *dev = kmalloc(..., GFP_KERNEL);
+    kref_init(&dev->ref);
+    dev->hw_reg = ioremap(...);
+    return 0;
+}
+
+void device_close(struct device_ctx *dev) {
+    kref_put(&dev->ref, release_dev);  // 关闭时减少引用
+}
+```
+
+### 5.5 使用规则与陷阱
+
+#### 5.5.1 三条核心规则
+
+1. 传递持久指针前必增计数：若对象指针需长期保存或跨线程传递，必须先调用`kref_get()`
+2. 使用完毕后必减计数：通过`kref_put()`释放引用，归零时自动清理
+3. 未持有是获取引用需加锁：若代码未持有对象指针却需获取引用(如从链表获取)，必须用锁同步`kref_get`和`kref_put`
+
+#### 5.5.2 常见陷阱
+
+1. 计数不匹配：`init/get`和`put`要成对出现 -> 内存泄露或提前释放
+2. 错误释放函数：`release`中未正确使用`container_of` -> 内存损坏
+3. 并发漏洞：未加锁保护共享对象的引用操作 -> 竞态条件
+
+### 5.6 运行测试
+
+测试代码：
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+
+static struct kobject *my_kobject_01;
+static struct kobject *my_kobject_02;
+static struct kobject *my_kobject_03;
+
+static struct kobj_type my_kobj_type;
+
+static int __init my_init(void)
+{
+    my_kobject_01 = kobject_create_and_add("my_kobject_01", NULL);
+    printk(KERN_INFO "my_kobject_01 kref:%d\n", my_kobject_01->kref.refcount.counter);
+
+    my_kobject_02 = kobject_create_and_add("my_kobject_02", my_kobject_01);
+    printk(KERN_INFO "my_kobject_01 kref:%d\n", my_kobject_01->kref.refcount.counter);
+    printk(KERN_INFO "my_kobject_02 kref:%d\n", my_kobject_02->kref.refcount.counter);
+
+    my_kobject_03 = kzalloc(sizeof(*my_kobject_03), GFP_KERNEL);
+    kobject_init_and_add(my_kobject_03, &my_kobj_type, NULL, "%s", "my_kobject_03");
+    printk(KERN_INFO "my_kobject_03 kref:%d\n", my_kobject_03->kref.refcount.counter);
+
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    printk(KERN_INFO "my_kobject_01 kref:%d\n", my_kobject_01->kref.refcount.counter);
+    printk(KERN_INFO "my_kobject_02 kref:%d\n", my_kobject_02->kref.refcount.counter);
+    printk(KERN_INFO "my_kobject_03 kref:%d\n", my_kobject_03->kref.refcount.counter);
+
+    kobject_put(my_kobject_01);
+    printk(KERN_INFO "my_kobject_01 kref:%d\n", my_kobject_01->kref.refcount.counter);
+    printk(KERN_INFO "my_kobject_02 kref:%d\n", my_kobject_02->kref.refcount.counter);
+    printk(KERN_INFO "my_kobject_03 kref:%d\n", my_kobject_03->kref.refcount.counter);
+
+    kobject_put(my_kobject_02);
+    printk(KERN_INFO "my_kobject_01 kref:%d\n", my_kobject_01->kref.refcount.counter);
+    printk(KERN_INFO "my_kobject_02 kref:%d\n", my_kobject_02->kref.refcount.counter);
+    printk(KERN_INFO "my_kobject_03 kref:%d\n", my_kobject_03->kref.refcount.counter);
+
+    kobject_put(my_kobject_03);
+    printk(KERN_INFO "my_kobject_01 kref:%d\n", my_kobject_01->kref.refcount.counter);
+    printk(KERN_INFO "my_kobject_02 kref:%d\n", my_kobject_02->kref.refcount.counter);
+    printk(KERN_INFO "my_kobject_03 kref:%d\n", my_kobject_03->kref.refcount.counter);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果：
+
+![](./src/0015.jpg)
+
+## 第6章 `kobject`释放实例分析
+
+通过上个章节的实验，我们已经知道引用计数器是如何工作的。当引用计数器的值为0时，会自动调用自定义的释放函数去执行释放的操作。
+
+### 6.1 创建`kobject`：增加引用计数
+
+我们分析`kobject_create_and_add()`函数，看下引用计数是怎么设置的：
+
+1. `kobject_create_and_add -> kobject_create -> kobject_init -> kobject_init_internal -> kref_init(&kobj->kref)`: 把`kobject`对象的`kref`初始化为1
+2. `kobject_create_and_add -> kobject_add -> kobject_add_varg -> kobject_add_internal -> kobject_get(kobj->parent)`: 把`kobject`的`parent`对象的`kref`加1
+
+```c
+struct kobject *kobject_create_and_add(const char *name, struct kobject *parent)
+{
+	struct kobject *kobj;
+	int retval;
+
+	kobj = kobject_create();
+	retval = kobject_add(kobj, parent, "%s", name);
+
+	return kobj;
+}
+
+struct kobject *kobject_create(void)
+{
+	struct kobject *kobj;
+
+	kobj = kzalloc(sizeof(*kobj), GFP_KERNEL);
+	kobject_init(kobj, &dynamic_kobj_ktype);
+
+	return kobj;
+}
+
+void kobject_init(struct kobject *kobj, struct kobj_type *ktype)
+{
+	kobject_init_internal(kobj);
+	kobj->ktype = ktype;
+	return;
+}
+
+static void kobject_init_internal(struct kobject *kobj)
+{
+	kref_init(&kobj->kref);
+}
+
+int kobject_add(struct kobject *kobj, struct kobject *parent,
+		const char *fmt, ...)
+{
+	retval = kobject_add_varg(kobj, parent, fmt, args);
+	return retval;
+}
+
+static int kobject_add_varg(struct kobject *kobj, struct kobject *parent,
+			    const char *fmt, va_list vargs)
+{
+	kobj->parent = parent;
+	return kobject_add_internal(kobj);
+}
+
+static int kobject_add_internal(struct kobject *kobj)
+{
+	struct kobject *parent;
+	parent = kobject_get(kobj->parent);
+}
+```
+
+动态创建`kobject`对象的函数：`kobject_create()`。使用的`kobj_type`为`dynamic_kobj_ktype`，最终会用它来释放内存。
+
+```c
+static void dynamic_kobj_release(struct kobject *kobj)
+{
+	kfree(kobj);
+}
+
+static struct kobj_type dynamic_kobj_ktype = {
+	.release	= dynamic_kobj_release,
+};
+
+struct kobject *kobject_create(void)
+{
+	struct kobject *kobj;
+
+	kobj = kzalloc(sizeof(*kobj), GFP_KERNEL);
+	kobject_init(kobj, &dynamic_kobj_ktype);
+
+	return kobj;
+}
+```
+
+### 6.2 释放`kobject`：减少引用计数，释放内存
+
+我们调用`kobject_put()`函数来释放`kobject`内存。下面来分析源码，看看是怎么做到的：
+
+`kobject_put -> kref_put -> kobject_release -> kobj->release(dynamic_kobj_release) -> kfree(kobj)`：最终调用`kfree(kobj)`释放内存
+
+```c
+void kobject_put(struct kobject *kobj)
+{
+	if (kobj) {
+		kref_put(&kobj->kref, kobject_release); // 减少引用计数
+	}
+}
+
+int kref_put(struct kref *kref, void (*kobject_release)(struct kref *kref))
+{
+	if (atomic_sub_and_test((int) 1, &kref->refcount)) {
+		kobject_release(kref);  // 引用计数减到0时，调用释放内存函数
+		return 1;
+	}
+	return 0;
+}
+
+static void kobject_release(struct kref *kref)
+{
+	struct kobject *kobj = container_of(kref, struct kobject, kref);
+	kobj->release(kobj);    // 调用 dynamic_kobj_release 函数
+}
+
+static void dynamic_kobj_release(struct kobject *kobj)
+{
+	kfree(kobj);    // 调用kfree函数
+}
+```
+
+### 6.3 总结
+
++ `kobject_create()`创建`kobj`：调用`kzalloc`申请内存给`kobj`
+    ```c
+    struct kobject *kobject_create(void)
+    {
+        struct kobject *kobj;
+
+        kobj = kzalloc(sizeof(*kobj), GFP_KERNEL);
+        kobject_init(kobj, &dynamic_kobj_ktype);
+
+        return kobj;
+    }
+    ```
+
++ `kobject_put()`释放`kobj`：调用`kfree`释放`kobj`的内存
+    ```c
+    void kobject_put(struct kobject *kobj)
+    {
+        // kobj->release(kobj)  ->   dynamic_kobj_release(kobj)
+        kfree(kobj);
+    }
+    ```
