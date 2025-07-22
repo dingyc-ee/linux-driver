@@ -1335,3 +1335,54 @@ static void dynamic_kobj_release(struct kobject *kobj)
         kfree(kobj);
     }
     ```
+
+### 6.4 代码实测
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+
+static void my_release(struct kobject *kobj);
+
+static struct kobject *my_kobject;
+
+static struct kobj_type my_kobj_type = {
+    .release = my_release
+};
+
+static void my_release(struct kobject *kobj)
+{
+    printk(KERN_INFO "release kobj:%p\n", kobj);
+    kfree(kobj);
+}
+
+static int __init my_init(void)
+{
+    my_kobject = kzalloc(sizeof(*my_kobject), GFP_KERNEL);
+    kobject_init_and_add(my_kobject, &my_kobj_type, NULL, "%s", "my_kobject");
+
+    printk(KERN_INFO "make_kobj init\n");
+
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    kobject_put(my_kobject);
+    printk(KERN_INFO "make_kobj exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果：
+
+![](./src/0016.jpg)
+
+
