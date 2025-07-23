@@ -1385,4 +1385,205 @@ MODULE_AUTHOR("ding");
 
 ![](./src/0016.jpg)
 
+## 第7章 `container_of`宏定义
+
+`container_of`是Linux内核中，通过结构体成员地址，反向获取整个结构体起始地址的核心宏，在链表、设备驱动等场景广泛应用。
+
+### 7.1 参数详解
+
+```c
+#define container_of(ptr, type, member)
+```
+
++ `ptr`: 成员指针. 指向结构体*成员变量*的地址
++ `type`: 结构体类型. 包含该成员的*结构体类型名*
++ `member`: 成员名称. 成员在结构体中的*字段名*
++ `返回值`: 指向结构体首地址的*结构体类型指针*
+
+### 7.2 典型用法
+
+#### 7.2.1 内核链表遍历(最常见场景)
+
+作用：通过链表结点指针pos，反向定位包含它的sensor结构体
+
+```c
+struct list_head {
+    struct list_head *next, *prev;
+};
+
+struct sensor {
+    int id;
+    struct list_head list;  // 嵌入链表节点
+};
+
+// 遍历链表获取 sensor 结构体
+struct list_head *pos;
+list_for_each(pos, &sensor_list) {
+    struct sensor *s = container_of(pos, struct sensor, list);
+    printk("Sensor ID: %d\n", s->id);
+}
+```
+
+#### 7.2.2 设备驱动开发
+
+作用：通过cdev成员指针获取自定义设备结构，实现多设备实例管理
+
+```c
+struct my_device {
+    struct cdev cdev;  // 字符设备
+    int irq;
+};
+
+static int dev_open(struct inode *inode, struct file *filp) {
+    struct my_device *dev = container_of(inode->i_cdev, struct my_device, cdev);
+    filp->private_data = dev;  // 存储设备结构体指针
+}
+```
+
+## 第8章 `kobj`创建属性文件并实现读写功能
+
+在第6章中，我们实现了自定义`kobj`的`release`释放函数，在创建`kobj`时设置生效。这样做的作用是，当`kobj`引用计数为0时，可以自动释放内存。
+
+```c
+struct kobj_type {
+	void (*release)(struct kobject *kobj);
+	const struct sysfs_ops *sysfs_ops;
+	struct attribute **default_attrs;
+};
+
+static struct kobj_type my_kobj_type = {
+    .release = my_release
+};
+
+static void my_release(struct kobject *kobj)
+{
+    printk(KERN_INFO "release kobj:%p\n", kobj);
+    kfree(kobj);
+}
+
+static int __init my_init(void)
+{
+    my_kobject = kzalloc(sizeof(*my_kobject), GFP_KERNEL);
+    kobject_init_and_add(my_kobject, &my_kobj_type, NULL, "%s", "my_kobject");
+
+    printk(KERN_INFO "make_kobj init\n");
+
+    return 0;
+}
+```
+
+实际上，`struct kobj_type`结构体除了`release`外，还有2个关键成员：`sysfs_ops`和`default_attrs`，这就是用来创建和读写`kobj`的属性文件的。接下来我们仔细分析！
+
+### 8.1 代码实测
+
+我们先写一个最简单的代码，来创建和读写属性文件。看看效果，下一节再去分析实现原理！
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+
+struct my_kobj {
+    struct kobject my_kobj;
+    int value1;
+    int value2;
+};
+
+static struct my_kobj *s_my_kobj;
+
+static struct attribute value1 = {
+    .name = "value1",
+    .mode = 0666
+};
+
+static struct attribute value2 = {
+    .name = "value2",
+    .mode = 0666
+};
+
+static struct attribute *my_attrs[] = {
+    &value1,
+    &value2,
+    NULL
+};
+
+static void my_release(struct kobject *kobj)
+{
+    struct my_kobj *p_my_kobj = container_of(kobj, struct my_kobj, my_kobj);
+    printk(KERN_INFO "release attr_01\n");
+    kfree(p_my_kobj);
+}
+
+static ssize_t my_attr_show(struct kobject *kobj, struct attribute *attr, char *buf)
+{
+    ssize_t count = 0;
+    struct my_kobj *p_my_kobj = container_of(kobj, struct my_kobj, my_kobj);
+
+    if (strcmp(attr->name, "value1") == 0) {
+        count = sprintf(buf, "%d\n", p_my_kobj->value1);
+    }
+    else if (strcmp(attr->name, "value2") == 0) {
+        count = sprintf(buf, "%d\n", p_my_kobj->value2);
+    }
+
+    return count;
+}
+
+static ssize_t my_attr_store(struct kobject *kobj, struct attribute *attr, const char *buf, size_t size)
+{
+    struct my_kobj *p_my_kobj = container_of(kobj, struct my_kobj, my_kobj);
+
+    if (strcmp(attr->name, "value1") == 0) {
+        sscanf(buf, "%d", &p_my_kobj->value1);
+    }
+    else if (strcmp(attr->name, "value2") == 0) {
+        sscanf(buf, "%d", &p_my_kobj->value2);
+    }
+    
+    return size;
+}
+
+static const struct sysfs_ops my_sysfs_ops = {
+    .show  = my_attr_show,
+	.store = my_attr_store,
+};
+
+static struct kobj_type my_kobj_type = {
+    .release        = my_release,
+    .sysfs_ops      = &my_sysfs_ops,
+    .default_attrs  = my_attrs
+};
+
+static int __init my_init(void)
+{
+    s_my_kobj = kzalloc(sizeof(struct my_kobj), GFP_KERNEL);
+    s_my_kobj->value1 = 1;
+    s_my_kobj->value2 = 2;
+
+    kobject_init_and_add(&s_my_kobj->my_kobj, &my_kobj_type, NULL, "%s", "attr_01");
+    printk(KERN_INFO "attr_01 init\n");
+
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    kobject_put(&s_my_kobj->my_kobj);
+    printk(KERN_INFO "attr_01 exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果：
+
+![](./src/0017.jpg)
+
+### 8.2 属性文件原理分析
+
 
