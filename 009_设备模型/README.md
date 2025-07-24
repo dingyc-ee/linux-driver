@@ -1584,6 +1584,184 @@ MODULE_AUTHOR("ding");
 
 ![](./src/0017.jpg)
 
-### 8.2 属性文件原理分析
+### 8.2 sysfs核心机制
 
+sysfs是Linux内核的伪文件系统，挂载于`/sys`目录，用于将内核对象(设备、驱动、总线)以文件形式暴露给用户空间。用户通过`cat`和`echo`读写这些文件时，最终会调用驱动注册的`sysfs_ops`函数，如`show()`和`store()`。
+
+1. `用户操作`：`cat`触发读操作，`echo`触发写操作
+2. `VFS层`：系统调用(`open/read/write`)由虚拟文件系统VFS路由到sysfs的文件操作函数
+3. `sysfs层`：sysfs解析文件路径，定位到对应的`kobject`和属性`attribute`
+4. `驱动回调`：通过`kobject`关联的`kobj_type`找到`sysfs_ops`，最终调用驱动的`show()`或`store()`函数
+
+### 8.3 源码分析：`ktype`的`default_attrs数组`转为属性文件
+
+属性文件`default_attrs[]`和`sysfs_ops`都在`ktype`中，所以接下来我们重点跟踪`ktype`的使用
+
+函数调用链：`kobject_init_and_add` -> `kobject_add_varg` -> `kobject_add_internal` -> `kobject_add_internal` -> `create_dir`
+
+```c
+static int create_dir(struct kobject *kobj)
+{
+    sysfs_create_dir_ns(kobj, kobject_namespace(kobj)); // 在sysfs中，以kobj名称创建目录
+    populate_dir(kobj); // 在/sys/kobj目录下，先获取ktype再遍历default_attrs属性数组，创建属性文件(属性数组以NULL结尾)
+}
+
+// 在sysfs中，以kobj名称创建目录
+int sysfs_create_dir_ns(struct kobject *kobj, const void *ns)
+{
+    kernfs_create_dir_ns(parent, kobject_name(kobj), S_IRWXU | S_IRUGO | S_IXUGO, kobj, ns);
+}
+
+// 在/sys/kobj目录下，先获取ktype再遍历default_attrs属性数组，创建属性文件(属性数组以NULL结尾)
+static int populate_dir(struct kobject *kobj)
+{
+	struct kobj_type *t = get_ktype(kobj);
+	struct attribute *attr;
+	int error = 0;
+	int i;
+
+	if (t && t->default_attrs) {
+		for (i = 0; (attr = t->default_attrs[i]) != NULL; i++) {
+			sysfs_create_file(kobj, attr);
+		}
+	}
+}
+```
+
+### 8.4 源码分析：`ktype`的`sysfs_ops`转为读写操作
+
+在8.3节的源码分析中，最后是调用`sysfs_create_file(kobj, attr)`来创建`kobj`的属性文件。其实，对属性文件的读写这个函数完成的。
+
+函数调用链：`sysfs_create_file` -> `sysfs_create_file_ns` -> `sysfs_add_file_mode_ns`。我们来分析以下，
+
+1. 获取`kobj`对象的`ktype`，取出`sysfs_ops`操作集
+2. 根据`sysfs_ops`中是否自定义了读(`show`)写(`store`)操作，选择对应的`ops`
+3. 调用`__kernfs_create_file`真正去创建属性文件. 传入绑定的参数包括：属性文件名(`attr->name`)、权限(`attr->mode`)、读写操作集(`ops`)、其他
+4. 用户读写属性文件时，就会调用到ops中的`sysfs_kf_seq_show`和`sysfs_kf_write`。最终会调用到`ktype`中实现的`sysfs_ops`
+
+```c
+int sysfs_add_file_mode_ns(struct kernfs_node *parent,
+			   const struct attribute *attr, bool is_bin,
+			   umode_t mode, const void *ns)
+{
+    const struct sysfs_ops *sysfs_ops = kobj->ktype->sysfs_ops;
+
+    if (sysfs_ops->show && sysfs_ops->store) {
+        ops = &sysfs_file_kfops_rw;
+    } else if (sysfs_ops->show) {
+        ops = &sysfs_file_kfops_ro;
+    } else if (sysfs_ops->store) {
+        ops = &sysfs_file_kfops_wo;
+    } else
+        ops = &sysfs_file_kfops_empty;
+
+	__kernfs_create_file(parent, attr->name, mode & 0777, size, ops, (void *)attr, ns, key);
+}
+
+static const struct kernfs_ops sysfs_file_kfops_empty = {
+};
+
+static const struct kernfs_ops sysfs_file_kfops_ro = {
+	.seq_show	= sysfs_kf_seq_show,
+};
+
+static const struct kernfs_ops sysfs_file_kfops_wo = {
+	.write		= sysfs_kf_write,
+};
+
+static const struct kernfs_ops sysfs_file_kfops_rw = {
+	.seq_show	= sysfs_kf_seq_show,
+	.write		= sysfs_kf_write,
+};
+
+static int sysfs_kf_seq_show(struct seq_file *sf, void *v)
+{
+	const struct sysfs_ops *ops = kobj->ktype->sysfs_ops;
+	char *buf;
+
+	if (ops->show) {
+		ops->show(kobj, of->kn->priv, buf);
+	}
+}
+
+static ssize_t sysfs_kf_write(struct kernfs_open_file *of, char *buf,
+			      size_t count, loff_t pos)
+{
+	const struct sysfs_ops *ops = kobj->ktype->sysfs_ops;
+
+	return ops->store(kobj, of->kn->priv, buf, count);
+}
+```
+
+### 8.5 源码分析：属性文件的名称和权限
+
+可以看到，每个属性文件包含2部分：名称(`name`)和权限(`mode`)。权限`0666`是一个八进制数，表示该文件对所有用户均开放读写权限。
+
+0666是Linux文件权限的八进制表示，具体分解如下：
+
++ `0`: 前缀，表示八进制数
++ `6`(所有者权限): 4(读) + 2(写) = 6(可读可写)
++ `6`(组权限): 4(读) + 2(写) = 6(可读可写)
++ `6`(其他用户权限): 4(读) + 2(写) = 6(可读可写)
+
+```c
+static struct attribute value1 = {
+    .name = "value1",
+    .mode = 0666
+};
+
+static struct attribute value2 = {
+    .name = "value2",
+    .mode = 0666
+};
+
+static struct attribute *my_attrs[] = {
+    &value1,
+    &value2,
+    NULL
+};
+
+属性数组以NULL结尾。0666表示所有用户均可读写该sysfs文件(例如通过cat读取或echo写入)
+```
+
+### 8.6 源码分析：`show`和`store`函数指针
+
++ `show`: 用户读取属性文件。因此，我们要把字符串格式化到`buf`中，然后上层会显示`buf`的内容
++ `store`: 用户写入属性文件。如`echo 111 > value1`，这里用户的输入是一个字符串`"111"`，保存在`buf`指针中。我们要把字符串解析成十进制保存，因此采用`sscanf(buf, "%d", &p_my_kobj->value1)`。`%d`就是以十进制格式解析字符串
+
+```c
+static ssize_t my_attr_show(struct kobject *kobj, struct attribute *attr, char *buf)
+{
+    ssize_t count = 0;
+    struct my_kobj *p_my_kobj = container_of(kobj, struct my_kobj, my_kobj);
+
+    if (strcmp(attr->name, "value1") == 0) {
+        count = sprintf(buf, "%d\n", p_my_kobj->value1);
+    }
+    else if (strcmp(attr->name, "value2") == 0) {
+        count = sprintf(buf, "%d\n", p_my_kobj->value2);
+    }
+
+    return count;
+}
+
+static ssize_t my_attr_store(struct kobject *kobj, struct attribute *attr, const char *buf, size_t size)
+{
+    struct my_kobj *p_my_kobj = container_of(kobj, struct my_kobj, my_kobj);
+
+    if (strcmp(attr->name, "value1") == 0) {
+        sscanf(buf, "%d", &p_my_kobj->value1);
+    }
+    else if (strcmp(attr->name, "value2") == 0) {
+        sscanf(buf, "%d", &p_my_kobj->value2);
+    }
+    
+    return size;
+}
+
+static const struct sysfs_ops my_sysfs_ops = {
+    .show  = my_attr_show,
+	.store = my_attr_store,
+};
+```
 
