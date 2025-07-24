@@ -1765,3 +1765,76 @@ static const struct sysfs_ops my_sysfs_ops = {
 };
 ```
 
+## 第9章 使用`struct kobj_attribute`优化属性文件读写
+
+在第8章中，我们是直接使用`struct attribute`创建属性文件，然后再使用`sysfs_ops`创建操作集，二者是独立分离的。
+
+```c
+struct attribute {
+	const char *name;
+	umode_t     mode;
+};
+```
+
+还有一种常用的方式来创建属性文件，就是使用`struct kobj_attribute`结构体。来看下，他内嵌了`struct attribute`属性结构体，还包含了读写ops。所以我们可以理解，他定义的是一个属性文件外加读写操作。应用访问属性文件时，直接调用这个结构体中的ops函数指针。
+
+```c
+struct kobj_attribute {
+	struct attribute attr;
+	ssize_t (*show)(struct kobject *kobj, struct kobj_attribute *attr, char *buf);
+	ssize_t (*store)(struct kobject *kobj, struct kobj_attribute *attr,
+			const char *buf, size_t count);
+};
+```
+
+### 9.1 核心区别
+
+| 特性 | `struct attribute` | `struct kobj_attribute` |
+| - | - | - |
+| 结构定义 | 基础属性(名称+权限) | 扩展属性(含独立读写函数) |
+| 操作函数绑定 | 依赖`ktype->sysfs_ops`统一分发 | 每个属性自带`show/store`函数 |
+| 适用场景 | 多属性共享同一组操作函数 | 每个属性需独立操作逻辑 |
+| 代码耦合度 | 低(属性与操作解耦) | 高(属性与操作强绑定) |
+| 典型用例 | 设备类的默认属性(如dev、uevent) | 驱动自定义属性(如gpio_value) |
+
+### 9.2 适用场景与选择
+
+1. 直接使用`struct attribute`
+    + 场景：多个属性需复用同一组操作函数(通过`attr->name`区分属性)
+    + 优势：减少代码冗余，统一管理属性读写逻辑
+    + 内核应用：设备模型中的默认属性(如dev、uevent)
+    + 代码流程：
+        1. 定义`struct attribute`数组
+        2. 在`ktype->sysfs_ops`中实现统一的分发函数
+        3. 在分发函数中解析`attr->name`并执行操作
+2. 使用`struct kobj_attribute`
+    + 场景：每个属性需*独立的操作函数*，无需在代码中解析属性名
+    + 优势：代码直观，属性与操作绑定，避免strcmp判断
+    + 内核应用：驱动自定义属性(如GPIO的value、LED的brightness)
+    + 代码流程：
+        1. 定义`struct kobj_zttribute`(含show/store函数指针)
+        2. 直接通过`container_of`从`attr`反向获取`kobj_attribute`
+        3. 调用属性自带的读写函数
+
+### 9.3 选择建议
+
+1. 优先`kobj_attribute`
+    + 适用于*大多数驱动场景*，每个属性有独立逻辑(如GPIO电平控制、设备状态读写)
+    + 避免在分发函数中解析属性名，提升可读性和可维护性
+2. 选择`attribute`的场景
+    + 多个*属性逻辑高度相似*(如统一格式化输出)
+    + 需兼容内核默认属性机制(如`class_create_file`生成的属性)
+
+终极法则：
++ 若属性操作高度类似(如批量生成设备信息)，用`attribute`
++ 若属性需独立业务逻辑(如驱动控制接口)，用`kojb_attribute`
+
+### 9.5 常见错误
+
+1. 混淆结构类型：将`kobj_attribute`传递给`default_attrs`时需用`&attr.attr`(提取内嵌的`attribute`)
+2. 未处理属性名冲突：使用`attribute`时未校验`attr->name`，导致错误操作
+3. 忽略权限控制：`mode`需匹配操作函数，如只读属性不可实现store
+
+### 9.6 函数接口
+
+
