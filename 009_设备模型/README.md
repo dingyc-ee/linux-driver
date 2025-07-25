@@ -1837,4 +1837,146 @@ struct kobj_attribute {
 
 ### 9.6 函数接口
 
+#### 9.6.1 `__ATTR`创建属性文件
+
+```c
+#define __ATTR(_name, _mode, _show, _store) {				\
+	.attr = {.name = __stringify(_name),				\
+		 .mode = VERIFY_OCTAL_PERMISSIONS(_mode) },		\
+	.show	= _show,						\
+	.store	= _store,						\
+}
+```
+
++ `_name`: 属性文件名(字符串)
++ `_mode`: 文件属性(八进制，控制用户空间访问权限)。可以有2种方式：数字或宏。本质上都是一样的
+    1. 纯数字方式
+        + 0666：可读可写
+        + 0444：只读
+        + 0222：只写
+    2. 使用宏定义
+        + `S_IRUGO`: 只读
+        + `S_IWUGO`: 只写
+        + `S_WRUGO | S_IWUGO`: 可读可写
+    3. 在`__ATTR`宏中，会对`_mode`进行权限检查。0666过不了，常用的全限制为0644
++ `_show`: 读回调函数，用户执行`cat`时触发
++ `_store`: 写回调函数，用户执行`echo`时触发
+
+#### 9.6.2 `__ATTR_NULL`标识属性数组的末尾
+
+用在属性数组的尾部，结束标志！
+
+```c
+#define __ATTR_NULL { .attr = { .name = NULL } }
+```
+
+#### 9.6.2 内核驱动代码实例
+
+Linux内核驱动`ecard.c`中，就有使用`__ATTR`的实例。他提供了一系列读取设备属性的接口：
+
+```c
+static struct device_attribute ecard_dev_attrs[] = {
+	__ATTR(device,   S_IRUGO, ecard_show_device,    NULL),
+	__ATTR(dma,      S_IRUGO, ecard_show_dma,       NULL),
+	__ATTR(irq,      S_IRUGO, ecard_show_irq,       NULL),
+	__ATTR(resource, S_IRUGO, ecard_show_resources, NULL),
+	__ATTR(type,     S_IRUGO, ecard_show_type,      NULL),
+	__ATTR(vendor,   S_IRUGO, ecard_show_vendor,    NULL),
+	__ATTR_NULL,
+};
+```
+
+### 9.7 代码实测
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+
+struct my_kobj {
+    struct kobject my_kobj;
+    int value;
+};
+
+static struct my_kobj *s_my_kobj;
+
+static ssize_t value_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct my_kobj *p_my_kobj = container_of(kobj, struct my_kobj, my_kobj);
+    return sprintf(buf, "%d\n", p_my_kobj->value);
+}
+
+static ssize_t value_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t size)
+{
+    struct my_kobj *p_my_kobj = container_of(kobj, struct my_kobj, my_kobj);
+    sscanf(buf, "%d", &p_my_kobj->value);
+    return size;
+}
+
+static struct kobj_attribute value = __ATTR(value, 0644, value_show, value_store);
+
+static void my_release(struct kobject *kobj)
+{
+    struct my_kobj *p_my_kobj = container_of(kobj, struct my_kobj, my_kobj);
+    printk(KERN_INFO "release attr_02\n");
+    kfree(p_my_kobj);
+}
+
+static ssize_t my_attr_show(struct kobject *kobj, struct attribute *attr, char *buf)
+{
+    struct kobj_attribute *p_my_kobj = container_of(attr, struct kobj_attribute, attr);
+    return p_my_kobj->show(kobj, p_my_kobj, buf);
+}
+
+static ssize_t my_attr_store(struct kobject *kobj, struct attribute *attr, const char *buf, size_t size)
+{
+    struct kobj_attribute *p_my_kobj = container_of(attr, struct kobj_attribute, attr);
+    return p_my_kobj->store(kobj, p_my_kobj, buf, size);
+}
+
+static const struct sysfs_ops my_sysfs_ops = {
+    .show  = my_attr_show,
+	.store = my_attr_store,
+};
+
+static struct attribute *my_attrs[] = {
+    &value.attr,
+    NULL
+};
+
+static struct kobj_type my_kobj_type = {
+    .release        = my_release,
+    .sysfs_ops      = &my_sysfs_ops,
+    .default_attrs  = my_attrs
+};
+
+static int __init my_init(void)
+{
+    s_my_kobj = kzalloc(sizeof(struct my_kobj), GFP_KERNEL);
+    s_my_kobj->value = 1;
+
+    kobject_init_and_add(&s_my_kobj->my_kobj, &my_kobj_type, NULL, "%s", "attr_02");
+    printk(KERN_INFO "attr_02 init\n");
+
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    kobject_put(&s_my_kobj->my_kobj);
+    printk(KERN_INFO "attr_02 exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+## 第10章 使用`kobject_create_and_add`创建的kobject, 添加属性文件
+
+前面
 
