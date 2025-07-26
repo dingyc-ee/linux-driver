@@ -1976,7 +1976,111 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("ding");
 ```
 
-## 第10章 使用`kobject_create_and_add`创建的kobject, 添加属性文件
+## 第10章 使用`kobject_create_and_add(*name, *parent)`创建的kobject, 添加属性文件
 
-前面
+前面我们创建`kobj`属性文件，是使用`kobject_init_and_add(*kobj, *ktype, *parent, ...)`函数，因为可以传入`ktype`参数，我们的属性文件名和读写操作集，都是通过`ktype`传入。
+
+*那么问题来了，`kobject_create_and_add(*name, *parent)`这个函数没有ktype入参，该怎么创建属性文件呢？*
+
+我们还是先来看下`kobject_create_and_add()`的源码. 函数调用链：`kobject_create_and_add` -> `kobject_create`。
+
+1. 动态创建的`kobject`，使用的`ktype`是`dynamic_kobj_ktype`
+2. `dynamic_kobj_ktype`的`release`函数，就是`kfree`释放内存
+3. `dynamic_kobj_ktype`没有`default_attrs`属性文件数组，我们暂时还不知道该如何创建属性文件
+3. `dynamic_kobj_ktype`竟然有`sysfs_ops`操作集。看起来很奇怪，没关系。我们接下来仔细分析
+
+```c
+// 动态创建的kobject，使用的ktype为dynamic_kobj_ktype
+static struct kobj_type dynamic_kobj_ktype = {
+	.release	= dynamic_kobj_release,
+	.sysfs_ops	= &kobj_sysfs_ops,
+};
+
+struct kobject *kobject_create(void)
+{
+	struct kobject *kobj;
+
+	kobj = kzalloc(sizeof(*kobj), GFP_KERNEL);
+	kobject_init(kobj, &dynamic_kobj_ktype);
+
+	return kobj;
+}
+
+static void dynamic_kobj_release(struct kobject *kobj)
+{
+	pr_debug("kobject: (%p): %s\n", kobj, __func__);
+	kfree(kobj);
+}
+```
+
+### 10.1 创建属性文件的本质：`sysfs_create_file(*kobj, *attr)`
+
+在`8.3 ~ 8.4`节的源码分析中，我们知道ktype里面的属性文件，最终是调用`sysfs_create_file(kobj, attr)`函数来创建属性文件，并绑定`sysfs_ops`操作集的。
+
+```c
+static int populate_dir(struct kobject *kobj)
+{
+	struct kobj_type *t = get_ktype(kobj);
+	struct attribute *attr;
+	int error = 0;
+	int i;
+
+	if (t && t->default_attrs) {
+		for (i = 0; (attr = t->default_attrs[i]) != NULL; i++) {
+			sysfs_create_file(kobj, attr);
+		}
+	}
+}
+```
+
+那么对于动态创建的`kobject`，我们也可以直接调用`sysfs_create_file(kobj, attr)`来创建属性文件，并绑定操作集。
+
+### 10.2 动态`kobject`的`sysfs_ops`操作集
+
+动态`kobject`的`sysfs_ops`操作集代码已经写好了。我们来分析下：
+
+1. 统一注册的`kobj_sysfs_ops`，然后在`sysfs_ops`中进行分发
+2. 在`sysfs_ops`中，获取`struct kobj_attribute`，然后再调用`kobj_attribute`绑定的属性操作函数。所以，我们需要创建`kobj_attribute`类型的属性文件
+
+```c
+const struct sysfs_ops kobj_sysfs_ops = {
+	.show	= kobj_attr_show,
+	.store	= kobj_attr_store,
+};
+
+static ssize_t kobj_attr_show(struct kobject *kobj, struct attribute *attr,
+			      char *buf)
+{
+	struct kobj_attribute *kattr;
+	ssize_t ret = -EIO;
+
+	kattr = container_of(attr, struct kobj_attribute, attr);
+	if (kattr->show)
+		ret = kattr->show(kobj, kattr, buf);
+	return ret;
+}
+
+static ssize_t kobj_attr_store(struct kobject *kobj, struct attribute *attr,
+			       const char *buf, size_t count)
+{
+	struct kobj_attribute *kattr;
+	ssize_t ret = -EIO;
+
+	kattr = container_of(attr, struct kobj_attribute, attr);
+	if (kattr->store)
+		ret = kattr->store(kobj, kattr, buf, count);
+	return ret;
+}
+```
+
+### 10.3 动态`kobject`添加属性文件的流程总结
+
+1. `kobject_create_and_add`创建动态`kobject`
+2. `__ATTR`创建`struct kojb_attribute`属性结构体，并绑定读写函数
+3. `sysfs_create_file`创建属性文件，把第2步创建的属性结构体传入
+
+### 10.4 代码实测
+
+
+
 
