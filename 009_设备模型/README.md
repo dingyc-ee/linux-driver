@@ -2081,6 +2081,229 @@ static ssize_t kobj_attr_store(struct kobject *kobj, struct attribute *attr,
 
 ### 10.4 代码实测
 
+#### 10.4.1 `kobject`以指针形式嵌入到外部结构体的问题
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+
+struct my_device {
+    struct kobject *kobj;
+    int value;
+};
+
+static struct my_device *my_dev;
+
+static ssize_t value_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    struct my_device *dev = container_of((struct kobject **)kobj, struct my_device, kobj);
+    return sprintf(buf, "%d\n", dev->value);
+}
+
+static ssize_t value_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t size)
+{
+    struct my_device *dev = container_of((struct kobject **)kobj, struct my_device, kobj);
+    sscanf(buf, "%d", &dev->value);
+    return size;
+}
+
+static struct kobj_attribute value = __ATTR(value, 0644, value_show, value_store);
+
+static int __init my_init(void)
+{
+    my_dev = kzalloc(sizeof(struct my_device), GFP_KERNEL);
+
+    my_dev->kobj = kobject_create_and_add("f_attr", NULL);
+    my_dev->value = 1;
+    sysfs_create_file(my_dev->kobj, &value.attr);
+
+    printk(KERN_INFO "f_attr init\n");
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    kobject_put(my_dev->kobj);
+    kfree(my_dev);
+    printk(KERN_INFO "f_attr exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果如下。可以看到，这个结果显然是不对的。问题出在哪里？？？
+
+![](./src/0018.jpg)
+
+显然不对。初始值应该是1才对，但这里是一串随机值。问题出在哪里？？
+
+我们的`kobject`是以指针形式嵌入到外部结构体的，这不是标准用法。Linux 设备模型强烈推荐直接嵌入 `struct kobject`（非指针），以简化内存管理和避免类型风险。
+
+#### 10.4.2 解决方案：定义成单独的静态变量
+
+不要把`kobject`指针嵌入到外部结构体成员中。如果有需要用指针，定义成单独的静态变量`static struct kobject *my_device`
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+
+static int my_value;
+static struct kobject *my_kobject;
+
+static ssize_t value_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%d\n", my_value);
+}
+
+static ssize_t value_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t size)
+{
+    sscanf(buf, "%d", &my_value);
+    return size;
+}
+
+static struct kobj_attribute value = __ATTR(value, 0644, value_show, value_store);
+
+static int __init my_init(void)
+{
+    my_kobject = kobject_create_and_add("f_attr", NULL);
+    my_value = 1;
+    sysfs_create_file(my_kobject, &value.attr);
+
+    printk(KERN_INFO "f_attr init\n");
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    kobject_put(my_kobject);
+    printk(KERN_INFO "f_attr exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+## 第11章 使用`sysfs_create_group(*kobj, *grp)`创建多个属性
+
+第10章的代码中，我们使用`sysfs_create_file`来给`kobject`创建属性文件。这没有任何问题，但是如果我们需要创建多个属性文件呢？
+
++ 办法1：循环调用多次`sysfs_create_file`
++ 办法2：使用`sysfs_create_group`创建1组属性文件
+
+### 11.1 函数功能
+
+`sysfs_create_group()`用于在指定的`kobject`对应的sysfs目录下创建一组属性文件(属性组)。这些属性文件通常用于*用户空间与内核的交互*(如读写设备参数、控制硬件状态)。属性组通过`struct attribute_group`来定义，可包含多个属性文件，每核文件绑定独立的`show`和`store`回调函数。
+
+### 11.2 函数原型与参数
+
+```c
+int sysfs_create_group(struct kobject *kobj, const struct attribute_group *grp);
+```
+
+1. `kobj`: 指向目标内核对象
+2. `grp`: 指向属性组
+    ```c
+    struct attribute_group {
+        const char *name;          // 可选：属性组的子目录名
+        umode_t (*is_visible)(...); // 可选：控制属性可见性
+        struct attribute **attrs;  // 必需：属性文件数组
+        struct bin_attribute **bin_attrs; // 二进制属性（可选）
+    };
+    ```
+    关键成员：
+    + `attrs`: 以NULL结尾的`struct attribute_group *`数组，每个元素代表一个属性文件
+    + `name`: 若指定，则在`kobj`目录下创建子目录. 否则属性直接位于`kobj`目录
+3. 返回值: 0(成功)
+4. 需在模块卸载时调用`sysfs_remove_group`删除属性组，避免资源泄露
+
+### 11.3 典型使用场景
+
+1. 设备驱动调试：暴露硬件传感器、开关状态等参数供用户空间实时读写
+2. 动态配置设备：如传感器校准值、通信超时时间
+3. 批量创建属性：避免多次调用`sysfs_create_file()`，提升代码可维护性
+
+### 11.4 代码实测
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+
+static int my_value = 100;
+static char my_mode[16] = "default";
+
+static ssize_t value_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%d\n", my_value);
+}
+
+static ssize_t value_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t size)
+{
+    int ret = kstrtoint(buf, 10, &my_value);
+    return ret ? ret : size;
+}
+
+static struct kobj_attribute value_attr = __ATTR_RW(value);
+
+static ssize_t mode_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+    return sprintf(buf, "%s\n", my_mode);
+}
+
+static struct kobj_attribute mode_attr = __ATTR_RO(mode);
+
+static struct attribute *my_attrs[] = {
+    &value_attr.attr,
+    &mode_attr.attr,
+    NULL
+};
+
+static const struct attribute_group my_attr_grp = {
+    .attrs = my_attrs   // 关联属性数组
+};
+
+static struct kobject *my_kobject;
+
+static int __init my_init(void)
+{
+    my_kobject = kobject_create_and_add("f_attr", NULL);
+    sysfs_create_group(my_kobject, &my_attr_grp);   // 创建属性组
+    printk(KERN_INFO "f_attr init\n");
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    sysfs_remove_group(my_kobject, &my_attr_grp);
+    kobject_put(my_kobject);
+    printk(KERN_INFO "f_attr exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果：
+
+![](./src/0019.jpg)
 
 
 
