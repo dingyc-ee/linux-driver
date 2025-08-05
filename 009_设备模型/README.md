@@ -2305,5 +2305,265 @@ MODULE_AUTHOR("ding");
 
 ![](./src/0019.jpg)
 
+## 第12章 注册一个自己的`bus`总线
 
+前面提到，设备模型包括设备、驱动、总线和类。前面我们学习了设备模型基本框架`kobject`和`kset`，本章开始学习总线。
+
+Linux系统中的总线的根目录是`/sys/bus`. 如果我们自己注册一个总线，也会出现在此目录下。
+
+![](./src/0020.jpg)
+
+### 12.1 总线注册API函数
+
+#### 12.1.1 `bus_register`注册总线
+
+```c
+int bus_register(struct bus_type *bus);
+```
+
++ 功能：向内核注册总线类型，创建`/sys/bus/<bus_name>`目录及其子目录(devices、drivers)
++ 参数`bus`：`struct bus_type`指针，需初始化`name`(总线名)和`match`(匹配函数)等字段
++ 返回值： 0=成功  负数=失败
++ 代码实例：
+    ```c
+    struct bus_type my_bus = {
+        .name = "my_bus",
+        .match = my_match,  // 自定义匹配函数
+    };
+    int ret = bus_register(&my_bus);
+    ```
+
+#### 12.1.2 `bus_unregister`注销总线
+
+```c
+void bus_unregister(struct bus_type *bus);
+```
+
++ 功能：注销总线，清理`sysfs`条目和内核数据结构
++ 参数`bus`：待注销的总线指针
++ 返回值：无
+
+### 12.2 总线核心方法
+
+#### 12.2.1 `match`方法
+
+```c
+int (*match)(struct device *dev, struct device_driver *drv)
+```
+
++ 功能：判断设备与驱动是否匹配(需总线实现)
++ 典型实现逻辑：
+    ```c
+    static int my_match(struct device *dev, struct device_driver *drv) {
+        // 示例：按名称匹配
+        return strcmp(dev_name(dev), drv->name) == 0;
+        // 实际场景可能用设备ID或设备树compatible属性
+    }
+    ```
++ 返回值：匹配成功 - 非零值    不匹配：0
++ 底层原理：
+    + 设备/驱动注册时，总线遍历对方链表调用`match()`
+    + 匹配后触发`probe()`
+
+#### 12.2.2 `probe`方法
+
+```c
+int (*probe)(struct device *dev)
+```
+
++ 功能：设备匹配成功后初始化硬件资源
++ 场景：设备热插拔或去当加载时的初始化
+
+### 12.3 典型总线对比
+
+| 总线类型 | 匹配方式 | 典型场景 |
+| - | - | - |
+| PCI | 设备ID (vendor/device) | 显卡、网卡 |
+| platform | 设备名称或设备树compatible | SoC内置设备(如GPIO) |
+| I2C | 设备地址和驱动ID表 | 传感器、EEPROM |
+
+### 12.4 代码实测
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/device.h>
+
+#define PROJECT_NAME    "mybus"
+
+static int mybus_match(struct device *dev, struct device_driver *drv)
+{
+    printk(KERN_INFO "%s\n", __FUNCTION__);
+    return (strcmp(dev_name(dev), drv->name) == 0);
+}
+
+static int my_probe(struct device *dev)
+{
+    struct device_driver *drv = dev->driver;
+    printk(KERN_INFO "%s\n", __FUNCTION__);
+    if (drv->probe) {
+        return drv->probe(dev);
+    }
+    return 0;
+}
+
+static struct bus_type mybus = {
+    .name   = "mybus",
+    .match  = mybus_match,
+    .probe  = my_probe,
+};
+
+static int __init my_init(void)
+{
+    int ret;
+    ret = bus_register(&mybus);
+    if (ret == 0) {
+        printk(KERN_INFO "%s init success\n", PROJECT_NAME);
+    }
+    else {
+        printk(KERN_INFO "%s init fail\n", PROJECT_NAME);
+    }
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    bus_unregister(&mybus);
+    printk(KERN_INFO "%s exit\n", PROJECT_NAME);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+![](./src/0021.jpg)
+
+## 第13章 给`bus`总线添加属性文件
+
+上一章我们成功的创建了自定义总线，接下来给总线添加属性文件，以扩展其功能。
+
+### 13.1 `bus`总线属性文件API函数
+
+```c
+struct bus_attribute {
+    struct attribute attr;     // 基础属性（文件名、权限）
+    ssize_t (*show)(struct bus_type *bus, char *buf); // 读回调
+    ssize_t (*store)(struct bus_type *bus, const char *buf, size_t count); // 写回调
+};
+```
+
+#### 13.1.1 `bus_create_file`创建`bus`属性文件
+
+```c
+int bus_create_file(struct bus_type *bus, struct bus_attribute *attr);
+```
+
+#### 13.1.2 `bus_remove_file`销毁`bus`属性文件
+
+```c
+void bus_remove_file(struct bus_type *bus, struct bus_attribute *attr);
+```
+
+#### 13.1.3 `kstrtoint`把字符串转为10/16进制，在`store`方法中调用
+
+```c
+int kstrtoint(const char *s, unsigned int base, int *res);
+```
+
+### 13.2 `bus`属性文件的典型使用场景
+
+| 场景 | 说明 |
+| - | - |
+| 总线版本信息暴露 | 创建只读文件(如version)，显示总线驱动版本号 |
+| 动态配置总线参数 | 创建可写文件(如timeout)，允许用户修改总线超时时间 |
+| 调试接口 | 创建文件触发内部状态dump(如debug_level) |
+
+### 13.3 代码实测
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/device.h>
+
+#define PROJECT_NAME    "mybus"
+#define PROJECT_VER     "V1.0"
+
+static int mybus_match(struct device *dev, struct device_driver *drv)
+{
+    printk(KERN_INFO "%s\n", __FUNCTION__);
+    return (strcmp(dev_name(dev), drv->name) == 0);
+}
+
+static int my_probe(struct device *dev)
+{
+    struct device_driver *drv = dev->driver;
+    printk(KERN_INFO "%s\n", __FUNCTION__);
+    if (drv->probe) {
+        return drv->probe(dev);
+    }
+    return 0;
+}
+
+static struct bus_type mybus = {
+    .name   = "mybus",
+    .match  = mybus_match,
+    .probe  = my_probe,
+};
+
+static ssize_t version_show(struct bus_type *bus, char *buf)
+{
+    return sprintf(buf, "%s %s\n", bus->name, PROJECT_VER);
+}
+
+static int mybus_debug_level = 0;
+
+static ssize_t debug_level_show(struct bus_type *bus, char *buf)
+{
+    sprintf(buf, "%d\n", mybus_debug_level);
+}
+static ssize_t debug_level_store(struct bus_type *bus, const char *buf, size_t count)
+{
+    kstrtoint(buf, 10, &mybus_debug_level);
+    return count;
+}
+
+static BUS_ATTR_RO(version);
+static BUS_ATTR_RW(debug_level);
+
+static int __init my_init(void)
+{
+    bus_register(&mybus);
+    bus_create_file(&mybus, &bus_attr_version);
+    bus_create_file(&mybus, &bus_attr_debug_level);
+    printk(KERN_INFO "%s init\n", PROJECT_NAME);
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    bus_remove_file(&mybus, &bus_attr_debug_level);
+    bus_remove_file(&mybus, &bus_attr_version);
+    bus_unregister(&mybus);
+    printk(KERN_INFO "%s exit\n", PROJECT_NAME);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+![](./src/0022.jpg)
+
+## 第14章 `bus_register`底层代码原理分析
 
