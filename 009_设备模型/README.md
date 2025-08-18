@@ -2567,3 +2567,394 @@ MODULE_AUTHOR("ding");
 
 ## 第14章 `bus_register`底层代码原理分析
 
+### 14.1 `klist`和`klist_node`线程安全链表
+
+Linux内核的`klist`是一种线程安全的链表实现。在标准`list_head`基础上引入了引用计数和同步机制，主要用于需要安全并发访问的场景。
+
+#### 14.1.1 `klist`链表头
+
+```c
+struct klist {
+	spinlock_t		k_lock;         // 保护链表的自旋锁
+	struct list_head	k_list;     // 嵌入的标准链表节点
+	void			(*get)(struct klist_node *);    // 节点引用增加时的回调
+	void			(*put)(struct klist_node *);    // 节点引用减少时的回调
+} __attribute__ ((aligned (sizeof(void *))));       // 栈指针大小对齐
+```
+
+设计意图：
+
++ 线程安全：通过`k_lock`自旋锁确保对链表的操作原子化
++ 生命周期管理：`get/put`回调由用户定义，用于嵌入对线的应用计数管理
++ 内存对齐：利用地址对齐特性，将指针最低位用于状态标记(如节点删除标志)，避免额外存储开销
+
+#### 14.1.2 `klist_node`链表节点
+
+```c
+struct klist_node {
+	void			*n_klist;	// 指向所属klist
+	struct list_head	n_node; // 嵌入的标准链表节点
+	struct kref		n_ref;      // 引用计数器
+};
+```
+
+关键设计：
+
++ `n_klist`的双重作用：
+    + 指向所属klist链表头
+    + *最低位作为状态标记位(`KNODE_DEAN`)*：若置1，表示节点已标记删除，迭代时会跳过
++ 引用计数`n_ref`：
+    + 节点被引用时计数增加，释放时减少
+    + 计数归零时触发`klist_release`，从链表移除节点并唤醒等待线程
+
+#### 14.1.2 核心设计思路
+
+1. 安全删除机制`klist_del`(延迟移除)
+
+    + 问题：直接删除节点可能导致其他线程访问已释放内存
+    + 方案：
+        + `klist_del()`仅标记`KNODE_DEAD`并减少引用计数，不立即删除
+        + 当引用计数归零时，节点被真正移除(通过`klist_release`)
+    + 优势：避免悬空指针，确保无线程持有节点时才释放内存
+
+2. 阻塞式删除`klist_remove`
+
+    + 场景：需等待节点完全释放(如卸载驱动时移除设备)
+    + 实现：
+        + 调用线程加入全局等待队列`klist_remove_waiters`，进入休眠
+        + 当节点引用归零时，`klist_release`唤醒等待线程
+
+#### 14.1.3 地址对齐与状态标记
+
+技术背景：指针地址对齐。32位系统中，指针地址按4字节对齐(最低2位恒为0).利用最低位的`冗余0`存储状态信息(1表示删除状态)，不影响指针本身的寻址能力。我们来看下源码：
+
+`klist.c`
+
+```c
+/*
+ * Use the lowest bit of n_klist to mark deleted nodes and exclude dead ones from iteration.
+ */
+#define KNODE_DEAD		1LU
+#define KNODE_KLIST_MASK	~KNODE_DEAD
+
+// 获知真实链表头
+static struct klist *knode_klist(struct klist_node *knode)
+{
+	return (struct klist *)((unsigned long)knode->n_klist & KNODE_KLIST_MASK);
+}
+
+// 判断节点状态
+static bool knode_dead(struct klist_node *knode)
+{
+	return (unsigned long)knode->n_klist & KNODE_DEAD;
+}
+
+// 标记节点为删除状态
+static void knode_kill(struct klist_node *knode)
+{
+	*(unsigned long *)&knode->n_klist |= KNODE_DEAD;
+}
+```
+
+总结：通过位运算快速切换状态，避免锁开销。
+
+#### 14.1.4 典型应用场景
+
+1. 设备驱动模型(核心应用)
+
+    + 设备与驱动的关联：
+        + 总线：通过`klist`管理所有设备(`klist_devices`)和驱动(`klist_drivers`)
+        + 驱动：使用`klist`管理其支持的设备(`klist_devices`)
+        + 设备：包含`klist_node`成员，挂载到总线和驱动的链表中
+
+    + 示例：
+        + I2C总线上挂载多个设备(如温度传感器)，设备节点通过`klist`连接到总线及对应驱动的链表
+        + 卸载驱动时，调用`klist_remove()`阻塞至所有设备引用释放
+
+2. 动态对象管理
+
+    + 场景：需跟踪生命周期且可能被多线程访问的对象(如内核模块、网络连接)
+    + 优势：
+        + 引用计数自动管理对象销毁
+        + 自旋锁保证并发操作安全
+
+#### 14.1.5 与`list_head`的对比
+
+| 特性 | `list_head` | `klist` |
+| - | - | - |
+| 线程安全 | 无 | 自旋锁保护操作 |
+| 节点删除 | 立即移除 | 延迟移除(引用计数归零) |
+| 迭代安全 | 不支持并发修改 | 支持安全并发迭代 |
+| 内存开销 | 较小 | 略大(含锁和引用计数) |
+
+### 14.2 子系统的私有管理
+
+在Linux内核设备模型中，`struct subsys_private`、`struct driver_private`、`struct device_private`是3个核心私有结构体，用于管理子系统(如总线或类)、设备驱动和设备实例的内部状态和关联关系。
+
+### 14.2.1 `struct subsys_private`子系统的私有管理
+
+```c
+struct subsys_private {
+	struct kset subsys;             // 子系统的kset对象. 如/sys/bus/usb
+	struct kset *devices_kset;      // 子系统下所有设备的kset. /sys/bus/usb/devices
+    struct kset *drivers_kset;      // 子系统下所有驱动的kset. /sys/bus/usb/drivers
+	
+	struct klist klist_devices;     // 线程安全的设备链表. klist管理
+	struct klist klist_drivers;     // 线程安全的驱动链表. klist管理
+
+	unsigned int drivers_autoprobe:1;   // 是否自动触发驱动probe()的标志
+	struct bus_type *bus;           // 关联的总线类型. 如usb_bus_type
+
+	struct class *class;            // 关联的设备类
+};
+```
+
+### 14.2.2 `bus_register`源码分析
+
+#### 14.2.2.1 `bus_kset`创建`/sys/bus`
+
++ `buses_init`函数中，创建了名为`bus`的变量`bus_kset`. 这个操作会创建`/sys/bus`目录
+
+    ```c
+    int __init buses_init(void)
+    {
+        bus_kset = kset_create_and_add("bus", &bus_uevent_ops, NULL);
+        return 0;
+    }
+    ```
+
+#### 14.2.2.2 `bus_ktype`定义了`kset`的操作函数
+
++ 创建了`bus_ktype`变量。这个变量包含：`sysfs_ops`读写属性文件，`bus_release`释放内存
++ `bus_release`释放内存的过程：通过`kobj`找到`subsys_private`，再进一步找到`subsys_private->bus`，释放`priv`的内存
+
+    ```c
+    static ssize_t bus_attr_show(struct kobject *kobj, struct attribute *attr,
+                    char *buf)
+    {
+        struct bus_attribute *bus_attr = to_bus_attr(attr);
+        struct subsys_private *subsys_priv = to_subsys_private(kobj);
+
+        if (bus_attr->show)
+            ret = bus_attr->show(subsys_priv->bus, buf);
+    }
+
+    static ssize_t bus_attr_store(struct kobject *kobj, struct attribute *attr,
+                    const char *buf, size_t count)
+    {
+        struct bus_attribute *bus_attr = to_bus_attr(attr);
+        struct subsys_private *subsys_priv = to_subsys_private(kobj);
+
+        if (bus_attr->store)
+            ret = bus_attr->store(subsys_priv->bus, buf, count);
+    }
+
+    static const struct sysfs_ops bus_sysfs_ops = {
+        .show	= bus_attr_show,
+        .store	= bus_attr_store,
+    };
+
+    static void bus_release(struct kobject *kobj)
+    {
+        struct subsys_private *priv = container_of(kobj, typeof(*priv), subsys.kobj);
+        struct bus_type *bus = priv->bus;
+        
+        kfree(priv);
+        bus->p = NULL;
+    }
+
+    static struct kobj_type bus_ktype = {
+        .sysfs_ops	= &bus_sysfs_ops,
+        .release	= bus_release,
+    };
+    ```
+
+#### 14.2.2.3 总线注册`bus_register`函数
+
+1. 申请`subsys_private`内存. 把`priv->bus`设为`bus`, `bus->p`设为`priv`. 这使得`bus`和`priv`可以互相访问对方
+2. 设置`sysfs`目录结构. `kobj`名称设为`bus`名, `kset`设为`bus_kset`. 这个操作会创建`/sys/bus/xxx`目录，最后注册`priv->kset`
+3. `drivers_autoprobe`标志位设置为1. 当这个标志位为1时，添加设备匹配到了驱动时，就会自动执行驱动的`probe()`函数
+4. 以`priv->kset`为`parent`，创建`devices`和`drivers`两个子`kset`. 这个操作会创建`/sys/bus/xxx/devices`和`/sys/bus/xxx/drivers`两个子目录
+5. 初始化设备和驱动的`klist`链表. 这里`klist_devices_get`和`klist_devices_put`里面封装了`kobject_get/put`，会执行引用计数管理
+6. `add_probe_files`函数创建总线的属性文件：`uevent`、`drivers_probe`、`drivers_autoprobe`这3个属性文件
+    ![](./src/0023.jpg)
+    ```c
+    static BUS_ATTR(uevent, S_IWUSR, NULL, bus_uevent_store);
+    static BUS_ATTR(drivers_probe, S_IWUSR, NULL, store_drivers_probe);
+    static BUS_ATTR(drivers_autoprobe, S_IWUSR | S_IRUGO, show_drivers_autoprobe, store_drivers_autoprobe);
+
+    static int add_probe_files(struct bus_type *bus)
+    {
+        retval = bus_create_file(bus, &bus_attr_uevent);
+        retval = bus_create_file(bus, &bus_attr_drivers_probe);
+        retval = bus_create_file(bus, &bus_attr_drivers_autoprobe);
+    }
+    ```
+7. 添加自定义属性组`bus_groups`. 没有属性组时就不去创建
+
+```c
+int bus_register(struct bus_type *bus)
+{
+	int retval;
+	struct subsys_private *priv;
+
+	priv = kzalloc(sizeof(struct subsys_private), GFP_KERNEL);
+	priv->bus = bus;
+	bus->p = priv;
+
+	retval = kobject_set_name(&priv->subsys.kobj, "%s", bus->name);
+	priv->subsys.kobj.kset = bus_kset;
+	priv->subsys.kobj.ktype = &bus_ktype;
+	retval = kset_register(&priv->subsys);
+
+    priv->drivers_autoprobe = 1;
+
+	retval = bus_create_file(bus, &bus_attr_uevent);
+
+	priv->devices_kset = kset_create_and_add("devices", NULL, &priv->subsys.kobj);
+	priv->drivers_kset = kset_create_and_add("drivers", NULL, &priv->subsys.kobj);
+
+	klist_init(&priv->klist_devices, klist_devices_get, klist_devices_put);
+	klist_init(&priv->klist_drivers, NULL, NULL);
+
+	retval = add_probe_files(bus);
+
+	retval = bus_add_groups(bus, bus->bus_groups);
+
+	pr_debug("bus: '%s': registered\n", bus->name);
+	return 0;
+}
+```
+
+## 第15章 `int device_register(struct device *dev)`注册设备
+
+上一章我们注册了总线，这一章学习如何注册设备。总线和设备需要单独注册，因此我们需要2个驱动模块。
+
+### 15.1 总线驱动`bus.c`
+
+注意：由于设备驱动需要绑定`mybus`总线，而这是在2个不同的驱动模块间引用，因此需要导出`mybus`变量。操作方式如下：
+
+1. `mybus`不能用static修饰，需要用全局变量
+2. 使用`EXPORT_SYMBOL_GPL(mybus);`宏定义导出`mybus`变量
+3. 编译出来的`Module.symvers`符号表文件，内容如下
+    ```txt
+    0x2f5856e4	mybus	/home/ding/linux/imx/driver/ch7_device_model/12_bus/bus/bus	EXPORT_SYMBOL_GPL
+    ```
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/device.h>
+#include <linux/export.h>
+
+#define PROJECT_NAME    "mybus"
+#define PROJECT_VER     "V1.0"
+
+static int mybus_match(struct device *dev, struct device_driver *drv)
+{
+    printk(KERN_INFO "%s\n", __FUNCTION__);
+    return (strcmp(dev_name(dev), drv->name) == 0);
+}
+
+static int mybus_probe(struct device *dev)
+{
+    struct device_driver *drv = dev->driver;
+    printk(KERN_INFO "%s\n", __FUNCTION__);
+    if (drv->probe) {
+        return drv->probe(dev);
+    }
+    return 0;
+}
+
+struct bus_type mybus = {
+    .name   = "mybus",
+    .match  = mybus_match,
+    .probe  = mybus_probe,
+};
+EXPORT_SYMBOL_GPL(mybus);
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "%s init\n", PROJECT_NAME);
+    return bus_register(&mybus);
+}
+
+static void __exit my_exit(void)
+{
+    printk(KERN_INFO "%s exit\n", PROJECT_NAME);
+    bus_unregister(&mybus);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+### 15.2 设备驱动`device.c`
+
+注意：设备驱动要绑定`mybus`总线，而这是跨模块引用，因此要用到符号表。具体操作如下：
+
+1. 源文件`device.c`中，使用`extern`声明`mybus`变量
+    ```c
+    extern struct bus_type mybus;
+    ```
+2. `Makefile`中，使用环境变量`KBUILD_EXTRA_SYMBOLS`来指定符号文件的绝对路径。必须是绝对路径！
+    ```Makefile
+    KBUILD_EXTRA_SYMBOLS += $(PWD)/../bus/Module.symvers	# 添加符号文件
+    ```
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/device.h>
+
+#define PROJECT_NAME    "mydev"
+
+extern struct bus_type mybus;
+
+static void	mydev_release(struct device *dev)
+{
+    printk(KERN_INFO "%s release\n", PROJECT_NAME);
+}
+
+static struct device mydev = {
+    .init_name  = "mydev",
+    .bus        = &mybus,
+    .release    = mydev_release,
+};
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "%s init\n", PROJECT_NAME);
+    return device_register(&mydev);
+}
+
+static void __exit my_exit(void)
+{
+    printk(KERN_INFO "%s exit\n", PROJECT_NAME);
+    device_unregister(&mydev);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果如下：
+
+![](./src/0024.jpg)
+
+### 15.3 设备注册流程分析
+
+
+
