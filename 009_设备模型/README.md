@@ -2954,7 +2954,213 @@ MODULE_AUTHOR("ding");
 
 ![](./src/0024.jpg)
 
-### 15.3 设备注册流程分析
+### 15.3 `device_register`设备注册流程分析
 
+```c
+int device_register(struct device *dev)
+{
+	device_initialize(dev);
+	return device_add(dev);
+}
+```
 
+重点是`device_add`函数。我们继续分析：
+
+```c
+int device_add(struct device *dev)
+{
+	struct device *parent = NULL;
+	struct kobject *kobj;
+	struct class_interface *class_intf;
+	int error = -EINVAL;
+
+    // 1. 初始化子系统
+	device_private_init(dev);
+
+    // 2. 如果设备设置了init_name, 则会使用这么设备名称. 如果没有设备名但设置了总线名, 则使用总线的规则来设置设备名
+	if (dev->init_name) {
+		dev_set_name(dev, "%s", dev->init_name);
+	}
+	if (!dev_name(dev) && dev->bus && dev->bus->dev_name) {
+        dev_set_name(dev, "%s%u", dev->bus->dev_name, dev->id);
+    }
+		
+    #if 0
+    // 3. 建立设备层次关系. 设备在sysfs中的位置取决于其父设备和类属性, 函数通过get_device_parent来确定设备的父对象
+    + 无类无父设备: 挂在/sys/devices目录下
+    + 无类有父设备: 挂在父设备对应的目录下
+    + 有类无父设备: 挂在/sys/devices/virtual下对应类名的目录下
+    + 有类有父设备: 根据父设备是否属于类来决策
+    #endif
+	kobj = get_device_parent(dev, dev->parent);
+	if (kobj) {
+        dev->kobj.parent = kobj;
+    }
+	kobject_add(&dev->kobj, dev->kobj.parent, NULL);	
+
+    // 4. 为设备创建各种属性文件
+	device_create_file(dev, &dev_attr_uevent);
+	device_add_attrs(dev);
+
+    // 5. 为设备构建of_node设备节点的符号链接，以及设备到类、类到设备的符号链接
+    device_add_class_symlinks(dev);
+
+    // 6. 将设备添加到总线, 并建立设备与总线之间的双向关联
+	bus_add_device(dev);
+
+    // 7. 触发总线对设备的探测，尝试将设备与合适的驱动进行匹配​
+	bus_probe_device(dev);
+
+    // 8. 将当前设备添加到其所属类的设备链表中
+	if (dev->class) {
+		mutex_lock(&dev->class->p->mutex);
+		klist_add_tail(&dev->knode_class, &dev->class->p->klist_devices);
+		list_for_each_entry(class_intf, &dev->class->p->interfaces, node)
+			if (class_intf->add_dev)
+				class_intf->add_dev(dev, class_intf);
+		mutex_unlock(&dev->class->p->mutex);
+	}
+
+	return 0;
+}
+```
+
+下面是一些关键函数的代码分析：
+
++ `get_device_parent`获取父设备
+
+    1. 如果没有显式设置parent, 而总线bus设置了`dev_root`, 则把sysfs的parent设为`dev_root`
+    2. 如果显式设置了parent, 则把sysfs的parent设为`parent`
+
+    ```c
+    static struct kobject *get_device_parent(struct device *dev,
+					 struct device *parent)
+    {
+        if (!parent && dev->bus && dev->bus->dev_root)
+		return &dev->bus->dev_root->kobj;
+
+        if (parent)
+            return &parent->kobj;
+        return NULL;
+    }
+    ```
+
++ `device_add_class_symlinks`创建sysfs符号连接, 揭示设备在内核不同维度(物理连接、功能分类、总线驱动)之间的关键
+
+    ```c
+    static int device_add_class_symlinks(struct device *dev)
+    {
+        struct device_node *of_node = dev_of_node(dev);
+
+        // 创建of_node链接, 链接到设备树节点
+        if (of_node) {
+            sysfs_create_link(&dev->kobj, &of_node->kobj,"of_node");
+        }
+
+        // 如果设备没有关联的class, 则无需创建后续链接
+        if (!dev->class)
+            return 0;
+
+        // 创建subsystem链接, 指向设备所属class的目录
+        sysfs_create_link(&dev->kobj, &dev->class->p->subsys.kobj, "subsystem");
+
+        // 创建device链接, 指向父设备的目录
+        if (dev->parent) {
+            sysfs_create_link(&dev->kobj, &dev->parent->kobj, "device");
+        }
+
+        // 在class目录下创建指向该设备的连接, 这使得通过class能找到设备
+        sysfs_create_link(&dev->class->p->subsys.kobj, &dev->kobj, dev_name(dev));
+
+        return 0;
+    }
+    ```
+
++ `bus_add_device`将设备关联到总线的体系结构中
+
+    1. 在总线的devices目录下创建指向设备的符号链接（总线->设备）
+    2. 在设备目录下创建指向总线的subsystem符号链接（设备->总线）
+    3. 将设备添加到总线的设备链表（klist_devices）中
+
+    ```c
+    int bus_add_device(struct device *dev)
+    {
+        struct bus_type *bus = bus_get(dev->bus);
+        if (bus) {
+            sysfs_create_link(&bus->p->devices_kset->kobj, &dev->kobj, dev_name(dev));
+            sysfs_create_link(&dev->kobj, &dev->bus->p->subsys.kobj, "subsystem");
+            klist_add_tail(&dev->p->knode_bus, &bus->p->klist_devices);
+        }
+        return 0;
+    }
+    ```
+
++ `bus_probe_device` 发总线对设备的探测，尝试将设备与合适的驱动进行匹配
+
+    1. 如果bus总线的`drivers_autoprobe`变量为1, 则启动自动探测, 执行执行device_attach函数, 并返回结果
+
+        ```c
+        void bus_probe_device(struct device *dev)
+        {
+            struct bus_type *bus = dev->bus;
+            int ret;
+
+            if (bus->p->drivers_autoprobe) {
+                ret = device_attach(dev);
+                WARN_ON(ret < 0);
+            }
+        }
+        ```
+
+    2. `device_attach`函数遍历`bus`总线的`klist_drivers`节点, 挨个取出驱动程序, 执行`__device_attach(drv, dev)` . 执行成功则探测成功退出循环
+
+        ```c
+        int device_attach(struct device *dev)
+        {
+            istruct klist_iter i;
+            struct device_driver *drv;
+
+            klist_iter_init_node(&dev->bus->p->klist_drivers, &i, NULL);
+            while ((drv = next_driver(&i)) && !error)
+                error = __device_attach(drv, dev);
+            klist_iter_exit(&i);
+            return error;
+        }
+        ```
+
+    3. `__device_attach`函数先调用`bus`总线的`match`函数`drv->bus->match(dev, drv)`, 如果匹配成功则调用`probe`函数`driver_probe_device`
+    
+        ```c
+        static int __device_attach(struct device_driver *drv, void *dev)
+        {
+            if (!drv->bus->match(dev, drv))
+                return 0;
+            return driver_probe_device(drv, dev);
+        }
+        ```
+
+    4. `driver_probe_device`函数, 执行总线`bus`或驱动`drv`的`probe`函数, 然后绑定驱动和设备
+
+        ```c
+        int driver_probe_device(struct device_driver *drv, struct device *dev)
+        {
+            int ret = 0;
+
+            if (dev->bus->probe) {
+                ret = dev->bus->probe(dev);
+            } 
+            else if (drv->probe) {
+                ret = drv->probe(dev);
+            }
+            driver_bound(dev);
+
+            return ret;
+        }
+        ```
+
+以上就是`device_add`添加设备的流程。关键过程总结一下：
+
+1. 建立`sysfs`层次关系
+2. 建立设备、驱动、类的symlink符号链接
+3. 触发总线自动探测设备. 先执行match再执行驱动的probe函数
 
