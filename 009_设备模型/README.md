@@ -3164,3 +3164,331 @@ int device_add(struct device *dev)
 2. 建立设备、驱动、类的symlink符号链接
 3. 触发总线自动探测设备. 先执行match再执行驱动的probe函数
 
+### 15.4 `platform_device_register`设备注册流程分析
+
+#### 15.4.1 源码分析
+
+```c
+int platform_device_register(struct platform_device *pdev)
+{
+	device_initialize(&pdev->dev);
+	return platform_device_add(pdev);
+}
+```
+
+我们主要来分析`platform_device_add`这个函数。如下：
+
+```c
+int platform_device_add(struct platform_device *pdev)
+{
+	int i, ret;
+
+    // 1. 如果没有设置父设备, 则把父设备设为platform_bus
+	if (!pdev->dev.parent)
+		pdev->dev.parent = &platform_bus;
+
+    // 2. 把设备关键的总线, 设为platform_bus_type
+	pdev->dev.bus = &platform_bus_type;
+
+    #if 0
+    // 3. 根据name和id, 设置device设备名
+    // 如果platform_device的id为-1, 则设备名为%s(如led)
+    // 如果platform_device的id为0、1、2..., 则设备名为%s%d(如i2c0 i2c1 i2c2...)
+    // 如果platform_device的id为-2, 则设备名为%s.%s.auto
+    #endif
+	switch (pdev->id) {
+	default:
+		dev_set_name(&pdev->dev, "%s.%d", pdev->name,  pdev->id);
+		break;
+	case -1:
+		dev_set_name(&pdev->dev, "%s", pdev->name);
+		break;
+	case -2:
+		dev_set_name(&pdev->dev, "%s.%d.auto", pdev->name, pdev->id);
+		break;
+	}
+
+    // 4. 添加resource资源。如果设置了parent则先进行检查, 如地址是否越界.
+    // MEM资源都添加到iomem_resource中, IO资源都添加到ioport_resource中
+	for (i = 0; i < pdev->num_resources; i++) {
+		struct resource *p, *r = &pdev->resource[i];
+		p = r->parent;
+		if (!p) {
+			if (resource_type(r) == IORESOURCE_MEM)
+				p = &iomem_resource;
+			else if (resource_type(r) == IORESOURCE_IO)
+				p = &ioport_resource;
+		}
+
+		if (p && insert_resource(p, r)) {
+			dev_err(&pdev->dev, "failed to claim resource %d\n", i);
+			ret = -EBUSY;
+			goto failed;
+		}
+	}
+
+    // 5. 调用device_add注册设备
+	ret = device_add(&pdev->dev);
+	return ret;
+}
+```
+
+#### 15.4.2 设计思路
+
+`platform_bus`设备和`platform_bus_type`总线, 在内核启动的早期调用platform_bus_init注册。这是Linux设备驱动模型中至关重要的一步，只要用于管理那些不直接依附于物理总线(如I2C、SPI、PCI、USB)的片上系统(SoC)设备和其他平台设备。
+
+```c
+struct device platform_bus = {
+    .init_name	= "platform",
+};
+
+struct bus_type platform_bus_type = {
+    .name		= "platform",
+    .match		= platform_match,
+};
+
+static int platform_match(struct device *dev, struct device_driver *drv)
+{
+    struct platform_device *pdev = to_platform_device(dev);
+    struct platform_driver *pdrv = to_platform_driver(drv);
+
+    // 1. 设备树匹配
+    if (of_driver_match_device(dev, drv))
+        return 1;
+
+    // 2. 设备名和驱动的id_table匹配
+    if (pdrv->id_table)
+        return platform_match_id(pdrv->id_table, pdev) != NULL;
+
+    // 3. 设备名和驱动名匹配
+    return (strcmp(pdev->name, drv->name) == 0);
+}
+
+int __init platform_bus_init(void)
+{
+    device_register(&platform_bus);
+
+    bus_register(&platform_bus_type);
+}
+```
+
+`platform_bus_init`的设计思路：
+
+1. 先创建平台设备(`platform_bus`): 在sysfs中建立`/sys/devices/platform`目录, 所有平台设备都将以此设备为父设备, 形成层次结构
+2. 再注册平台总线类型(`platform_bus_type`): 在sysfs中建立`/sys/bus/platform`目录, 并注册总线的匹配函数`match`, 为后续设备和驱动的注册和匹配做好准备
+
+## 第16章 `int driver_register(struct device_driver *drv)`注册驱动
+
+前面几章我们注册了自己的`bus`总线和`device`设备，本章来学习注册自己的驱动。我们在前面的源码分析中提到，注册设备时最终会调用到`autoprobe`探测设备。过程如下：
+
+1. 先调用`bus`总线的`match`匹配函数：设备名称和驱动名称一致则算匹配成功
+
+    ```c
+    static int mybus_match(struct device *dev, struct device_driver *drv)
+    {
+        return (strcmp(dev_name(dev), drv->name) == 0);
+    }
+    ```
+
+2. 匹配成功时，如果总线有`probe`则调用总线`probe`，否则调用驱动的`prove`
+
+    ```c
+    static int mybus_probe(struct device *dev)
+    {
+        struct device_driver *drv = dev->driver;
+        if (drv->probe) {
+            return drv->probe(dev);
+        }
+        return 0;
+    }
+    ```
+
+### 16.1 `driver_register`注册驱动实验
+
+为了让设备和驱动能够匹配成功，我们这里把驱动的名称也设成`mydev`，跟设备保持一致。
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/kobject.h>
+#include <linux/sysfs.h>
+#include <linux/device.h>
+
+#define PROJECT_NAME    "mydrv"
+
+extern struct bus_type mybus;
+
+static int mydrv_probe(struct device *dev)
+{
+    printk(KERN_INFO "%s probe\n", PROJECT_NAME);
+    return 0;
+}
+
+static int mydrv_remove(struct device *dev)
+{
+    printk(KERN_INFO "%s remove\n", PROJECT_NAME);
+    return 0;
+}
+
+static struct device_driver mydrv = {
+    .name   = "mydev",  // 跟设备名保持一致
+    .bus    = &mybus,
+    .probe  = mydrv_probe,
+    .remove = mydrv_remove
+};
+
+static int __init my_init(void)
+{
+    printk(KERN_INFO "%s init\n", PROJECT_NAME);
+    return driver_register(&mydrv);
+}
+
+static void __exit my_exit(void)
+{
+    printk(KERN_INFO "%s exit\n", PROJECT_NAME);
+    driver_unregister(&mydrv);
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果：
+
+![](./src/0025.jpg)
+
+### 16.2 `driver_register`源码分析
+
+驱动注册源码分析的关键步骤，过程如下：
+
+1. 总线检查：确保驱动要注册的总线本身已经初始化完成。这是驱动注册的前提
+2. 冲突检查：这是一个历史遗留的警告。在早期的驱动设计中，一些总线操作(如probe、remove)可能会同时存在于总线类型和驱动中。此检查旨在提醒开发者更新旧的驱动代码
+3. 唯一性检查：通过`driver_find`函数在指定总线的驱动链表中查找是否已有同名的驱动被注册。`driver_find`内部会调用`kset_find_obj`在总线对应的`drivers_kset(驱动集合)`中遍历查找，已确保驱动名称的唯一性。如果找到，则返回`-EBUSY`错误
+4. 核心注册`bus_add_driver`：这是最复杂也是最关键的一步，他完成了驱动注册的实质性工作
+
+```c
+int driver_register(struct device_driver *drv)
+{
+	int ret;
+	struct device_driver *other;
+
+    // 1. 总线检查
+    BUG_ON(!drv->bus->p);
+
+    // 2. 如果总线和驱动同时定义了probe、remove、shutdown, 则打印冲突日志
+	if ((drv->bus->probe && drv->probe) ||
+	    (drv->bus->remove && drv->remove) ||
+	    (drv->bus->shutdown && drv->shutdown))
+		printk(KERN_WARNING "Driver '%s' needs updating - please use "
+			"bus_type methods\n", drv->name);
+
+    // 3. 检查总线下是否已注册同名驱动
+    other = driver_find(drv->name, drv->bus);
+	if (other) {
+		printk(KERN_ERR "Error: Driver '%s' is already registered, "
+			"aborting...\n", drv->name);
+		return -EBUSY;
+	}
+
+    // 4. 核心操作: 将驱动添加到总线
+	ret = bus_add_driver(drv);
+
+	return ret;
+}
+```
+
+我们来分析一下`bus_add_driver`这个核心函数。
+
+```c
+int bus_add_driver(struct device_driver *drv)
+{
+	struct bus_type *bus;
+	struct driver_private *priv;
+	int error = 0;
+
+    // 1. 分配并初始化驱动的私有数据结构
+	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+
+    // 2. 初始化驱动私有数据中的设备链表和节点
+	klist_init(&priv->klist_devices, NULL, NULL);
+	priv->driver = drv; // 关联驱动
+	drv->p = priv;      // 驱动关联私有数据
+	priv->kobj.kset = bus->p->drivers_kset; // 设置私有数据中kobject所属的集合kset, 为总线下的driver_kset
+	error = kobject_init_and_add(&priv->kobj, &driver_ktype, NULL, "%s", drv->name);    // 初始化并添加驱动的kobject到sysfs
+
+    // 3. 将驱动添加到总线的驱动列表中
+	klist_add_tail(&priv->knode_bus, &bus->p->klist_drivers);
+
+    // 4. 核心: 尝试驱动与设备的匹配(如果总线允许自动探测)
+	if (drv->bus->p->drivers_autoprobe) {
+		driver_attach(drv);
+	}
+
+	return 0;
+}
+```
+
+1. `sysfs`集成`kobject_init_and_add`: 该函数会在`/sys/bus/<bus-name>/drivers/`目录下创建一个与驱动同名的子目录. 他同时指定了该`kobject`的类型为`driver_ktype`，这定义了驱动目录在sysfs中的默认文件操作
+2. 驱动-设备匹配`device_attach`: 这是最关键的步骤！如果总线的`drivers_autoprobe`标志为真，就会调用`driver_attach`
+3. `driver_attach`函数，他会遍历总线上的所有设备，对每个设备调用`__driver_attach`函数
+4. 用总线的`match`函数尝试匹配每个设备，如果`match`匹配成功，则调用`driver_probe_device`函数
+
+    ```c
+    int driver_attach(struct device_driver *drv)
+    {
+        return bus_for_each_dev(drv->bus, NULL, drv, __driver_attach);
+    }
+
+    int bus_for_each_dev(struct bus_type *bus, struct device *start, void *drv, __driver_attach)
+    {
+        struct klist_iter i;
+        struct device *dev;
+
+        klist_iter_init_node(&bus->p->klist_devices, &i, (start ? &start->p->knode_bus : NULL));
+        while ((dev = next_device(&i)) && !error)
+            error = __driver_attach(dev, drv);
+        klist_iter_exit(&i);
+        return error;
+    }
+
+    static int __driver_attach(struct device *dev, void *drv)
+    {
+        if (true == driver_match_device(drv, dev)) {
+            driver_probe_device(drv, dev);
+        }
+    }
+    ```
+
+最后一个关键点。我们再看下`driver_probe_device`函数做了些什么
+
+```c
+int driver_probe_device(struct device_driver *drv, struct device *dev)
+{
+	really_probe(dev, drv);
+}
+
+static int really_probe(struct device *dev, struct device_driver *drv)
+{
+    // 1. 设备绑定对应的驱动
+	dev->driver = drv;
+
+    // 2. 创建sysfs层次结构
+	driver_sysfs_add(dev);
+
+    // 3. 优先执行总线的probe函数, 否则执行驱动的probe函数
+	if (dev->bus->probe) {
+		ret = dev->bus->probe(dev);
+	}
+    else if (drv->probe) {
+		ret = drv->probe(dev);
+	}
+}
+```
+
+创建的`sysfs`软链接目录层次结构如下所示：
+
+![](./src/0026.jpg)
