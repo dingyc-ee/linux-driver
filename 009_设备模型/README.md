@@ -3492,3 +3492,43 @@ static int really_probe(struct device *dev, struct device_driver *drv)
 创建的`sysfs`软链接目录层次结构如下所示：
 
 ![](./src/0026.jpg)
+
+### 16.3 `__platform_driver_register`源码分析
+
+```c
+int __platform_driver_register(struct platform_driver *drv, struct module *owner)
+{
+	drv->driver.owner = owner;
+	drv->driver.bus = &platform_bus_type;
+
+    // 设置统一的probe remove shutdown函数. 这些统一函数里面再调用platform驱动的函数
+	if (drv->probe)
+		drv->driver.probe = platform_drv_probe;
+	if (drv->remove)
+		drv->driver.remove = platform_drv_remove;
+	if (drv->shutdown)
+		drv->driver.shutdown = platform_drv_shutdown;
+
+	return driver_register(&drv->driver);
+}
+```
+
+设置统一的probe remove shutdown函数. 这些统一函数里面再调用platform驱动的函数。以`probe`为例我们看下实现：
+
+```c
+static int platform_drv_probe(struct device *_dev)
+{
+	struct platform_driver *drv = to_platform_driver(_dev->driver);
+	struct platform_device *dev = to_platform_device(_dev);
+	int ret;
+
+    // 设置默认的的时钟
+	ret = of_clk_set_defaults(_dev->of_node, false);
+
+    // 调用platform_driver的probe函数
+    ret = drv->probe(dev);
+
+	return ret;
+}
+```
+
