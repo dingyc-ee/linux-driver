@@ -3531,4 +3531,3 @@ static int platform_drv_probe(struct device *_dev)
 	return ret;
 }
 ```
-
