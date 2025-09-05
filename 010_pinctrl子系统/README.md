@@ -372,7 +372,7 @@ struct pinctrl_desc {
 };
 ```
 
-+ `name`: 引脚控制器的名称，用于标识控制器的唯一性。通常在调试和sysfs中显示
++ `name`: 引脚控制器的名称，用于标识控制器的唯一性。通常在调试和`sysfs`中显示
     + 以`imx6ull`为例，设备树中的设备节点名为`iomuxc@020e0000`
         ```dts
         iomuxc@020e0000 {   // 节点名: iomuxc@020e0000
@@ -388,31 +388,10 @@ struct pinctrl_desc {
     struct pinctrl_pin_desc {
         unsigned number;    // 引脚的编号(索引)
         const char *name;   // 引脚的名称(字符串标识)
-        void *drv_data;     // 可选的驱动私有数据
     };
     ```
     + 以`imx6ull`为例，在`pinctrl-imx6ul.c`中定义了一个庞大的`imx6ul_pinctrl_pads`数组。并使用`IMX_PINCTRL_PIN`宏来初始化每个引脚描述符，将芯片手册中的引脚编号与人类可读的名称关联起来
-        ```c
-        enum imx6ul_pads {
-            // ...
-            MX6UL_PAD_GPIO1_IO00 = 23,
-            MX6UL_PAD_GPIO1_IO01 = 24,
-            MX6UL_PAD_GPIO1_IO02 = 25,
-            // ...
-            MX6UL_PAD_UART1_TX_DATA = 33,
-            MX6UL_PAD_UART1_RX_DATA = 34,
-        };
-
-        static const struct pinctrl_pin_desc imx6ul_pinctrl_pads[] = {
-            // ...
-            IMX_PINCTRL_PIN(MX6UL_PAD_GPIO1_IO00),
-            IMX_PINCTRL_PIN(MX6UL_PAD_GPIO1_IO01),
-            IMX_PINCTRL_PIN(MX6UL_PAD_GPIO1_IO02),
-            // ...
-            IMX_PINCTRL_PIN(MX6UL_PAD_UART1_TX_DATA),
-            IMX_PINCTRL_PIN(MX6UL_PAD_UART1_RX_DATA),
-        };
-        ```
+        ![](./src/0003.jpg)
 
 + `pctlops`: 该结构体包含了用于`管理引脚组`的操作函数。`引脚组`是将多个在逻辑上相关的引脚(如一个UART的所有引脚)组合在一起，方便统一配置
     1. `get_groups_count`: 获取该引脚控制器支持的`引脚组总数`。在imx6ull的驱动中，此函数会返回解析的设备树中，iomuxc下引脚组`xxx_grp`的个数。下面的设备树中，有2个group: i2c1grp、uart1grp。所以返回2
@@ -440,7 +419,7 @@ struct pinctrl_desc {
             };
         };
         ```
-    2. `get_group_name`: 给定索引`selector`，夺取对应引脚组的名称`xxx_grp`。上面的设备树中，`selector=0`返回`i2c1grp`，`selector=1`返回`uart1grp`
+    2. `get_group_name`: 给定索引`selector`，获取对应引脚组的名称`xxx_grp`。上面的设备树中，`selector=0`返回`i2c1grp`，`selector=1`返回`uart1grp`
     3. `get_group_pins`: 给定索引`selector`，获取该引脚组所包含的所有引脚的编号和引脚数量
 
 + `pinmux_ops`: 该结构体定义了SoC中的`引脚功能复用`
@@ -478,4 +457,118 @@ struct pinctrl_desc {
 + `pinconf_ops`: 该结构体定义了*配置引脚电气属性*的操作函数集。这些函数负责控制引脚的硬件属性，如上拉/下拉电阻、驱动强度等。与`pinmux_ops`(负责功能复用)相辅相成，`pinconf_ops`确保了引脚在物理层面的正确行为
     1. `pin_config_get`: 获取单个引脚的当前配置，返回电气属性的寄存器值
     2. `pin_config_set`: 设置单个引脚的电气属性值。这是最常用的函数，把配置值写于pad控制寄存器
+
+### 3.3 `imx_pinctrl_probe`源码分析
+
+我们从设备树开始，一步步分析`pinctrl`子系统是怎么跑起来的。
+
+#### 3.3.1 设备树定义了`compatible = "fsl,imx6ul-iomuxc"`，用来匹配驱动
+
+```dts
+iomuxc@020e0000 {
+    compatible = "fsl,imx6ul-iomuxc";   // compatible属性，用来匹配platform驱动pinctrl-imx6ul.c
+    reg = <0x20e0000 0x4000>;           // iomuxc硬件的寄存器地址
+
+    imx6ul-evk {    // function节点
+        i2c1grp {       // group节点
+            fsl,pins = <0xb4 0x340 0x5a4 0x2 0x1 0x4001b8b0 0xb8 0x344 0x5a8 0x2 0x2 0x4001b8b0>;
+            linux,phandle = <0x2b>;
+            phandle = <0x2b>;
+        };
+
+        uart1grp {      // group节点
+            fsl,pins = <0x84 0x310 0x0 0x0 0x0 0x1b0b1 0x88 0x314 0x624 0x0 0x3 0x1b0b1>;
+            linux,phandle = <0x8>;
+            phandle = <0x8>;
+        };
+    };
+};
+```
+
+#### 3.3.2 `platform`驱动`pinctrl-imx6ul.c`匹配`iomuxc`设备
+
+我们前面提到，在`pinctrl-imx6ul.c`中定义了一个庞大的`imx6ul_pinctrl_pads`数组，用来描述该控制器管理的所有物理引脚。就是下面这样，这个表跟芯片手册的`MUX`意义对应。
+
+```c
+static const struct pinctrl_pin_desc imx6ul_pinctrl_pads[] = {
+    // ...
+	IMX_PINCTRL_PIN(MX6UL_PAD_JTAG_MOD),
+	IMX_PINCTRL_PIN(MX6UL_PAD_JTAG_TMS),
+	IMX_PINCTRL_PIN(MX6UL_PAD_JTAG_TDO),
+	IMX_PINCTRL_PIN(MX6UL_PAD_JTAG_TDI),
+	IMX_PINCTRL_PIN(MX6UL_PAD_JTAG_TCK),
+	IMX_PINCTRL_PIN(MX6UL_PAD_JTAG_TRST_B),
+	IMX_PINCTRL_PIN(MX6UL_PAD_GPIO1_IO00),
+	IMX_PINCTRL_PIN(MX6UL_PAD_GPIO1_IO01),
+	IMX_PINCTRL_PIN(MX6UL_PAD_GPIO1_IO02),
+	IMX_PINCTRL_PIN(MX6UL_PAD_UART1_TX_DATA),
+	IMX_PINCTRL_PIN(MX6UL_PAD_UART1_RX_DATA),
+};
+```
+
+NXP为了适配i.MX系列芯片的特定需求和功能，对`struct pinctrl_pin_desc`又进行了一次封装。如下所示：
+
+```c
+struct imx_pinctrl_soc_info {
+	struct device *dev;
+	const struct pinctrl_pin_desc *pins;    // 指向imx6ul_pinctrl_pads数组，封装了iomuxc能管理的所有物理引脚
+	unsigned int npins;                     // imx6ul_pinctrl_pads数组元素的个数，即iomuxc管理的引脚数
+	struct imx_pin_reg *pin_regs;
+	struct imx_pin_group *groups;
+	unsigned int ngroups;
+	struct imx_pmx_func *functions;
+	unsigned int nfunctions;
+};
+```
+
+当驱动代码`pinctrl-imx6ul.c`根据`compatible = "fsl,imx6ul-iomuxc"`匹配到设备节点后，就去执行`imx6ul_pinctrl_probe`函数。
+
+```c
+static struct platform_driver imx6ul_pinctrl_driver = {
+	.driver = {
+		.name = "imx6ul-pinctrl",
+		.of_match_table = {
+            .compatible = "fsl,imx6ul-iomuxc",
+            .data = &imx6ul_pinctrl_info,
+        },
+	},
+	.probe = imx6ul_pinctrl_probe,
+};
+
+static int __init imx6ul_pinctrl_init(void)
+{
+	return platform_driver_register(&imx6ul_pinctrl_driver);
+}
+```
+
+`imx6ul_pinctrl_probe`函数，这里继续调用了`imx_pinctrl_probe`函数，这是imx系列的通用探测函数。然后还传入了我们封装的`struct imx_pinctrl_soc_info`结构体，这个结构体初始值只有2个参数：imx6ul_pinctrl_pads(引脚数组)、引脚数组个数。
+
+```c
+static struct imx_pinctrl_soc_info imx6ul_pinctrl_info = {
+	.pins = imx6ul_pinctrl_pads,
+	.npins = ARRAY_SIZE(imx6ul_pinctrl_pads),
+};
+
+static int imx6ul_pinctrl_probe(struct platform_device *pdev)
+{
+	return imx_pinctrl_probe(pdev, &imx6ul_pinctrl_info);
+}
+```
+
+#### 3.3.3 `imx_pinctrl_probe`函数一阶段：根据`iomuxc`设备节点，填充`imx6ul_pinctrl_info`结构体
+
+现在先不关心如何注册`pinctrl`。上一节说到，`imx6ul_pinctrl_info`这个结构体初始只有2个参数：`pins`、`npins`。当前一阶段要做的事情是，根据`iomuxc`设备节点，继续填充`imx6ul_pinctrl_info`结构体。
+
+我们要向`imx6ul_pinctrl_info`中填充的内容包括：
+
+1. `struct device`设备
+2. `function`节点个数
+3. 指向`function`结构体数组的指针。因为可能有多个`function`节点，每个节点信息都保存到结构体中，形成数组
+4. `group`节点个数。设备树可能有多个`function`节点，每个节点又有多个`group`节点。这里的`group`个数，指的是全部`function`下的`group`之和
+5. 指向`group`结构体数组的指针。因为我们必然是有多个`group`节点，那就需要数组了
+
+```c
+
+```
+
 
