@@ -735,4 +735,44 @@ static int imx_pinctrl_parse_functions(struct device_node *np/* function设备�
 
 ### 3.6 `imx_pinctrl_parse_groups`解析`groups`节点
 
+我们前面已经解析了`function`节点，现在要解析`group`节点，如下所示。
+
+```c
+static int imx_pinctrl_parse_functions(struct device_node *np/* function设备节点 */, 
+                                       struct imx_pinctrl_soc_info *info, 
+                                       u32 index/*function节点的索引*/)
+{
+    struct device_node *child;
+	struct imx_pmx_func *func;
+	struct imx_pin_group *grp;
+	u32 i = 0;
+
+    for_each_child_of_node(np, child) {
+		func->groups[i] = child->name;
+		grp = &info->groups[info->grp_index++];
+        // 解析group节点。child就是group的设备节点，grp就是group的结构体
+		imx_pinctrl_parse_groups(child, grp, info, i++);
+	}
+
+    return 0;
+}
+```
+
+在直接分析源码之前，我们先来看下每个`group`节点下有哪些内容。这也就是我们接下来代码要解析的
+
+```c
+struct imx_pin_group {
+	const char *name;
+	unsigned npins;
+	unsigned int *pin_ids;
+	struct imx_pin *pins;
+};
+```
+
+1. `const char *name`: `group`节点名
+2. `unsigned npins`: `group`节点下`pin`的个数
+3. `unsigned int pin_ids[]`: `pin id`数组。因为我们一个`group`下有很多pin
+
+![](./src/0009.jpg)
+
 
