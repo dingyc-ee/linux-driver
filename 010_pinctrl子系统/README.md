@@ -566,9 +566,173 @@ static int imx6ul_pinctrl_probe(struct platform_device *pdev)
 3. 指向`function`结构体数组的指针。因为可能有多个`function`节点，每个节点信息都保存到结构体中，形成数组
 4. `group`节点个数。设备树可能有多个`function`节点，每个节点又有多个`group`节点。这里的`group`个数，指的是全部`function`下的`group`之和
 5. 指向`group`结构体数组的指针。因为我们必然是有多个`group`节点，那就需要数组了
+6. 指向`imx_pin_reg`结构体数组的指针。设备树中的每个pin都有`mux`和`pad`寄存器，`imx_pin_reg`数组的每个成员，就保存对应`pin`的这两个物理寄存器
 
 ```c
+int imx_pinctrl_probe(struct platform_device *pdev, struct imx_pinctrl_soc_info *info)
+{
+	struct device_node *dev_np = pdev->dev.of_node;
+	struct resource *res;
+	int ret, i;
 
+    // 1. 填充device结构体
+	info->dev = &pdev->dev;
+
+#if 0
+    // 2. 保存每个物理引脚的
+    // 前面我们不是定义了imx6ul_pinctrl_pads数组嘛，用来保存iomuxc控制器能够管理的所有物理引脚
+    // pin_regs是一个数组，每个数组包含mux_reg和conf_reg两个寄存器，用来保存设备树中设置的引脚的寄存器
+#endif
+	info->pin_regs = devm_kmalloc(&pdev->dev, sizeof(*info->pin_regs) * info->npins, GFP_KERNEL);
+	for (i = 0; i < info->npins; i++) {
+		info->pin_regs[i].mux_reg = -1;
+		info->pin_regs[i].conf_reg = -1;
+	}
+
+    // 3. 读取设备节点的第0个资源。这是什么？这是寄存器映射，reg = <0x20e0000 0x4000> 然后ioremap映射内存
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	ipctl->base = devm_ioremap_resource(&pdev->dev, res);
+
+    // 4. 解析设备节点，继续填充imx6ul_pinctrl_info结构体。这是个关键函数，我们下一节重点分析
+	ret = imx_pinctrl_probe_dt(pdev, info);
+	
+	dev_info(&pdev->dev, "initialized IMX pinctrl driver\n");
+
+    // 注册pinctrl子系统。先不管，在下一节再分析
+    pinctrl_register(imx_pinctrl_desc, &pdev->dev, ipctl);
+
+	return 0;
+}
 ```
+
+看起来可能还是有点抽象。我们结合实际的代码来看看：
+
+1. 为什么`imx6ul_pinctrl_pads数组`前面预留了17个元素？因为`iomuxc`寄存器的起始地址为0x44(68)，`68/4=17`，所以预留了17个元素。这样做的好处是，我们可以直接根据`寄存器地址 / 4 = 数组索引`。此时寄存器地址和`pin`的引脚是一一对应的
+
+![](./src/0004.jpg)
+
+2. `imx6ul_pinctrl_pads`数组中定义了数组的`pin`索引，这个索引值跟`iomuxc`寄存器的偏移地址一一对应。我们定义了`info->pin_regs`数组，数组的元素索引就是imx6ul_pinctrl_pads，数组的值就是对应的`mux`和`config`寄存器值
+
+![](./src/0005.jpg)
+
+3. 获取`iomuxc`的第0个资源，即外设的寄存器地址范围。`ioremap`映射这段地址，接下来就能访问`mux`和`config`寄存器了
+
+![](./src/0006.jpg)
+
+接下来是调用`imx_pinctrl_probe_dt(pdev, info)`解析`iomuxc`设备节点，继续填充`info`结构体，我们来分析源码。
+
+### 3.4 `imx_pinctrl_probe_dt(pdev"iomuxc设备节点", info"imx")`源码分析
+
+```c
+static int imx_pinctrl_probe_dt(struct platform_device *pdev, struct imx_pinctrl_soc_info *info)
+{
+	struct device_node *np = pdev->dev.of_node;
+	struct device_node *child;
+	u32 nfuncs = 0;
+	u32 i = 0;
+
+	nfuncs = of_get_child_count(np);
+	if (nfuncs <= 0) {
+		dev_err(&pdev->dev, "no functions defined\n");
+		return -EINVAL;
+	}
+
+	info->nfunctions = nfuncs;
+	info->functions = devm_kzalloc(&pdev->dev, nfuncs * sizeof(struct imx_pmx_func), GFP_KERNEL);
+
+	info->ngroups = 0;
+	for_each_child_of_node(np, child)
+		info->ngroups += of_get_child_count(child);
+	info->groups = devm_kzalloc(&pdev->dev, info->ngroups * sizeof(struct imx_pin_group), GFP_KERNEL);
+	if (!info->groups)
+		return -ENOMEM;
+
+	for_each_child_of_node(np, child)
+		imx_pinctrl_parse_functions(child, info, i++);
+
+	return 0;
+}
+```
+
+这个函数做的事情如下：
+1. 获取`iomuxc`设备节点下的`function`节点个数
+2. 给`function`节点申请内存
+3. 遍历所有的`function`节点，获取每个`function`节点下面的`group`节点个数
+4. 给`group`节点申请内存
+
+![](./src/0007.jpg)
+
+最后，遍历每个`function`节点，解析这些`function`节点，并更新`info`结构体。
+
+### 3.5 `imx_pinctrl_parse_functions`解析`function`节点
+
+前面提到，我们已经获取了`function`节点的个数，并申请了内存。最后，遍历每个`function`节点，调用`imx_pinctrl_parse_functions`来解析`function`节点，并把解析结果保存到`info`结构体中。
+
+```c
+static int imx_pinctrl_probe_dt(struct platform_device *pdev, struct imx_pinctrl_soc_info *info)
+{
+	struct device_node *np = pdev->dev.of_node;
+	struct device_node *child;
+
+	for_each_child_of_node(np, child)
+		imx_pinctrl_parse_functions(child, info, i++);
+
+	return 0;
+}
+```
+
+在真正分析`解析function节点`的源代码之前，我们先think一下，我们要解析哪些东西呢？
+
+如下面的设备树。设备树的`function`节点，有以下内容：
+
+1. `const char *name`: `function`节点名
+2. `const char **groups`: 二级指针(字符串指针数组)。保存每个`group`节点的名称
+3. `unsigned num_groups`: `group`节点的个数
+
+![](./src/0008.jpg)
+
+现在我们已经知道了，`解析function节点`要做的工作。OK 现在看下具体的源码实现：
+
+```c
+static int imx_pinctrl_parse_functions(struct device_node *np/* function设备节点 */, 
+                                       struct imx_pinctrl_soc_info *info, 
+                                       u32 index/*function节点的索引*/)
+{
+	struct device_node *child;
+	struct imx_pmx_func *func;
+	struct imx_pin_group *grp;
+	u32 i = 0;
+
+#if 0
+    1. func结构体的name，就是function设备节点的名称
+    // func结构体的num_groups，就是function设备节点的子节点(group)个数
+    // 如果function节点没有子节点，直接报错
+#endif
+	func = &info->functions[index];
+	func->name = np->name;
+	func->num_groups = of_get_child_count(np);
+	if (func->num_groups == 0) {
+		dev_err(info->dev, "no groups defined in %s\n", np->full_name);
+		return -EINVAL;
+	}
+
+    // 2. 申请指针数组(二级指针) ，数组大小为num_groups，用来保存每个group节点的名称
+	func->groups = devm_kzalloc(info->dev, func->num_groups * sizeof(char *), GFP_KERNEL);
+
+    // 3. 遍历function节点下的group子节点
+	for_each_child_of_node(np, child) {
+        // 4. 保存每个group子节点的名称
+		func->groups[i] = child->name;
+
+        // 5. 调用imx_pinctrl_parse_groups，解析group子节点
+		grp = &info->groups[info->grp_index++];
+		imx_pinctrl_parse_groups(child, grp, info, i++);
+	}
+
+	return 0;
+}
+```
+
+### 3.6 `imx_pinctrl_parse_groups`解析`groups`节点
 
 
