@@ -771,8 +771,961 @@ struct imx_pin_group {
 
 1. `const char *name`: `group`节点名
 2. `unsigned npins`: `group`节点下`pin`的个数
-3. `unsigned int pin_ids[]`: `pin id`数组。因为我们一个`group`下有很多pin
+3. `unsigned int pin_ids[]`: `pin id`数组。因为我们一个`group`下有很多pin，这个数组用来记录每个`pin`的id，这个id可以通过`mux`寄存及计算得到，跟`imx6ul_pinctrl_pads数组`一一对应
+4. `struct imx_pin *pins`: `pin 寄存器和值`数组。`input_reg mux_mode input_val conf_val`这些值，要从设备树里取出来放到`pins`数组中
+    ```c
+    struct imx_pin {
+        unsigned int pin;
+        unsigned int mux_mode;
+        u16 input_reg;
+        unsigned int input_val;
+        unsigned long config;
+    };
+    ```
 
 ![](./src/0009.jpg)
 
+OK. 现在我们来看下源码，具体是怎么解析`group`节点的。
 
+![](./src/0010.jpg)
+
+![](./src/0011.jpg)
+
+到这里为止，我们已经把`imx`解析`iomuxc`设备树节点，包括`function`和`group`节点，全部分析完成了。
+
+设备节点解析完成后，`imx_pinctrl_probe`函数继续调用`pinctrl_register`，来注册`pinctrl`子系统，我们后面继续分析。
+
+```c
+int imx_pinctrl_probe(struct platform_device *pdev, struct imx_pinctrl_soc_info *info)
+{
+    struct imx_pinctrl *ipctl;
+	struct resource *res;
+	struct pinctrl_desc *imx_pinctrl_desc;
+
+    imx_pinctrl_probe_dt(pdev, info);   // 前面分析的代码，解析设备树节点
+
+    // 填充pinctrl_dest静态描述符
+    imx_pinctrl_desc->name = dev_name(&pdev->dev);
+	imx_pinctrl_desc->pins = info->pins;
+	imx_pinctrl_desc->npins = info->npins;
+	imx_pinctrl_desc->pctlops = &imx_pctrl_ops;
+	imx_pinctrl_desc->pmxops = &imx_pmx_ops;
+	imx_pinctrl_desc->confops = &imx_pinconf_ops;
+	imx_pinctrl_desc->owner = THIS_MODULE;
+
+    // ipctl是要设置给驱动使用的私有数据
+    ipctl->base = devm_ioremap_resource(&pdev->dev, res);
+    ipctl->info = info;
+	ipctl->dev  = info->dev;
+	platform_set_drvdata(pdev, ipctl);
+
+    // 注册pinctrl子系统
+    ipctl->pctl = pinctrl_register(imx_pinctrl_desc, &pdev->dev, ipctl);
+}
+```
+
+### 3.7 `pinctrl`子系统操作函数集
+
+前面我们对`pinctrl`的`probe`函数进行了讲解，probe函数的实际作用就是，注册并启用`pinctrl`设备。`pinctrl`设备由`pinctrl_desc`结构体描述，所以在`probe`函数中会对`pinctrl_desc`结构体中的内容进行填充。
+
+#### 3.7.1 `function`和`group`
+
+在`pinctrl`子系统中，有两个关键概念：引脚组(group)和功能(function)，在介绍`pinctrl`子系统函数操作集之前，首先对`function`和`group`进行讲解。
+
+引脚组(`group`): 是一组具有相似功能、约束条件或共同工作的引脚的集合。每个引脚组通常与特定的硬件功能或外设相关联。例如：一个引脚组可以用于控制穿行通信接口(如UART或SPI)，另一个引脚组可以用于驱动GPIO。
+
+功能(`function`): 定义了芯片上具有外设功能的功能。每个功能节点对应与一个或多个IO组(`group`)的配置信息。这些功能可以是串口、SPI、I2C等外设功能。
+
+#### 3.7.2 函数操作集结构体讲解
+
+在`pinctrl_desc`结构体中，总共有3个函数操作集。具体内容如下所示：
+
+```c
+const struct pinctrl_ops imx_pctrl_ops;
+const struct pinmux_ops  imx_pmx_ops;
+const struct pinconf_ops imx_pinconf_ops;
+```
+
+我们看下函数操作集的具体实现。
+
+##### 3.7.2.1 `pinctrl_ops`
+
+```c
+static const struct pinctrl_ops imx_pctrl_ops = {
+	.get_groups_count   = imx_get_groups_count, // 获取引脚组数量
+	.get_group_name     = imx_get_group_name,   // 获取引脚组名称
+	.get_group_pins     = imx_get_group_pins,   // 获取引脚组的引脚列表
+	.dt_node_to_map     = imx_dt_node_to_map,   // 将设备树节点转换为引脚控制器映射的函数
+	.dt_free_map        = imx_dt_free_map,      // 释放引脚控制器映射资源的函数
+};
+```
+
+下面是这些和函数的具体实现。
+
+```c
+static int imx_get_groups_count(struct pinctrl_dev *pctldev)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+
+	return info->ngroups;
+}
+
+static const char *imx_get_group_name(struct pinctrl_dev *pctldev, unsigned selector)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+
+	return info->groups[selector].name;
+}
+
+static int imx_get_group_pins(struct pinctrl_dev *pctldev, unsigned selector,
+			       const unsigned **pins,
+			       unsigned *npins)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+
+	*pins = info->groups[selector].pin_ids;
+	*npins = info->groups[selector].npins;
+
+	return 0;
+}
+
+static int imx_dt_node_to_map(struct pinctrl_dev *pctldev,
+			struct device_node *np,
+			struct pinctrl_map **map, unsigned *num_maps)
+{
+    // 这个函数很复杂。后面专门介绍
+}
+```
+
+##### 3.7.2.2 `pinmux_ops`
+
+```c
+static const struct pinmux_ops imx_pmx_ops = {
+	.get_functions_count = imx_pmx_get_funcs_count, // 获取引脚复用功能数量
+	.get_function_name   = imx_pmx_get_func_name,   // 获取引脚复用功能名称
+	.get_function_groups = imx_pmx_get_groups,      // 获取引脚复用功能对应的引脚组
+	.set_mux             = imx_pmx_set,             // 设置引脚复用功能的函数
+};
+```
+
+对应的函数代码实现：
+
+```c
+static int imx_pmx_get_funcs_count(struct pinctrl_dev *pctldev)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+
+	return info->nfunctions;
+}
+
+static const char *imx_pmx_get_func_name(struct pinctrl_dev *pctldev,
+					  unsigned selector)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+
+	return info->functions[selector].name;
+}
+
+static int imx_pmx_get_groups(struct pinctrl_dev *pctldev, unsigned selector,
+			       const char * const **groups,
+			       unsigned * const num_groups)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+
+	*groups = info->functions[selector].groups;
+	*num_groups = info->functions[selector].num_groups;
+
+	return 0;
+}
+
+static int imx_pmx_set(struct pinctrl_dev *pctldev, unsigned selector, unsigned group)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+	const struct imx_pin_reg *pin_reg;
+	unsigned int npins, pin_id;
+	int i;
+	struct imx_pin_group *grp;
+
+	// 1. 获取引脚组
+	grp = &info->groups[group];
+	npins = grp->npins;
+
+    // 2. 遍历引脚组下的所有引脚
+	for (i = 0; i < npins; i++) {
+		struct imx_pin *pin = &grp->pins[i];
+
+        // 3. 获取pin_id和对应的pin_reg
+		pin_id = pin->pin;
+		pin_reg = &info->pin_regs[pin_id];
+
+        // 4. 把复用值写入复用功能寄存器
+		writel(pin->mux_mode, ipctl->base + pin_reg->mux_reg);
+
+        if (pin->input_reg) {
+            writel(pin->input_val, ipctl->base + pin->input_reg);
+        }
+	}
+
+	return 0;
+}
+```
+
+##### 3.7.2.3 `imx_pinconf_ops`
+
+```c
+static const struct pinconf_ops imx_pinconf_ops = {
+	.pin_config_get = imx_pinconf_get,  // 获取引脚配置
+	.pin_config_set = imx_pinconf_set,  // 设置引脚配置
+};
+```
+
+对应的源码实现：
+
+```c
+static int imx_pinconf_get(struct pinctrl_dev *pctldev,
+			     unsigned pin_id, unsigned long *config)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+	const struct imx_pin_reg *pin_reg = &info->pin_regs[pin_id];
+
+	*config = readl(ipctl->base + pin_reg->conf_reg);
+
+	return 0;
+}
+
+static int imx_pinconf_set(struct pinctrl_dev *pctldev,
+			     unsigned pin_id, unsigned long *configs,
+			     unsigned num_configs)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+	const struct imx_pin_reg *pin_reg = &info->pin_regs[pin_id];
+	int i;
+
+	for (i = 0; i < num_configs; i++) {
+		writel(configs[i], ipctl->base + pin_reg->conf_reg);
+	}
+
+	return 0;
+}
+```
+
+一般情况下，SoC原厂的BSP工程师已经帮我们写好了上述函数，不需要独自进行编写。所以只需要简单的了解即可。
+
+### 3.8 `dt_node_to_map`函数分析
+
+`imx_dt_node_to_map`函数，用于给定一个`group`设备节点，把他映射成`map`表。
+
+#### 3.8.1 `pinctrl_map`结构体成员
+
+我们先来看下`struct pinctrl_map`结构体。
+
+```c
+struct pinctrl_map {
+	const char *dev_name;   // 设备名。通常与设备节点名一致
+	const char *name;       // 此映射项的名称。常对应设备树中pinctrl-names定义的状态名(如default、sleep)
+	enum pinctrl_map_type type; // 映射类型。决定data联合体中哪个成员有效。主要类型有PIN_MAP_TYPE_MUX_GROUP(功能复用)和PIN_MAP_TYPE_CONFIGS_PIN(电气配置)
+	const char *ctrl_dev_name;  // 引脚控制器的设备名称。即 iomuxc
+	union {                     // 一个联合体。根据type字段存储具体的配置数据
+		struct pinctrl_map_mux mux;         // 当type为PIN_MAP_TYPE_MUX_GROUP时使用
+		struct pinctrl_map_configs configs; // 当type为PIN_MAP_TYPE_CONFIGS_PIN时使用
+	} data;
+};
+
+// data联合体中的结构体
+struct pinctrl_map_mux {
+    const char *group;    /* 引脚组的名称 */
+    const char *function; /* 功能名称（如 "uart1", "i2c0"） */
+};
+
+struct pinctrl_map_configs {
+    const char *group_or_pin; /* 引脚组名或单个引脚名 */
+    unsigned long *configs;   /* 指向配置值数组的指针 */
+    unsigned num_configs;     /* 配置值的数量 */
+};
+```
+
+#### 3.8.2 `pinctrl_map`的典型使用场景
+
+1. 设备树解析与映射转换: 这是`pinctrl_map`最核心的来源。内核启动时，会解析设备树中`pinctrl-0`、`pinctrl-1`等属性引用的节点。引脚控制器的驱动(`dt_node_to_map`函数)将这些设备树节点信息转换为一个或多个`pinctrl-map`结构体。这些映射随后被注册到系统中供后续调用
+2. 管理设备的多种引脚状态: 一个设备在不同工作模式下，可能需要不同的引脚配置
+    + `default`: 正常工作时的配置
+    + `sleep`: 低功耗模式下的配置，可能会将引脚设置为高阻或下拉以盛典
+3. 驱动初始化时应用引脚配置: 设备驱动在其Probe函数中，通常会执行以下步骤来应用引脚配置
+    + 调用 devm_pinctrl_get()获取该设备的 pinctrl 句柄
+    + 调用 pinctrl_lookup_state()查找特定状态（如 "default"）的 pinctrl_state
+    + 调用 pinctrl_select_state()应用该状态
+
+#### 3.8.3 `dt_node_to_map`源码分析
+
+```c
+static int imx_dt_node_to_map(struct pinctrl_dev *pctldev,
+			struct device_node *np,
+			struct pinctrl_map **map, unsigned *num_maps)
+{
+	struct imx_pinctrl *ipctl = pinctrl_dev_get_drvdata(pctldev);
+	const struct imx_pinctrl_soc_info *info = ipctl->info;
+	const struct imx_pin_group *grp;
+	struct pinctrl_map *new_map;
+	struct device_node *parent;
+	int map_num = 1;
+	int i, j;
+
+    // 1. 根据设备节点名，获取group引脚组
+	grp = imx_pinctrl_find_group_by_name(info, np->name);
+    map_num += grp->npins;
+
+    // 2. 申请map并初始化。申请的个数=1 + npins. 1用于mux map(复用), npins用于config map
+	new_map = kmalloc(sizeof(struct pinctrl_map) * map_num, GFP_KERNEL);
+	*map = new_map;
+	*num_maps = map_num;
+
+	// 3. 设置复用map
+	parent = of_get_parent(np);
+	new_map[0].type = PIN_MAP_TYPE_MUX_GROUP;
+	new_map[0].data.mux.function = parent->name;
+	new_map[0].data.mux.group = np->name;
+
+	// 4. 设置config map
+	new_map++;
+	for (i = 0; i < grp->npins; i++) {
+        // 5. 分别设置类型、pin名称、配置值的地址、配置值数量
+        new_map[i].type = PIN_MAP_TYPE_CONFIGS_PIN;
+        new_map[i].data.configs.group_or_pin = pin_get_name(pctldev, grp->pins[i].pin);
+        new_map[i].data.configs.configs = &grp->pins[i].config;
+        new_map[i].data.configs.num_configs = 1;
+	}
+
+	return 0;
+}
+```
+
+### 3.9 `pinctrl_bind_pins`函数
+
+在前面的章节中，对`pinctrl`子系统的`probe`函数及其相关框架进行了讲解，现在还需要回答一个问题：`引脚的复用关系是在什么时候被设置的`。我们来看下本章的内容。
+
+#### 3.9.1 `dev_pin_info`结构体引入
+
+以有线网卡的设备树节点进行举例。要添加的`ethernet`设备树内容如下所示：
+
+```c
+ethernet@02188000 {
+    compatible = "fsl,imx6ul-fec", "fsl,imx6q-fec";
+    reg = <0x2188000 0x4000>;
+    status = "okay";
+    pinctrl-names = "default";
+    pinctrl-0 = <0x23>;
+    phy-mode = "rmii";
+    phy-handle = <0x24>;
+    phy-reset-gpios = <0x25 0x6 0x1>;   // 复位引脚
+    phy-reset-duration = <0x1a>;
+};
+```
+
+当上面编写的`ethernet`设备树跟驱动匹配成功后，就会进入相应驱动中的`probe`函数，在`probe`函数中就可以对设备树中的复位引脚进行拉高和拉低的操作，从而控制网卡时序。所以可以猜测，在进入驱动的`probe`函数之前就已经使用`pinctrl`子系统对引脚进行了复用。我们来看下驱动匹配的函数源码：
+
+```c
+int driver_probe_device(struct device_driver *drv, struct device *dev)
+{
+	really_probe(dev, drv);
+}
+
+static int really_probe(struct device *dev, struct device_driver *drv)
+{
+    /* If using pinctrl, bind pins now before probing */
+	pinctrl_bind_pins(dev);
+}
+```
+
+可以看到，`device`和`driver`匹配成功后，会调用到`pinctrl_bind_pins`函数，我们来分析下这个函数。
+
+```c
+struct dev_pin_info {
+	struct pinctrl *p;
+	struct pinctrl_state *default_state;
+#ifdef CONFIG_PM
+	struct pinctrl_state *sleep_state;
+	struct pinctrl_state *idle_state;
+#endif
+};
+
+int pinctrl_bind_pins(struct device *dev)
+{
+	int ret;
+
+    // dev->pins 就是 struct dev_pin_info 结构体
+	dev->pins = devm_kzalloc(dev, sizeof(*(dev->pins)), GFP_KERNEL);
+
+    // 1. 获取设备的 pinctrl 句柄
+	dev->pins->p = devm_pinctrl_get(dev);
+
+    // 2. 查找设备默认 pinctrl 状态
+	dev->pins->default_state = pinctrl_lookup_state(dev->pins->p, PINCTRL_STATE_DEFAULT);
+
+    // 3. 选择默认的 pinctrl 状态
+	ret = pinctrl_select_state(dev->pins->p, dev->pins->default_state);
+
+	return 0;
+}
+```
+
+在`ethernet`设备树中，`pinctrl-names`属性制定了设备所使用的引脚为`"default"`，而`pinctrl-0`存放了对应的phandle指针，`"default_state"`必然会保存引脚的复用信息。
+
+我们接下来看下，`"default_state"`和`"pinctrl_map"`是如何建立关联的。
+
+#### 3.9.1 `pinctrl_bind_pins`函数分析1
+
+```c
+int pinctrl_bind_pins(struct device *dev)
+{
+	int ret;
+
+    // dev->pins 就是 struct dev_pin_info 结构体
+	dev->pins = devm_kzalloc(dev, sizeof(*(dev->pins)), GFP_KERNEL);
+
+    // 1. 获取设备的 pinctrl 句柄
+	dev->pins->p = devm_pinctrl_get(dev);
+
+    // 2. 查找设备默认 pinctrl 状态
+	dev->pins->default_state = pinctrl_lookup_state(dev->pins->p, PINCTRL_STATE_DEFAULT);
+
+    // 3. 选择默认的 pinctrl 状态
+	ret = pinctrl_select_state(dev->pins->p, dev->pins->default_state);
+
+	return 0;
+}
+```
+
+`pinctrl_bind_pins`函数，首先调用了`devm_pinctrl_get`函数获取设备的 `pinctrl` 句柄并保存。我们看下实现过程。
+
+```c
+struct pinctrl *devm_pinctrl_get(struct device *dev)
+{
+	return pinctrl_get(dev);
+}
+
+struct pinctrl *pinctrl_get(struct device *dev)
+{
+	return create_pinctrl(dev);
+}
+```
+
+可以看到，`devm_pinctrl_get`函数最终会调用`create_pinctrl`，根据`dev设备`来创建`pinctrl`。我们来分析一下源码：
+
+```c
+struct pinctrl {
+	struct list_head node;  // 用于将 pinctrl 添加到全局链表 pinctrl_list
+	struct device *dev;     // 关联的设备
+	struct list_head states;        // 存储引脚配置的链表，用于跟踪不同的引脚配置转来
+	struct pinctrl_state *state;    // 当前应用的引脚配置状态
+	struct list_head dt_maps;       // 存储设备树中定义的引脚映射信息的链表
+};
+
+static struct pinctrl *create_pinctrl(struct device *dev)
+{
+	struct pinctrl *p;
+	struct pinctrl_maps *maps_node;
+	int i;
+	struct pinctrl_map const *map;
+	int ret;
+
+	// 1. 分配 pinctrl 并初始化
+	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	p->dev = dev;
+	INIT_LIST_HEAD(&p->states);
+	INIT_LIST_HEAD(&p->dt_maps);
+
+    // 2. 将设备树中方音译的引脚映射信息，转换成struct pinctrl_map结构，并添加到p->dt_maps
+	ret = pinctrl_dt_to_map(p);
+
+    // 3. 调用add_setting添加map
+	for_each_maps(maps_node, i, map) {
+		/* Map must be for this device */
+		if (strcmp(map->dev_name, dev_name(dev)))
+			continue;
+
+		ret = add_setting(p, map);
+	}
+
+    // 4. 把 当前设备节点生成的pinctrl，添加到pinctrl_list链表中。每个pinctrl设备节点，都会创建一个pinctrl对象，最终添加到pinctrl_list中
+	list_add_tail(&p->node, &pinctrl_list);
+
+	return p;
+}
+```
+
+从源码中可以看到，`pinctrl_dt_to_map(p)`用于将设备节点的`pinctrl-`添加到`map`表中。我们来分析下这个函数的源代码：
+
+![](./src/0013.jpg)
+
+![](./src/0014.jpg)
+
+我们来看下`dt_to_map_one_config(p, statename, np_config)`函数，它用来解析一个设备节点。
+
+```c
+static int dt_to_map_one_config(struct pinctrl *p, const char *statename, struct device_node *np_config)
+{
+	struct device_node *np_pctldev = np_config;
+	struct pinctrl_dev *pctldev;
+	const struct pinctrl_ops *ops;
+	int ret;
+	struct pinctrl_map *map;
+	unsigned num_maps;
+
+    // 1. 循环遍历group引脚组(设备节点)的父节点，直到找到pinctrldev_list链表注册的iomuxc设备为止
+	for (;;) {
+        // 1. 获取 np_pctldev 的父节点
+		np_pctldev = of_get__parent(np_pctldev);
+
+        // 2. 从pinctrldev_list链表中，遍历匹配np_pctldev设备节点。匹配成功则返回指针(此时即为iomuxc设备节点)，匹配失败则返回NULL，继续寻找父节点
+		pctldev = get_pinctrl_dev_from_of_node(np_pctldev);
+		if (pctldev)
+			break;
+	}
+
+    // 3. 执行pinctrl_register注册函数中，设置给imx_pinctrl_desc的ops，调用dt_node_to_map函数。解析group引脚组转为map
+	ops = pctldev->desc->pctlops;
+	ret = ops->dt_node_to_map(pctldev, np_config, &map, &num_maps);
+
+	// 4. 将映射表块存储起来，以供后续使用
+	return dt_remember_or_free_map(p, statename, pctldev, map, num_maps);
+}
+```
+
+最后一步是，调用`dt_remember_or_free_map(p, statename, pctldev, map, num_maps)`保存`map`映射表，看下源码。
+
+```c
+static int dt_remember_or_free_map(struct pinctrl *p, const char *statename,
+				   struct pinctrl_dev *pctldev,
+				   struct pinctrl_map *map, unsigned num_maps)
+{
+	int i;
+	struct pinctrl_dt_map *dt_map;
+
+	// 1. 初始化map结构体数组里面，每个结构体成员的其他字段
+	for (i = 0; i < num_maps; i++) {
+		map[i].dev_name = dev_name(p->dev);
+		map[i].name = statename;
+		if (pctldev)
+			map[i].ctrl_dev_name = dev_name(pctldev->dev);
+	}
+
+    // 2. 申请dt_map并初始化，然后添加到 pinctrl 的dt_maps 链表中
+	dt_map = kzalloc(sizeof(*dt_map), GFP_KERNEL);
+	dt_map->pctldev = pctldev;
+	dt_map->map = map;
+	dt_map->num_maps = num_maps;
+	list_add_tail(&dt_map->node, &p->dt_maps);
+
+    // 3. 注册map
+	return pinctrl_register_map(map, num_maps, false);
+}
+```
+
+注册`map`，把`map`添加到全局静态链表`pinctrl_maps`中，后面可以通过查找静态链表`pinctrl_maps`来进行引脚配置和管理。
+
+```c
+LIST_HEAD(pinctrl_maps);
+
+int pinctrl_register_map(struct pinctrl_map const *maps, unsigned num_maps, bool dup)
+{
+	struct pinctrl_maps *maps_node;
+
+	maps_node = kzalloc(sizeof(*maps_node), GFP_KERNEL);
+	maps_node->num_maps = num_maps;
+    maps_node->maps = maps;
+
+	list_add_tail(&maps_node->node, &pinctrl_maps);
+
+	return 0;
+}
+```
+
+#### 3.9.2 `pinctrl_bind_pins`函数分析2
+
+这里继续讲解在上一章中没有讲解完成的`create_pinctrl`函数。我们接着往后看：
+
+```c
+static struct pinctrl *create_pinctrl(struct device *dev)
+{
+	struct pinctrl *p;
+	const char *devname;
+	struct pinctrl_maps *maps_node;
+	int i;
+	struct pinctrl_map const *map;
+	int ret;
+
+    // 1. 创建 pinctrl 对象指针
+	p = kzalloc(sizeof(*p), GFP_KERNEL);
+	p->dev = dev;
+	INIT_LIST_HEAD(&p->states);
+	INIT_LIST_HEAD(&p->dt_maps);
+
+    // 2. 把设备节点转成map，并注册到 pinctrl_maps 静态链表中
+	ret = pinctrl_dt_to_map(p);
+
+    // 3. 遍历pinctrl_maps静态链表，只要名称匹配就算找到了，执行add_setting函数
+	for_each_maps(maps_node, i, map) {
+		if (strcmp(map->dev_name, dev_name(dev)))
+			continue;
+
+        // 4. 对于每一个匹配的map，调用add_setting进行转换和添加
+		add_setting(p, map);
+	}
+
+    // 4. 把pinctrl对象指针，添加到全局链表pinctrl_list中
+	list_add_tail(&p->node, &pinctrl_list);
+
+	return p;
+}
+```
+
+`add_setting`是一个非常重要的函数，用于将映射map添加到引脚控制器中。
+
+```c
+// create_state函数，就是申请state(如default、sleep)，保存到 pinctrl->states 链表中
+static struct pinctrl_state *create_state(struct pinctrl *p, const char *name)
+{
+	struct pinctrl_state *state;
+
+	state = kzalloc(sizeof(*state), GFP_KERNEL);
+	state->name = name;
+	INIT_LIST_HEAD(&state->settings);
+
+	list_add_tail(&state->node, &p->states);
+
+	return state;
+}
+
+struct pinctrl_setting {
+	struct list_head node;
+	enum pinctrl_map_type type;
+	struct pinctrl_dev *pctldev;
+	const char *dev_name;
+	union {
+		struct pinctrl_setting_mux mux;
+		struct pinctrl_setting_configs configs;
+	} data;
+};
+
+static int add_setting(struct pinctrl *p, struct pinctrl_map const *map)
+{
+	struct pinctrl_state *state;
+	struct pinctrl_setting *setting;
+	int ret;
+
+    // 1. 申请state(default、slepp), 保存到 pinctrl->states 链表
+	state = create_state(p, map->name);
+
+    // 2. 申请setting并初始化
+	setting = kzalloc(sizeof(*setting), GFP_KERNEL);
+	setting->type = map->type;
+	setting->pctldev = get_pinctrl_dev_from_devname(map->ctrl_dev_name);
+	setting->dev_name = map->dev_name;
+
+    // 3. 完成map到setting的转换
+	switch (map->type) {
+	case PIN_MAP_TYPE_MUX_GROUP:
+		ret = pinmux_map_to_setting(map, setting);  // 复用组映射类型
+		break;
+	case PIN_MAP_TYPE_CONFIGS_PIN:
+	case PIN_MAP_TYPE_CONFIGS_GROUP:
+		ret = pinconf_map_to_setting(map, setting); // 配置映射类型
+		break;
+	}
+
+    // 4. 把 setting 添加到 state->settings链表，而 state又在 pinctrl->states 链表
+	list_add_tail(&setting->node, &state->settings);
+
+	return 0;
+}
+```
+
+至此，`add_setting`分析完成，关于他的上层函数`create_pinctrl`也就讲解完成了。我们继续分析`pinctrl_bind_pins`函数。
+
+```c
+int pinctrl_bind_pins(struct device *dev)
+{
+	int ret;
+
+	dev->pins = devm_kzalloc(dev, sizeof(*(dev->pins)), GFP_KERNEL);
+
+	dev->pins->p = devm_pinctrl_get(dev);
+
+	dev->pins->default_state = pinctrl_lookup_state(dev->pins->p, PINCTRL_STATE_DEFAULT);
+
+    // 调用 pinctrl_select_state 函数，设置默认状态
+	ret = pinctrl_select_state(dev->pins->p, dev->pins->default_state);
+
+	return 0;
+}
+```
+
+我们来看下`pinctrl_select_state`函数源码，看看他是怎么设置选择`state`状态的:
+
+1. 读取setting数组的type(第1个元素是mux，后面的元素是config)
+2. 如果type是`PIN_MAP_TYPE_MUX_GROUP`，调用`pinmux_enable_setting`
+3. 如果type是`PIN_MAP_TYPE_CONFIGS_PIN`，调用`pinconf_apply_setting`
+
+```c
+int pinctrl_select_state(struct pinctrl *p, struct pinctrl_state *state)
+{
+	struct pinctrl_setting *setting, *setting2;
+	struct pinctrl_state *old_state = p->state;
+	int ret;
+
+	p->state = NULL;
+
+	/* Apply all the settings for the new state */
+	list_for_each_entry(setting, &state->settings, node) {
+		switch (setting->type) {
+		case PIN_MAP_TYPE_MUX_GROUP:
+			ret = pinmux_enable_setting(setting);
+			break;
+		case PIN_MAP_TYPE_CONFIGS_PIN:
+		case PIN_MAP_TYPE_CONFIGS_GROUP:
+			ret = pinconf_apply_setting(setting);
+			break;
+		}
+	}
+
+	p->state = state;
+
+	return 0;
+}
+```
+
+关于这两个函数，其实调用`imx_pinctrl_desc`设置的`set_mux`和`pin_config_set`这两个ops方法，设置对应的`mux`和`config`寄存器值。
+
+```c
+int pinmux_enable_setting(struct pinctrl_setting const *setting)
+{
+	struct pinctrl_dev *pctldev = setting->pctldev;
+	const struct pinctrl_ops *pctlops = pctldev->desc->pctlops;
+	const struct pinmux_ops *ops = pctldev->desc->pmxops;
+	int ret = 0;
+
+	ret = ops->set_mux(pctldev, setting->data.mux.func, setting->data.mux.group);
+
+	return 0;
+}
+
+int pinconf_apply_setting(struct pinctrl_setting const *setting)
+{
+	struct pinctrl_dev *pctldev = setting->pctldev;
+	const struct pinconf_ops *ops = pctldev->desc->confops;
+	int ret;
+
+	switch (setting->type) {
+	case PIN_MAP_TYPE_CONFIGS_PIN:
+
+		ret = ops->pin_config_set(pctldev,
+				setting->data.configs.group_or_pin,
+				setting->data.configs.configs,
+				setting->data.configs.num_configs);
+
+		break;
+	}
+
+	return 0;
+}
+```
+
+### 3.10. `pinctrl_register`注册`pinctrl`子系统
+
+在前面我们已经分析了，`imx6ull`内核解析`iomuxc`设备树节点的全过程。我们已经解析了设备树还需要做的事情就是，把`pinctrl`注册到linux子系统中。这就要使用到`pinctrl_register`函数。
+
+#### 3.10.1 函数原型
+
+这个函数是Linux内核通用函数，所以他一定不会直接出现`imx`系列的函数和结构体，但最终是以什么方式产生关联？我们来看下。
+
+```c
+struct pinctrl_dev *pinctrl_register(struct pinctrl_desc *pctldesc,
+				                     struct device *dev, 
+                                     void *driver_data)
+```
+
+#### 3.10.2 函数参数
+
+1. `struct pinctrl_desc *pctldesc`: 对引脚控制器的软件抽象，它定义了控制器的属性和操作结构，是pinctrl驱动与pinctrl核心子系统之间的桥梁。我们看下结构体成员：
+    ```c
+    struct pinctrl_desc {
+        const char *name;   // 引脚控制器的名称。就是iomuxc设备节点名
+        struct pinctrl_pin_desc const pins[];    // 就是imx6ul_pinctrl_pads数组。详细描述了该控制器管理的所有物理引脚，包括引脚编号和名字
+        unsigned int npins; // pins数组中的引脚数量
+        const struct pinctrl_ops *pctlops;  // ops指针，主要用于管理引脚分组
+        const struct pinmux_ops *pmxops;    // ops指针，主要用于控制引脚的功能复用(i2c、spi...)
+        const struct pinconf_ops *confops;  // ops指针，主要用于配置引脚的电气属性(上/下拉，驱动能力...)
+    };
+    ```
+
+2. `struct device *dev`: 指向设备指针。是我们`iomuxc`设备节点对应的`device`
+3. `void *driver_data`: 驱动私有数据指针。可以在驱动需要时存储一些上下文，该信息会被存储到注册成功的`pinctrl_dev`中，后续驱动可通过`pinctrl_get_drvdata`获取
+
+#### 3.10.3 函数返回值
+
+`pinctrl_register`注册函数的返回值，是一个`struct pinctrl_dev`设备。`pinctrl_dev`结构体是`pinctrl`子系统的核心，它抽象了一个物理的引脚控制器。我们来看下结构体成员：
+
+```c
+struct pinctrl_dev {
+	struct list_head node;
+	struct pinctrl_desc *desc;
+	struct radix_tree_root pin_desc_tree;
+	struct list_head gpio_ranges;
+	struct device *dev;
+	void  *driver_data;
+	struct pinctrl *p;
+	struct pinctrl_state *hog_default;
+	struct pinctrl_state *hog_sleep;
+	struct mutex mutex;
+};
+```
+
+1. `struct list_head node`:用于将多个`pinctrl_dev`链接到一个全局链表`pinctrldev_list`中，方便内核统一管理和遍历所有的引脚控制器
+2. `struct pinctrl_desc *desc`: 前一节中已经介绍。这是驱动在注册时提供的静态描述符，包含了引脚控制器的名称、它支持的所有引脚描述符数组(pins)、引脚数量(npins)以及最关键的三大操作集函数指针。`pinctrl_dev`以来这些操作集来执行具体硬件操作
+3. `struct radix_tree_root pin_desc_tree`: 一个基数树。用于高效的存储和通过引脚编号快速查找该控制器管理的每一个引脚的`struct pin_desc`
+4. `struct list_head gpio_ranges`: 一个链表有，用于链接多个`struct pinctrl_gpio_range`。这些范围描述了此引脚控制器管理的引脚中，哪些范围可以作为GPIO使用，以及他们如何映射到全局的GPIO编号空间。这是`pinctrl`子系统与`GPIO`子系统协同工作的关键
+5. `struct device *dev`: `iomuxc`设备节点对应的`device`指针
+6. `void  *driver_data`一个供驱动使用的私有数据指针，通常用于存储驱动特定的上下文或硬件寄存器基地址
+7. `struct pinctrl *p`: 指向一个`pinctrl`结构体。用于管理`客户端设备`的引脚状态(例如`default、sleep、idle`)。它包含了状态链表和当前激活的状态
+8. `struct pinctrl_state *hog_default, *hog_sleep`: 在引脚控制器自身初始化时，如果需要`永久独占`某些引脚硬设置为特定的默认或睡眠状态，这些指针指向对应的状态
+9. `struct mutex mutex`: 互斥锁。用于保护对引脚控制器的并发访问
+
+#### 3.10.4 `pinctrl_register`函数源码实现
+
+前面我们介绍了`pinctrl_dev`结构体的成员，感觉上还是有点抽象。`pinctrl_dev`是`pinctrl_register`函数的返回值，所以接下来分析函数源码，看看是怎么填充`pinctrl_dev`设备的。
+
+```c
+struct pinctrl_dev *pinctrl_register(struct pinctrl_desc *pctldesc,
+				    struct device *dev, void *driver_data)
+{
+	struct pinctrl_dev *pctldev;
+	int ret;
+
+    // 1. 申请内存，保存pctldev设备
+	pctldev = kzalloc(sizeof(*pctldev), GFP_KERNEL);
+
+    // 2. 保存设备、驱动注册的静态描述符、驱动的私有数据
+    pctldev->dev = dev;
+	pctldev->desc = pctldesc;
+	pctldev->driver_data = driver_data;
+
+    // 3. 初始化radix-tree数据结构。它做的事情是，创建一个树形结构，通过pin_id可以迅速查找对应的指针
+	INIT_RADIX_TREE(&pctldev->pin_desc_tree, GFP_KERNEL);
+
+    // 4. 初始化gpio rangs
+	INIT_LIST_HEAD(&pctldev->gpio_ranges);
+	
+    // 5. 初始化互斥锁
+	mutex_init(&pctldev->mutex);
+
+    // 6. 注册所有的引脚(注册imx6ul_pinctrl_pads数组定义的引脚)
+	pinctrl_register_pins(pctldev, pctldesc->pins, pctldesc->npins);
+
+    // 7. 把当前pinctrl_dev添加到全局链表pinctrldev_list中
+	mutex_lock(&pinctrldev_list_mutex);
+	list_add_tail(&pctldev->node, &pinctrldev_list);
+	mutex_unlock(&pinctrldev_list_mutex);
+
+    // 解析和准备所有的引脚状态
+	pctldev->p = pinctrl_get(pctldev->dev);
+
+    // 9. 查找并设置所有的状态(default、sleep)，并设置默认状态
+    #define PINCTRL_STATE_DEFAULT "default"
+    #define PINCTRL_STATE_IDLE "idle"
+    #define PINCTRL_STATE_SLEEP "sleep"
+	pctldev->hog_default = pinctrl_lookup_state(pctldev->p, PINCTRL_STATE_DEFAULT);
+	pctldev->hog_sleep = pinctrl_lookup_state(pctldev->p, PINCTRL_STATE_SLEEP);
+    pinctrl_select_state(pctldev->p,pctldev->hog_default);
+
+	return pctldev;
+}
+```
+
+这个函数中，有一些非常重要的代码框图。可以帮助我们理解`pinctrl`子系统的整体视图。
+
+##### 3.10.4.1 `radix-tree`基数树
+
+代码中有这样一行`INIT_RADIX_TREE(&pctldev->pin_desc_tree, GFP_KERNEL)`，用于初始化`radix-tree`。这是一种典型的二叉树结构，内核用它来存储`pin id(整数)`和`pin 对象(指针)`。本质上是一种整数和指针的映射。
+
+为什么需要`radix-tree`？因为我们的`pin`可能有非常非常多，如果每次都是定义一个大数组遍历查询，效率非常之低。
+
+既然有了`radix-tree`，可以想象的到，接下来我们就会把所有的`pin id`和`pin 对象`添加到这个表中。
+
+![](./src/0012.jpg)
+
+
+##### 3.10.4.2 `注册pin数组`
+
+我们要做的事情就是，把所有的`pin`(对于imx6ull来说，就是imx6ul_pinctrl_pads数组)，都插入到`radix-tree`树中。这样的好处是，我们使用`pin`能够很快的找到对象指针。
+
+```c
+// 注册imx6ul_pinctrl_pads数组中所有的pin
+pinctrl_register_pins(pctldev, pctldesc->pins, pctldesc->npins);
+
+static int pinctrl_register_pins(struct pinctrl_dev *pctldev, 
+                                 struct pinctrl_pin_desc const *pins,
+				                 unsigned num_descs)
+{
+	unsigned i;
+	int ret = 0;
+
+	for (i = 0; i < num_descs; i++) {
+		ret = pinctrl_register_one_pin(pctldev, pins[i].number, pins[i].name);
+	}
+
+	return 0;
+}
+```
+
+上面的函数会遍历`imx6ul_pinctrl_pads`数组中的所有引脚，然后调用`pinctrl_register_one_pin`来注册。这个函数做的事情就是：
+
+1. 为每个`pin`引脚申请内存`pindesc`，保存dev指针和name
+2. 把`pin id`和`pindesc 指针`，插入到`radix-tree`树中。这样可以根据`pin id`迅速查找到`pindesc 指针`
+
+这样做有什么用呢？我们可以根据`pinctrl_dev`获取到`pin_desc_tree`树，然后根据`pin id`可以从树中查找到`pin name`。
+
+```c
+struct pin_desc {
+	struct pinctrl_dev *pctldev;
+	const char *name;
+	bool dynamic_name;
+	/* These fields only added when supporting pinmux drivers */
+#ifdef CONFIG_PINMUX
+	unsigned mux_usecount;
+	const char *mux_owner;
+	const struct pinctrl_setting_mux *mux_setting;
+	const char *gpio_owner;
+#endif
+};
+
+static int pinctrl_register_one_pin(struct pinctrl_dev *pctldev, unsigned number, const char *name)
+{
+	struct pin_desc *pindesc;
+
+    // 1. 申请内存
+	pindesc = kzalloc(sizeof(*pindesc), GFP_KERNEL);
+
+    // 2. 设置dev指针和name
+	pindesc->pctldev = pctldev;
+	if (name) {
+		pindesc->name = name;
+	} else {
+		pindesc->name = kasprintf(GFP_KERNEL, "PIN%u", number);
+		pindesc->dynamic_name = true;
+	}
+
+    // 3. 把number(pin id)和pindesc指针，插入到radix-tree树中
+	radix_tree_insert(&pctldev->pin_desc_tree, number, pindesc);
+
+	return 0;
+}
+```
