@@ -355,3 +355,108 @@ int main(int argc, char *argv[])
 
 ![](./src/0011.jpg)
 
+### 2.3 Linux中的`/dev/mem`深入解析
+
+通过`/dev/mem`设备也可以控制GPIO，我们先来理解下`/dev/mem`。
+
+#### 2.3.1 什么是`/dev/mem`
+
+`/dev/mem`是Linux内核提供的一个字符设备，他是系统物理地址空间的完整映像。通过这个设备，用户空间可以绕过内核的内存管理机制，直接读写物理内存、外设寄存器以及其他映射到物理地址空间的硬件资源。由于其强大的能力和潜在风险，通常只有root用户才有权限访问此设备。
+
+#### 2.3.2 内核底层实现原理
+
+`/dev/mem`的驱动实现主要位于`Linux`内核的`drivers/char/mem.c`文件中。其核心是作为一个字符设备，通过定义`file_operations`结构退来实现打开、读取、写入和内存映射等操作。
+
+#### 2.3.2.1 关键操作函数实现
+
+```c
+static const struct file_operations __maybe_unused mem_fops = {
+	.llseek		= memory_lseek,
+	.read		= read_mem,
+	.write		= write_mem,
+	.mmap		= mmap_mem,
+	.open		= open_mem,
+};
+```
+
+#### 2.3.2.2 关键操作函数实现
+
+##### 2.3.2.2.1 打开设备(`open`)
+
+当用户空间程序打开`/dev/mem`时，内核会进行严格的权限检查。确保只有具备`CAP_SYS_RAWIO`能力的进程(通常是root)才能访问。
+
+```c
+static int open_mem(struct inode *inode, struct file *filp)
+{
+	if (!capable(CAP_SYS_RAWIO)) {
+        return -EPERM;  // 没有权限
+    }
+    return 0;
+}
+```
+
+##### 2.3.2.2.2 内存映射(`mmap`)
+
+`mmap`操作是将物理内存映射到用户空间地址的关键，它使用`remap_pfn_range()`函数实现物理地址到虚拟地址的转换。
+
+```c
+static int mmap_mem(struct file *file, struct vm_area_struct *vma)
+{
+	size_t size = vma->vm_end - vma->vm_start;
+
+    // 检查地址范围有效性
+	if (!valid_mmap_phys_addr_range(vma->vm_pgoff, size))
+		return -EINVAL;
+
+	// 创建映射
+	if (remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
+			    size, vma->vm_page_prot)) {
+		return -EAGAIN;
+	}
+	return 0;
+}
+```
+
+#### 2.3.2.3 物理地址空间组成
+
+`/dev/mem`提供的物理地址空间，包含多种类型的区域：
+
++ 物理地址(RAM): 系统主内存
++ 物理存储(ROM): 只读存储器
++ CPU总线地址: CPU总线上的地址空间
++ CPU寄存器: 处理器内部寄存器
++ 外设寄存器: 如GPIO、定时器、ADC灯硬件控制器寄存器
+
+#### 2.3.3 使用场景与示例
+
+##### 2.3.3.1 典型使用场景
+
+1. 硬件调试与开发: 在驱动开发或BSP移植初期，直接访问外设寄存器进行硬件调试
+2. 性能关键应用: 需要绕过内核开销，直接与硬件交互的高性能应用
+3. 系统监控与诊断: 开发系统监控工具，直接读取物理内存信息
+4. 嵌入式系统开发: 在资源受限的嵌入式环境中，实现轻量级硬件访问
+5. 安全研究与取证: 用于系统安全分析和数字取证
+
+##### 2.3.3.2 使用流程
+
+使用`/dev/mem`的基本流程通常如下：
+
+1. 打开设备: 使用`open()`系统调用打开`/dev/mem`
+2. 内存映射: 使用`mmap()`将感兴趣的物理地址区域映射到用户空间
+3. 直接访问: 通过映射后的指针直接读写内存或寄存器
+4. 清理资源: 使用`munmap()`解除映射并`close()`关闭设备
+
+#### 2.3.4 `设计思路与考量`
+
+##### 2.3.4.1 设计目标
+
+`/dev/mem`的设计，主要基于以下几个目标：
+
+1. 硬件直接访问: 为用户空间提供一种直接访问硬件资源的机制
+2. 性能优化: 避免不必要的内存拷贝，实现高效的数据传输
+3. 开发灵活性: 在驱动开发初期提供便捷的硬件调试手段
+4. 系统维护: 为系统诊断和监控工具提供底层访问能力
+
+##### 2.3.4.2 与`/dev/kmem`的区别
+
+
