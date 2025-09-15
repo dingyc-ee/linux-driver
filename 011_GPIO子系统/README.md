@@ -610,3 +610,290 @@ int main() {
 5. 同步重要数据: 对于`MAP_SHARED`映射，如果对数据的之旧话有严格要求，应在关键操作后调用`msync()`强制将修改同步到磁盘
 6. 地址空间布局随机化: 现代系统为安全起见，每次运行进程时`mmap`返回的地址可能不同，不应假设地址固定
 7. 性能权衡: 对于小文件或顺序访问，`mmap`的缺页异常开销可能使其细嫩不如传统的`read/write`。它更适用于需要频繁随机访问的大文件
+
+### 2.6 使用`/dev/mem`和`mmap`操作寄存器点亮LED
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+#define IOMUXC_SNVS_BASE    (0x02290000)
+#define GPIO5_BASE          (0x020AC000)
+#define MMAP_SIZE           (4096)
+
+#define READ_REG(reg)       (*((unsigned int *)(reg)))
+#define WRITE_REG(reg, val) ((*((unsigned int *)(reg))) = (val))
+
+int main(int argc, char *argv[])
+{
+    int fd = -1, flag = 0, count = 50;
+    unsigned char *iomuxc_snvs_base = NULL;
+    unsigned char *gpio5_base = NULL;
+    unsigned int reg_val = 0;
+
+    fd = open("/dev/mem", O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "open /dev/mem fail\n");
+        return -1;
+    }
+    iomuxc_snvs_base = (unsigned char *)mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, IOMUXC_SNVS_BASE);
+    if (iomuxc_snvs_base == MAP_FAILED) {
+        fprintf(stderr, "mmap IOMUXC_SNVS fail\n");
+        return -2;
+    }
+    gpio5_base = (unsigned char *)mmap(NULL, MMAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, fd, GPIO5_BASE);
+    if (iomuxc_snvs_base == MAP_FAILED) {
+        fprintf(stderr, "mmap GPIO5 fail\n");
+        return -3;
+    }
+    WRITE_REG(iomuxc_snvs_base + 0x0C, 5);
+    WRITE_REG(iomuxc_snvs_base + 0x10, 5);
+    WRITE_REG(iomuxc_snvs_base + 0x50, 0x1b0b0);
+    WRITE_REG(iomuxc_snvs_base + 0x54, 0x1b0b0);
+
+    reg_val = READ_REG(gpio5_base + 0x04);
+    reg_val |= (1 << 1);
+    reg_val |= (1 << 2);
+    WRITE_REG(gpio5_base + 0x04, reg_val);
+
+    while (count-- > 0) {
+        if (flag) {
+            reg_val = READ_REG(gpio5_base + 0x00);
+            reg_val |= (1 << 1);
+            reg_val |= (1 << 2);
+            WRITE_REG(gpio5_base + 0x00, reg_val);
+        }
+        else {
+            reg_val = READ_REG(gpio5_base + 0x00);
+            reg_val &= ~(1 << 1);
+            reg_val &= ~(1 << 2);
+            WRITE_REG(gpio5_base + 0x00, reg_val);
+        }
+        flag = !flag;
+        usleep(1000 * 200);
+    }
+
+    munmap(iomuxc_snvs_base, MMAP_SIZE);
+    munmap(gpio5_base, MMAP_SIZE);
+    close(fd);
+
+    return 0;
+}
+```
+
+## 第3章 GPIO调试方法
+
+GPIO调试方法除了使用IO或`/dem/mem`去查看寄存器，还可以使用其他方法进行GPIO的调试。
+
+### 3.1 `debugfs`调试文件系统
+
+`debugfs`是linux内核为开发者提供了一个基于内存的虚拟文件系统，专门用于内核调试。它允许开发者通过简单的文件操作(如`cat`、`echo`)在内核和用户空间之间交换信息，非常适合动态查看状态、控制行为或诊断问题，而无需重新编译内核或使用复杂的工具。
+
+#### 3.1.1 启用与挂载`debugfs`
+
+##### 3.1.1.1 内核启用`debugfs`
+
+我们先要在`linux`内核中，启用`debugfs`。操作方式如下：
+
+```sh
+Kernel hacking
+    -> Compile-time checks and pompiler options
+        -> Debuf Filesystem
+```
+
+![](./src/0012.jpg)
+
+我们可以通过以下命令，检查内核编译是是否启用了`CONFIG_DEBUG_FS`。输出为`CONFIG_DEBUG_FS=y`，表示内核启用了`debugfs`。
+
+```bash
+/ # zcat /proc/config.gz | grep CONFIG_DEBUG_FS
+CONFIG_DEBUG_FS=y
+```
+
+##### 3.1.1.2 手动挂载`debugfs`
+
+`debugfs`通常需要手动挂载到`/sys/kernel/debug`目录。在手动挂载前，我们可以先看一下`/sys/kernel/debug`目录下，有没有文件。
+
+如果没有，可以使用以下命令进行挂载：
+
+```bash
+mount -t debugfs none /sys/kernel/debug
+```
+
+![](./src/0013.jpg)
+
+##### 3.1.1.3 开机自动挂载`debugfs`
+
+如果希望开机自动挂载`debugfs`，可在`/etc/fstab`文件中添加如下一行。
+
+`/etc/fstab`文件内容：
+
+```sh
+# <file system>   <mount point>   <type>   <options>   <dump>   <pass>
+proc              /proc           proc     defaults    0        0
+tmpfs             /tmp            tmpfs    defaults    0        0
+sysfs             /sys            sysfs    defaults    0        0
+# 新增debugfs调试文件系统
+none        /sys/kernel/debug     debugfs  defaults    0        0
+```
+
+可以看到。`proc`的第一个参数是`proc`，`tmpfs`的第一个参数是`tmpfs`，`sysfs`的第一个参数是`sysfs`。那为什么`debugfs`的第一个参数不是`debugfs`而是`none`？
+
+下表汇总了常见虚拟文件系统在`fstab`中的典型写法，方便对比和理解：
+
+| 虚拟文件系统 | `fstab`中的设备字段(第1列) | 标准挂载点(第2列) | 典型挂载选项(第4列) |
+| - | - | - | - |
+| `procfs` | `proc` | `/proc` | `defaults` |
+| `sysfs` | `sysfs` | `/sys` | `defaults` |
+| `tmpfs` | `tmpfs` | `/tmp, /run, /var/volatile` | `defaults,size=xxx,mode=1777` |
+| `devpts` | `devpts` | `/dev/pts` | `mode=0620,gid=5` |
+| `debugfs` | `none` | `/sys/kernel/debug` | `defaults` |
+
+这种差异很多程度上是`历史原因`造成的。
+
++ `proc、sysfs、tmpfs`: 这些文件系统在Linux早期阶段就已存在。在当时，`mount`命令可能对`设备`参数有更严格的要求，过着数去形成了使用其类型名作为设备参数的惯例。这个被一直保留下来，尤其是在`/etc/fstab`中，以确保与所有历史脚本和与其行为的最大兼容性
++ `debugfs`: 作为一个相对比较晚加入内核的调试文件系统，它出现时，*使用`none`来明确表示`无设备`已称为新虚拟文件系统的标准做法*。因此，在配置`debugfs`时，第一参数普遍写作`none`。
+
+从功能上将，对于所有这些虚拟文件系统，*设备字段的具体内容通常并不关键*，因为内核最终是通过`-t <type>`参数来识别文件系统类型的。
+
+#### 3.1.2 `debugfs`与`procfs/sysfs`的对比
+
+| 特性 | `debugfs` | `procfs` | `sysfs` |
+| - | - | - | - |
+| *主要目的* | 内核调试 | 进程信息与类和接口 | 设备与驱动模型 |
+| *稳定性* | *不稳定*，接口可随时更改 | 稳定 | 稳定 |
+| *使用建议* | *仅限开发调试* | 可用于生产环境 | 可用于生产环境 |
+| *创建自定义接口* | *非常灵活简单* | 支持但比较复杂 | 支持，寻遵循特定结构 |
+
+#### 3.1.3 `/sys/kernel/debug/gpio`查看信息
+
+在挂载好`debugfs`之后，就可以使用命令`cat /sys/kernel/debug/gpio`查看`gpio`的硬件调试信息了。如下图所示：
+
+![](./src/0014.jpg)
+
+```sh
+/sys/kernel/debug # cat gpio
+GPIOs 0-31, platform/209c000.gpio, 209c000.gpio:
+ gpio-3   (xnur                ) in  lo    
+ gpio-9   (VSD_3V3             ) out lo    
+ gpio-19  (cd                  ) in  lo    
+
+GPIOs 32-63, platform/20a0000.gpio, 20a0000.gpio:
+
+GPIOs 64-95, platform/20a4000.gpio, 20a4000.gpio:
+
+GPIOs 96-127, platform/20a8000.gpio, 20a8000.gpio:
+
+GPIOs 128-159, platform/20ac000.gpio, 20ac000.gpio:
+ gpio-131 (?                   ) out lo    
+ gpio-134 (phy-reset           ) out lo    
+ gpio-135 (spi32766.0          ) out lo    
+ gpio-136 (?                   ) out lo    
+ gpio-138 (spi4                ) out lo    
+ gpio-139 (spi4                ) out lo    
+```
+
+`/sys/kernel/debug/gpio`文件中的每一行，通常代表一个GPIO引脚的状态。
+
+### 3.2 `/sys/kernel/debug/pinctrl`调试信息
+
+进入`/sys/kernel/debug/pinctrl`目录，可以获取有关GPIO控制器的调试信息。该目录下的文件和目录如下：
+
+![](./src/0015.jpg)
+
+1. `/sys/kernel/debug/pinctrl/20e0000.iomuxc/pinmux-functions`: 设备树`pinctrl`的`function`节点和对应的`group`节点
+
+    ![](./src/0016.jpg)
+
+2. `/sys/kernel/debug/pinctrl/20e0000.iomuxc/pingroups`: 提供了设备树`pinctrl`的`group`子节点的每个引脚组的信息
+
+    ![](./src/0017.jpg)
+
+3. `/sys/kernel/debug/pinctrl/20e0000.iomuxc/pinmux-pins`: 提供了每个引脚的功能模式、`function`节点和`group`引脚组
+
+    ![](./src/0018.jpg)
+
+4. `/sys/kernel/debug/pinctrl/20e0000.iomuxc/pinconf-pins`: 包含了GPIO引脚的配置信息。如输入输出、上拉/下拉、电气属性值
+
+    ![](./src/0019.jpg)
+
+## 第4章 GPIO子系统API函数的引入
+
+### 4.1 两套`GPIO API`接口区分
+
+在目前的Linux内核中，GPIO子系统存在两个版本：新版本和旧版本。新版本GPIO子系统接口是基于描述符(`descriptor-based`)来实现的，旧版本的GPIO子系统接口是基于整数(`integer-bases`)来实现的。在Linux内核中为了保持向下的兼容性，旧版本的接口在最新的内核版本中仍然得到支持。
+
+新的GPIO子系统接口需要与设备树结合使用。没有设备树，就无法使用新的GPIO接口。那要如何为新旧GPIO子系统接口进行区分？
+
+一个明显的区别是，新的GPIO子系统接口使用了以`gpiod_`作为前缀的函数命名约定，而旧的GPIO子系统接口使用了以`gpio_`作为前缀的函数命名约定。
+
+新的GPIO子系统接口示例：
+
+```c
+void gpiod_set_value(struct gpio_desc *desc, int value);
+int  gpiod_get_value(const struct gpio_desc *desc);
+
+int  gpiod_direction_input(struct gpio_desc *desc);
+int  gpiod_direction_output(struct gpio_desc *desc, int value);
+```
+
+旧的GPIO子系统接口示例：
+
+```c
+int  gpio_get_value(unsigned gpio);
+void gpio_set_value(unsigned gpio, int value);
+
+int gpio_direction_input(unsigned gpio);
+int gpio_direction_output(unsigned gpio, int value);
+```
+
+### 4.2 `struct gpio_desc`GPIO描述符
+
+#### 4.2.1 核心作用与设计理念
+
+前面提到，新的GPIO子系统基于描述符来实现，由`struct gpio_desc`结构体来表示。他代表了一个具体的GPIO引脚，是现代Linux GPIO操作的基石。
+
+#### 4.2.1 `struct gpio_desc`关键成员详解
+
+```c
+struct gpio_desc {
+	struct gpio_chip    *chip;
+
+#define FLAG_REQUESTED	0
+#define FLAG_IS_OUT	1
+#define FLAG_EXPORT	2	/* protected by sysfs_lock */
+#define FLAG_SYSFS	3	/* exported via /sys/class/gpio/control */
+#define FLAG_TRIG_FALL	4	/* trigger on falling edge */
+#define FLAG_TRIG_RISE	5	/* trigger on rising edge */
+#define FLAG_ACTIVE_LOW	6	/* value has active low */
+#define FLAG_OPEN_DRAIN	7	/* Gpio is open drain type */
+#define FLAG_OPEN_SOURCE 8	/* Gpio is open source type */
+#define FLAG_USED_AS_IRQ 9	/* GPIO is connected to an IRQ */
+#define FLAG_SYSFS_DIR	10	/* show sysfs direction attribute */
+#define FLAG_IS_HOGGED	11	/* GPIO is hogged */
+
+    unsigned long		flags;
+
+	const char		    *label;
+};
+```
+
+结构体关键成员介绍：
+
+1. `struct gpio_chip *chip`: *指向管理此引脚的GPIO控制器*。这是最重要的成员之一，通过它可以直接找到管理这个引脚的控制芯片(`gpio_chip`)和所有底层操作函数(如`set、get`)。一个GPIO控制器可以管理一组GPIO引脚
+2. `unsigned long flags`: *引脚的状态和属性标志位*。这是一个位图，通过预定义的宏来标识引脚的各种状态。例如：
+    + `FLAG_REQUESTED`: GPIO已被申请
+    + `FLAG_IS_OUT`: 配置为输出模式
+    + `FLAG_ACTIVE_LOW`: 低电平有效
+    + `FLAG_OPEN_DRAIN`: 开漏输出模式
+    + `FLAG_USED_AS_IRQ`: 用于终端输入
+3. `const char *label`: *GPIO的功能标签*。通常来自于设备树中的属性名(如`led-gpios`)或驱动申请时指定的名称。这在`debugfs`中非常有用，可以看到每个GPIO的用途
+
+值得注意的是: `struct gpio_desc`中`并不直接存储`引脚的`当前电平值`。电平是动态的，需要实时的通过其所属的`chip`中的`get()`函数从硬件寄存器中读取。
+
