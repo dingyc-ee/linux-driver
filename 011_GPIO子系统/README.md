@@ -1989,3 +1989,324 @@ static int led_probe(struct platform_device *pdev)
     return 0;
 }
 ```
+
+## 第8章 `GPIO`子系统与`pinctrl`子系统结合
+
+在前面`pinctrl`和`总线`的章节学习中，如果`device`和`driver`匹配成功，就会执行`probe`函数。在`probe`过程中，如果设备节点的`pinctrl-names = "default"`，就会默认设为`pinctrl-0`。如果`pinctrl-names`是其他值，此时就需要我们手动设置。
+
+我们现在把`pinctrl-names`改一下，手动设置`pinctrl`试试。
+
+```dts
+leds {
+    compatible = "gpio-leds";
+    pinctrl-names = "pctl_leds";  // pinctrl-names = "default", probe会自己设置复用
+    pinctrl-0 = <&pinctrl_leds>;
+
+    led0 {
+        led-gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
+    };
+    led1 {
+        led-gpios = <&gpio5 2 GPIO_ACTIVE_LOW>;
+    };
+};
+```
+
+### 8.1 函数介绍
+
+#### 8.1.1 `pinctrl_get`获取`pinctrl`
+
+1. 函数原型
+    ```c
+    struct pinctrl *pinctrl_get(struct device *dev);
+    ```
+2. 头文件
+    ```c
+    #include <linux/pinctrl/pinctrl.h>
+    ```
+3. 函数功能：用于获取指定设备`dev`相关联的`pinctrl`实例
+4. 参数：`device`设备指针
+5. 返回值：返回指向`struct pinctrl`的指针
+
+#### 8.1.2 `pinctrl_put`释放`pinctrl`
+
+1. 函数原型
+    ```c
+    void pinctrl_put(struct pinctrl *p);
+    ```
+2. 头文件
+    ```c
+    #include <linux/pinctrl/pinctrl.h>
+    ```
+3. 函数功能：释放`pinctrl`实例的相关资源
+4. 参数：`pinctrl`实例
+5. 返回值：无
+
+#### 8.1.3 `pinctrl_lookup_state`查找`pinctrl`状态
+
+1. 函数原型
+    ```c
+    struct pinctrl_state *pinctrl_lookup_state(struct pinctrl *p, const char *name)
+    ```
+2. 头文件
+    ```c
+    #include <linux/pinctrl/pinctrl.h>
+    ```
+3. 函数功能：用于在给定的`pinctrl`实例中，查找指定名称的`pinctrl`状态
+4. 参数
+    + `pinctrl`实例
+    + `name`：状态名称
+5. 返回值：返回指向`struct pinctrl_state`的指针
+
+该函数的功能是，在给定的`pinctrl`实例中，查找指定名称的`pinctrl`状态。`pinctrl`状态是与引脚相关的配置和控制状态，例如引脚模式、电气属性等。
+
+#### 8.1.4 `pinctrl_select_state`设置`pinctrl`到硬件
+
+1. 函数原型
+    ```c
+    int pinctrl_select_state(struct pinctrl *p, struct pinctrl_state *state);
+    ```
+2. 头文件
+    ```c
+    #include <linux/pinctrl/pinctrl.h>
+    ```
+3. 函数功能：用于将指定的`pinctrl`状态设置到硬件上
+4. 参数
+    + `pinctrl`实例
+    + ` struct pinctrl_state *state`：要设置的目标状态
+5. 返回值
+    + 成功：0
+    + 失败：其他
+
+### 8.2 测试代码
+
+```dts
+leds {
+    compatible = "gpio-leds";
+    pinctrl-names = "pctl_leds";
+    pinctrl-0 = <&pinctrl_leds>;
+
+    led0 {
+        led-gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
+    };
+    led1 {
+        led-gpios = <&gpio5 2 GPIO_ACTIVE_LOW>;
+    };
+};
+```
+
+`驱动代码.c`
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/gpio/consumer.h>
+#include <linux/pinctrl/consumer.h>
+
+struct led_dev {
+    const char *name;
+    struct gpio_desc *desc;
+    unsigned int minor;
+};
+
+struct leds_dev {
+    const char *name;
+    unsigned int major;
+	struct cdev led_cdev;
+	struct class *led_class;
+    struct pinctrl *pctl;
+    int led_count;
+    struct led_dev *led_dev;
+};
+
+static int led_open(struct inode *inode, struct file *filp)
+{
+    int minor = iminor(inode);
+    struct leds_dev *leds = container_of(inode->i_cdev, struct leds_dev, led_cdev);
+    struct led_dev *led = &leds->led_dev[minor];
+    filp->private_data = led;
+    printk("%s oepn\n", led->name);
+    return 0;
+}
+
+static ssize_t led_write(struct file *filp, const char __user *buf, size_t count, loff_t *ppos)
+{
+    char val;
+    struct led_dev *led = filp->private_data;
+
+    copy_from_user(&val, buf, count);
+    if (val == 1) {
+        printk("%s on\n", led->name);
+        gpiod_set_value(led->desc, 1);
+    }
+    else if (val == 0) {
+        printk("%s off\n", led->name);
+        gpiod_set_value(led->desc, 0);
+    }
+
+    return count;
+}
+
+static int led_release(struct inode *inode, struct file *filp)
+{
+    struct led_dev *led = filp->private_data;
+    printk("%s close\n", led->name);
+    return 0;
+}
+
+static const struct file_operations led_fops = {
+    .owner   = THIS_MODULE,
+    .open    = led_open,
+    .write   = led_write,
+    .release = led_release
+};
+
+static int led_probe(struct platform_device *pdev)
+{
+    dev_t dev_num;
+    int i, ret, led_count;
+    struct device *dev = &pdev->dev;
+    struct fwnode_handle *child;
+    struct leds_dev *leds;
+    struct led_dev *led;
+    struct pinctrl_state *pctl_state;
+
+    printk("led_probe ...\n");
+    led_count = device_get_child_node_count(dev);
+    if (led_count == 0) {
+        printk("no led found\n");
+        return -ENODEV;
+    }
+    else {
+        printk("%d led found\n", led_count);
+    }
+
+    leds = kzalloc(sizeof(struct leds_dev), GFP_KERNEL);
+    if (!leds) {
+        printk("malloc leds fail\n");
+        return -ENOMEM;
+    }
+    leds->name = dev->of_node->name;
+    leds->led_count = led_count;
+    // pinctrl
+    leds->pctl = pinctrl_get(dev);
+    if (IS_ERR(leds->pctl)) {
+        printk("pinctrl_get fail\n");
+        return -ENXIO;
+    }
+    pctl_state = pinctrl_lookup_state(leds->pctl, "pctl_leds");
+    if (IS_ERR(pctl_state)) {
+        printk("pinctrl_lookup_state fail\n");
+        return -ENXIO;
+    }
+    ret = pinctrl_select_state(leds->pctl, pctl_state);
+    if (ret < 0) {
+        printk("pinctrl_select_state fail\n");
+        return -ENXIO;
+    }
+    leds->led_dev = kzalloc(sizeof(struct led_dev) * leds->led_count, GFP_KERNEL);
+    if (!leds->led_dev) {
+        printk("malloc led_dev fail\n");
+        return -ENOMEM;
+    }
+    i = 0;
+    device_for_each_child_node(dev, child) {
+        led = &leds->led_dev[i];
+        led->name = of_node(child)->name;
+        led->desc = fwnode_get_named_gpiod(child, "led-gpios");
+        gpiod_direction_output(led->desc, 0);
+        printk("%s init\n", led->name);
+        i++;
+    }
+
+    alloc_chrdev_region(&dev_num, 0, leds->led_count, leds->name);
+    leds->major = MAJOR(dev_num);
+    for (i = 0; i < leds->led_count; i++) {
+        led = &leds->led_dev[i];
+        led->minor = i;
+        printk("%s %d:%d\n", led->name, leds->major, led->minor);
+    }
+    leds->led_cdev.owner = THIS_MODULE;
+    cdev_init(&leds->led_cdev, &led_fops);
+    cdev_add(&leds->led_cdev, dev_num, leds->led_count);
+    leds->led_class = class_create(THIS_MODULE, leds->name);
+    printk("create class:%s\n", leds->name);
+    for (i = 0; i < leds->led_count; i++) {
+        led = &leds->led_dev[i];
+        device_create(leds->led_class, NULL, MKDEV(leds->major, led->minor), NULL, led->name);
+        printk("create device:%s\n", led->name);
+    }
+    platform_set_drvdata(pdev, leds);
+
+    return 0;
+}
+
+static int led_remove(struct platform_device *pdev)
+{
+    int i;
+    struct leds_dev *leds;
+    struct led_dev *led;
+
+    leds = platform_get_drvdata(pdev);
+    for (i = 0; i < leds->led_count; i++) {
+        led = &leds->led_dev[i];
+        gpiod_set_value(led->desc, 0);
+        gpiod_put(led->desc);
+    }
+    pinctrl_put(leds->pctl);
+    for (i = 0; i < leds->led_count; i++) {
+        led = &leds->led_dev[i];
+        device_destroy(leds->led_class, MKDEV(leds->major, led->minor));
+    }
+    class_destroy(leds->led_class);
+    cdev_del(&leds->led_cdev);
+    unregister_chrdev_region(MKDEV(leds->major, 0), leds->led_count);
+    kfree(leds->led_dev);
+    kfree(leds);
+
+    return 0;
+}
+
+const struct of_device_id led_of_match_table[] = {
+	{ .compatible = "gpio-leds" },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver led_driver = {
+    .probe  = led_probe,
+    .remove = led_remove,
+    .driver = {
+        .name = "gpio-leds",
+        .owner = THIS_MODULE,
+        .of_match_table = led_of_match_table,
+    },
+};
+
+static int __init led_init(void)
+{
+    printk("register led_driver\n");
+    platform_driver_register(&led_driver);
+    return 0;
+}
+
+static void __exit led_exit(void)
+{
+    printk("unregister led_driver\n");
+    platform_driver_unregister(&led_driver);
+}
+
+module_init(led_init);
+module_exit(led_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果：
+
+![](./src/0028.jpg)
