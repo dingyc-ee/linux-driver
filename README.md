@@ -19,3 +19,9 @@
 [使用设备树](008_使用设备树/README.md)
 
 [设备模型](009_设备模型/README.md)
+
+[pinctrl子系统](010_pinctrl子系统/README.md)
+
+[GPIO子系统](011_GPIO子系统/README.md)
+
+[输入子系统](012_输入子系统/README.md)
