@@ -1196,6 +1196,77 @@ if (status_led) {
 
 + 使用`gpiod_get_optional`，如果`status-gpios`属性不存在，`status-led`将为NULL，但驱动不会因此报错失败
 
+#### 5.2.4 `struct fwnode_handle fwnode`成员
+
+##### 5.2.4.1 简介
+
+```c
+// device_node设备节点
+struct device_node {
+	const char *name;
+	const char *type;
+	phandle phandle;
+	const char *full_name;
+	struct fwnode_handle fwnode; // fwnode指针
+    // ...
+};
+
+// device设备指针
+struct device {
+	struct device   *parent;
+	struct kobject  kobj;
+	const char		*init_name;
+	const struct    device_type *type;
+
+	struct bus_type	*bus;
+	struct device_driver *driver;
+	void		*driver_data;
+
+	struct device_node	*of_node;
+	struct fwnode_handle	*fwnode; // fwnode指针
+    // ...
+};
+```
+
+在Linux内核中，`struct device_node`结构退用于表示设备树中的一个节点，而其中的`struct fwnode_handle fwnode`则是一个非常重要的成员，它充当了*连接设备树特定节点与内核统一设备属性接口之间的桥梁*。
+
+| 特性 | `struct device_node`(设备节点) | `struct fwnode_handle`(固件节点句柄) |
+| - | - | - |
+| 来源 | 专用于描述*设备树(DT)*节点 | 抽象层，可代表*设备树(DT)*、*ACPI*等多种固件源 |
+| 核心职责 | 存储设备树节点的具体信息(名称、属性、父子关系) | 提高一套*统一的接口*(fw_node_*开头的函数)，来访问设备属性，隐藏底层差异 |
+| 操作函数 | 传统`of_`系列函数(如`of_find_node_by_name`) | 通用`fwnode_`系列函数(如`fwnode_get_named_gpiod`) |
+| 目的 | *表示*设备树结构 | *抽象*和*访问*设备属性，无论其来源 |
+
+`struct fwnode_handle fwnode`成员的主要作用是，将特定的设备树节点(device_node)嵌入到一个通用的、与固件来源无关的句柄中。这个句柄可以被内核中哪些需要访问设备属性但又不希望紧密耦合于设备树机制的子系统和使用*统一接口*。
+
+##### 5.2.4.2 主要作用
+
+1. ***提供统一的设备属性访问接口***：通过`fwnode_handle`，内核提供了一组以`fwnode_*`为前缀的函数(例如`fwnode_get_named_gpiod、fwnode_property_read_string`)。驱动开发者可以使用这些通用函数来获取属性、GPIO、中断等资源，而无需关心底层硬件描述是来源于设备树(DT)还是ACPI等其他固件形式。这增强了驱动的可移植性和代码的简洁性
+2. ***支持多种固件来源***：`fwnode_handle`的设计是内核为了*抽象化不同固件来源(如设备树DT和ACPI)*的努力之一。虽然`device_node`本身是设备树特有的，但内嵌的`fwnode_handle`允许该节点在某些场景写通过通用的`fwnode`接口被操作，为未来可能的扩展或在不同固件环境下保持接口移植提供了基础
+3. ***集成到设备模型***：在Linux统一设备模型中，`struct device`结构体包含了一个`struct fwnode_handle *fwnode`的成员。对于支持设备树的平台，`device->fwnode`可以指向一个设备树节点内部的`fwnode_handle`(例如`&device_node->fwnode`)。这样，驱动在操作`struct device`时，就可以通过其通用的`fwnode`成员来获取设备属性，无需直接梳理设备树特有的`device_node`结构
+
+##### 5.2.4.3 典型使用场景
+
+加入一个驱动要获取设备树中某个节点的GPIO描述符：
+
++ 传统方式(直接使用设备树API)：驱动需要先获取`struct device_node *`，然后使用`of_get_named_gpio()`等`of_`系列函数
++ 通用方式(通过fwnode接口)：驱动可以获取到该节点对应的`struct fwnode_handle *`(通常来自于dev->fwnode或遍历子节点获得)，然后使用`fwnode_get_named_gpiod()`等函数
+
+```c
+/* 示例：通过 fwnode 获取 GPIO */
+struct fwnode_handle *child_fwnode; // 假设这是从某个地方获取到的子节点 fwnode
+struct gpio_desc *gpiod;
+
+gpiod = fwnode_get_named_gpiod(child_fwnode, "led-gpios", 0, GPIOD_OUT_LOW, NULL);
+if (IS_ERR(gpiod)) {
+    /* 错误处理 */
+}
+```
+
+##### 5.2.4.4 总结
+
+`struct device_node`结构体中的`struct fwnode_handle *fwnode`成员，是Linux内核为了​​统一设备属性访问接口​​、​​支持多种固件来源​​，并将​​设备树节点无缝集成到内核统一设备模型​​中的关键设计。它允许内核和驱动开发者使用一套相对稳定的API（fwnode_系列函数）来访问设备属性，而无需过分关注底层硬件描述的具体实现细节，从而提高了代码的通用性和可维护性。
+
 ### 5.3 重要注意事项
 
 1. 错误检查：*必须*使用`IS_ERR()`来检查`gpiod_get`和`gpiod_get_index`的返回值(除非使用`*_optional`变体且你确信可以忽略错误)。不要直接判断返回值是否为NULL
@@ -1231,15 +1302,264 @@ if (status_led) {
 		pinctrl-0 = <&pinctrl_leds>;
 
 		led0 {
-			led0-gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
+			led-gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
 		};
 		led1 {
-			led1-gpios = <&gpio5 2 GPIO_ACTIVE_LOW>;
+			led-gpios = <&gpio5 2 GPIO_ACTIVE_LOW>;
 		};
 	};
 }
 ```
 
-#### 5.4.2 驱动程序
+#### 5.4.2 关闭内核的`led`子系统
+
+由于我们的`led`设备节点名为`leds`，而Linux内核的`led`子系统也会创建`class`名为`leds`的类。这样就冲突了，我们的设备无法创建。
+
+关闭Linux内核默认编译的`led`子系统：
+
+![](./src/0022.jpg)
+
+然后重新编译Linux内核。
+
+#### 5.4.3 驱动代码1：建立`platform`驱动和字符设备
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/gpio/consumer.h>
+
+struct led_dev {
+    const char *name;
+    struct gpio_desc *desc;
+    unsigned int minor;
+};
+
+struct leds_dev {
+    const char *name;
+    unsigned int major;
+	struct cdev led_cdev;
+	struct class *led_class;
+    int led_count;
+    struct led_dev *led_dev;
+};
+
+static const struct file_operations led_fops = {
+
+};
+
+static int led_probe(struct platform_device *pdev)
+{
+    dev_t dev_num;
+    int i, led_count;
+    struct device *dev = &pdev->dev;
+    struct fwnode_handle *child;
+    struct leds_dev *leds;
+    struct led_dev *led;
+
+    printk("led_probe ...\n");
+    led_count = device_get_child_node_count(dev);
+    if (led_count == 0) {
+        printk("no led found\n");
+        return -ENODEV;
+    }
+    else {
+        printk("%d led found\n", led_count);
+    }
+
+    leds = kzalloc(sizeof(struct leds_dev), GFP_KERNEL);
+    if (!leds) {
+        printk("malloc leds fail\n");
+        return -ENOMEM;
+    }
+    leds->name = dev->of_node->name;
+    leds->led_count = led_count;
+    leds->led_dev = kzalloc(sizeof(struct led_dev) * leds->led_count, GFP_KERNEL);
+    if (!leds->led_dev) {
+        printk("malloc led_dev fail\n");
+        return -ENOMEM;
+    }
+    i = 0;
+    device_for_each_child_node(dev, child) {
+        led = &leds->led_dev[i];
+        led->name = of_node(child)->name;
+        led->desc = fwnode_get_named_gpiod(child, "led-gpios");
+        gpiod_direction_output(led->desc, 0);
+        printk("%s init\n", led->name);
+        i++;
+    }
+
+    alloc_chrdev_region(&dev_num, 0, leds->led_count, leds->name);
+    leds->major = MAJOR(dev_num);
+    for (i = 0; i < leds->led_count; i++) {
+        led = &leds->led_dev[i];
+        led->minor = i;
+        printk("%s %d:%d\n", led->name, leds->major, led->minor);
+    }
+    leds->led_cdev.owner = THIS_MODULE;
+    cdev_init(&leds->led_cdev, &led_fops);
+    cdev_add(&leds->led_cdev, dev_num, leds->led_count);
+    leds->led_class = class_create(THIS_MODULE, leds->name);
+    printk("create class:%s\n", leds->name);
+    for (i = 0; i < leds->led_count; i++) {
+        led = &leds->led_dev[i];
+        device_create(leds->led_class, NULL, MKDEV(leds->major, led->minor), NULL, led->name);
+        printk("create device:%s\n", led->name);
+    }
+    platform_set_drvdata(pdev, leds);
+
+    return 0;
+}
+
+static int led_remove(struct platform_device *pdev)
+{
+    int i;
+    struct leds_dev *leds;
+    struct led_dev *led;
+
+    leds = platform_get_drvdata(pdev);
+    for (i = 0; i < leds->led_count; i++) {
+        led = &leds->led_dev[i];
+        gpiod_set_value(led->desc, 0);
+        gpiod_put(led->desc);
+    }
+    for (i = 0; i < leds->led_count; i++) {
+        led = &leds->led_dev[i];
+        device_destroy(leds->led_class, MKDEV(leds->major, led->minor));
+    }
+    class_destroy(leds->led_class);
+    cdev_del(&leds->led_cdev);
+    unregister_chrdev_region(MKDEV(leds->major, 0), leds->led_count);
+    kfree(leds->led_dev);
+    kfree(leds);
+
+    return 0;
+}
+
+const struct of_device_id led_of_match_table[] = {
+	{ .compatible = "gpio-leds" },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver led_driver = {
+    .probe  = led_probe,
+    .remove = led_remove,
+    .driver = {
+        .name = "gpio-leds",
+        .owner = THIS_MODULE,
+        .of_match_table = led_of_match_table,
+    },
+};
+
+static int __init led_init(void)
+{
+    printk("register led_driver\n");
+    platform_driver_register(&led_driver);
+    return 0;
+}
+
+static void __exit led_exit(void)
+{
+    printk("unregister led_driver\n");
+    platform_driver_unregister(&led_driver);
+}
+
+module_init(led_init);
+module_exit(led_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果如下：
+
+![](./src/0023.jpg)
+
+#### 5.4.4 驱动代码2：增加`open`、`write`、`close`函数
+
+`驱动代码.c`
+
+```c
+static int led_open(struct inode *inode, struct file *filp)
+{
+    int minor = iminor(inode);
+    struct leds_dev *leds = container_of(inode->i_cdev, struct leds_dev, led_cdev);
+    struct led_dev *led = &leds->led_dev[minor];
+    filp->private_data = led;
+    printk("%s oepn\n", led->name);
+    return 0;
+}
+
+static ssize_t led_write(struct file *filp, const char __user *buf, size_t count, loff_t *ppos)
+{
+    char val;
+    struct led_dev *led = filp->private_data;
+
+    copy_from_user(&val, buf, count);
+    if (val == 1) {
+        printk("%s on\n", led->name);
+        gpiod_set_value(led->desc, 1);
+    }
+    else if (val == 0) {
+        printk("%s off\n", led->name);
+        gpiod_set_value(led->desc, 0);
+    }
+
+    return count;
+}
+
+static int led_release(struct inode *inode, struct file *filp)
+{
+    struct led_dev *led = filp->private_data;
+    printk("%s close\n", led->name);
+    return 0;
+}
+
+static const struct file_operations led_fops = {
+    .owner   = THIS_MODULE,
+    .open    = led_open,
+    .write   = led_write,
+    .release = led_release
+};
+```
+
+`测试代码.c`
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[])
+{
+    int fd;
+    unsigned char val;
+
+    if (argc < 2) {
+        printf("Usage: ./app /dev/ledx <1/0>\n");
+        return -EINVAL;
+    }
+    fd = open(argv[1], O_WRONLY);
+    if (fd < 0) {
+        printf("Open %s fail:%d\n", argv[1], fd);
+        return fd;
+    }
+    val = atoi(argv[2]);
+    write(fd, &val, sizeof(val));
+    close(fd);
+}
+```
+
+测试结果如下所示：
+
+![](./src/0024.jpg)
 
 
