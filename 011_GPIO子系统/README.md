@@ -1562,4 +1562,430 @@ int main(int argc, char *argv[])
 
 ![](./src/0024.jpg)
 
+## 第6章 GPIO操作函数实验
 
+本章节将对新gpio子系统中操作GPIO的相关API接口函数进行讲解。
+
+### 6.1 函数介绍
+
+#### 6.1.1 `gpiod_get_direction`获取GPIO方向
+
+1. 函数原型
+    ```c
+    int gpiod_get_direction(struct gpio_desc *desc);
+    ```
+2. 头文件
+    ```c
+    #include <linux/gpio/consumer.h>
+    ```
+3. 参数：`gpio_desc`描述符指针
+4. 返回值
+    + `GPIOF_DIR_IN`: 输入
+    + `GPIOF_DIR_OUT`: 输出
+
+#### 6.1.2 `gpiod_direction_input/output`配置GPIO的方向
+
+1. 函数原型
+    ```c
+    int gpiod_direction_input(struct gpio_desc *desc);
+    int gpiod_direction_output(struct gpio_desc *desc, int value);
+    ```
+2. 头文件
+    ```c
+    #include <linux/gpio/consumer.h>
+    ```
+3. 参数
+    + `gpio_desc`: 描述符指针
+    + `value`: 逻辑电平。不一定是真实电平
+4. 返回值
+    + 成功: 0
+    + 失败: 其他error code
+
+#### 6.1.3 `gpiod_get_value`读取GPIO电平
+
+1. 函数原型
+    ```c
+    int gpiod_get_value(const struct gpio_desc *desc);
+    ```
+2. 头文件
+    ```c
+    #include <linux/gpio/consumer.h>
+    ```
+3. 参数：`gpio_desc`描述符指针
+4. 返回值：逻辑电平
+    + 1: 逻辑高电平
+    + 0: 逻辑低电平
+
+#### 6.1.3 `gpiod_set_value`设置GPIO电平
+
+1. 函数原型
+    ```c
+    void gpiod_set_value(struct gpio_desc *desc, int value);
+    ```
+2. 头文件
+    ```c
+    #include <linux/gpio/consumer.h>
+    ```
+3. 参数
+    + `gpio_desc`: 描述符指针
+    + `value`: 逻辑电平
+
+#### 6.1.4 `gpiod_to_irq`获取中断
+
+1. 函数原型
+    ```c
+    int gpiod_to_irq(const struct gpio_desc *desc);
+    ```
+2. 头文件
+    ```c
+    #include <linux/gpio/consumer.h>
+    ```
+3. 参数：`gpio_desc`描述符指针
+4. 返回值：中断号
+
+### 6.2 设备树
+
+我们新增一个按键驱动。按一下LED亮，再按一下LED灭。*注意：这里`gpio-keys`已经被button输入子系统使用。我们这样写会报错。这里只是为了演示。*
+
+```dts
+/ {
+    leds {
+        compatible = "gpio-leds";
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_leds>;
+
+        led0 {
+            led-gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
+        };
+        led1 {
+            led-gpios = <&gpio5 2 GPIO_ACTIVE_LOW>;
+        };
+    };
+
+    keys {
+        compatible = "gpio-keys";
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_keys>;
+        key-gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;
+    };
+}
+```
+
+测试结果：
+
+![](./src/0025.jpg)
+
+可以看到，这里提示*驱动gpio-keys*已经存在。我们搜一下Linux内核源码，可以看到在输入子系统中已经使用了这个驱动名。
+
+![](./src/0026.jpg)
+
+我现在还不想裁剪Linux内核的输入子系统配置，先简单的把设备和驱动的`compatible`改个名称。
+
+```dts
+/ {
+    leds {
+        compatible = "gpio-leds";
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_leds>;
+
+        led0 {
+            led-gpios = <&gpio5 1 GPIO_ACTIVE_LOW>;
+        };
+        led1 {
+            led-gpios = <&gpio5 2 GPIO_ACTIVE_LOW>;
+        };
+    };
+
+    keys {
+        compatible = "gpio-key";
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_keys>;
+        key-gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;
+    };
+}
+```
+
+### 6.3 驱动代码
+
+`按键驱动.c`
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/of.h>
+#include <linux/platform_device.h>
+#include <linux/gpio/consumer.h>
+
+struct key_dev {
+    const char *name;
+    dev_t  dev_num;
+	struct cdev cdev;
+	struct class *class;
+    struct gpio_desc *desc;
+};
+
+static int key_open(struct inode *inode, struct file *filp)
+{
+    struct key_dev *dev = container_of(inode->i_cdev, struct key_dev, cdev);
+    filp->private_data = dev;
+    printk("%s oepn\n", dev->name);
+    return 0;
+}
+
+static ssize_t key_read(struct file *filp, char __user *buf, size_t count, loff_t *pos)
+{
+    struct key_dev *dev = filp->private_data;
+    char val = gpiod_get_value(dev->desc);
+    copy_to_user(buf, &val, 1);
+    return 1;
+}
+
+static int key_release(struct inode *inode, struct file *filp)
+{
+    struct key_dev *led = filp->private_data;
+    printk("%s close\n", led->name);
+    return 0;
+}
+
+static const struct file_operations key_fops = {
+    .owner   = THIS_MODULE,
+    .open    = key_open,
+    .read    = key_read,
+    .release = key_release
+};
+
+static int key_probe(struct platform_device *pdev)
+{
+    struct key_dev *dev;
+
+    printk("key_probe ...\n");
+    dev = kzalloc(sizeof(struct key_dev), GFP_KERNEL);
+    if (!dev) {
+        printk("malloc fail\n");
+        return -ENOMEM;
+    }
+    dev->name = pdev->dev.of_node->name;
+    dev->desc = gpiod_get_optional(&pdev->dev, "key", GPIOD_IN);
+    gpiod_direction_input(dev->desc);
+    alloc_chrdev_region(&dev->dev_num, 0, 1, dev->name);
+    dev->cdev.owner = THIS_MODULE;
+    cdev_init(&dev->cdev, &key_fops);
+    cdev_add(&dev->cdev, dev->dev_num, 1);
+    dev->class = class_create(THIS_MODULE, dev->name);
+    device_create(dev->class, NULL, dev->dev_num, NULL, "key");
+    platform_set_drvdata(pdev, dev);
+
+    return 0;
+}
+
+static int key_remove(struct platform_device *pdev)
+{
+    struct key_dev *dev;
+
+    dev = platform_get_drvdata(pdev);
+    gpiod_put(dev->desc);
+    device_destroy(dev->class, dev->dev_num);
+    class_destroy(dev->class);
+    cdev_del(&dev->cdev);
+    unregister_chrdev_region(dev->dev_num, 1);
+    kfree(dev);
+
+    return 0;
+}
+
+const struct of_device_id key_of_match_table[] = {
+	{ .compatible = "gpio-key" },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver key_driver = {
+    .probe  = key_probe,
+    .remove = key_remove,
+    .driver = {
+        .name = "gpio-key",
+        .owner = THIS_MODULE,
+        .of_match_table = key_of_match_table,
+    },
+};
+
+static int __init key_init(void)
+{
+    printk("register key_driver\n");
+    platform_driver_register(&key_driver);
+    return 0;
+}
+
+static void __exit key_exit(void)
+{
+    printk("unregister key_driver\n");
+    platform_driver_unregister(&key_driver);
+}
+
+module_init(key_init);
+module_exit(key_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+`测试程序app.c`
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[])
+{
+    int led_fd, key_fd;
+    unsigned char last, cur, val;
+
+    led_fd = open("/dev/led0", O_WRONLY);
+    key_fd = open("/dev/key", O_RDONLY);
+
+    last = cur = 0;
+    while (1) {
+        read(key_fd, &cur, 1);
+        if (cur != last) {
+            if (cur) {
+                val = 1;
+                printf("down\n");
+            }
+            else {
+                val = 0;
+                printf("up\n");
+            }
+            write(led_fd, &val, 1);
+            last = cur;
+        }
+        usleep(20 * 1000);
+    }
+
+    close(led_fd);
+    close(key_fd);
+    return 0;
+}
+```
+
+测试结果：
+
+![](./src/0027.jpg)
+
+## 第7章 三级节点操作函数实验
+
+在前两章中，我们使用`gpio`子系统的API函数，操作了`led`和`key`这两个硬件外设。
+
+我们先看下他们的设备树。可以看到：
+
+1. `keys`的gpio是二级节点描述。可以直接使用`gpiod_get_xxx`接口获取`gpio desc`描述符
+2. `leds`的gpio是三级节点描述。如果仍然使用`gpiod_get_xxx`来获取`gpio desc`描述，会获取不成功
+
+```dts
+/ {
+    keys {
+        compatible = "gpio-key";
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_keys>;
+        key-gpios = <&gpio5 0 GPIO_ACTIVE_LOW>;     // 二级节点
+    };
+
+    leds {
+        compatible = "gpio-leds";
+        pinctrl-names = "default";
+        pinctrl-0 = <&pinctrl_leds>;
+
+        led0 {
+            led-gpios = <&gpio5 1 GPIO_ACTIVE_LOW>; // 三级节点
+        };
+        led1 {
+            led-gpios = <&gpio5 2 GPIO_ACTIVE_LOW>;
+        };
+    };
+}
+```
+
+那么，获取三级节点的GPIO描述要使用什么函数？我们继续往后看。
+
+### 7.1 函数介绍
+
+#### 7.1.1 `device_get_child_node_count`计算子节点数量
+
+1. 函数原型
+    ```c
+    unsigned int device_get_child_node_count(struct device *dev);
+    ```
+2. 头文件
+    ```c
+    #include <linux/device.h>
+    ```
+3. 函数功能：用于计算给定设备节点`dev`的子节点个数
+4. 返回值：子节点个数
+
+#### 7.1.2 `fwnode_get_named_gpiod`获取指定节点的GPIO描述符
+
+1. 函数原型
+    ```c
+    struct gpio_desc *fwnode_get_named_gpiod(struct fwnode_handle *fwnode, const char *propname);
+    ```
+2. 头文件
+    ```c
+    #include <linux/gpio/consumer.h>
+    ```
+3. 函数功能：该函数通过指定节点的对象地址，获取子结点中的GPIO描述符
+4. 参数
+    + `fwnode`：指向`struct fwnode_handle`指针，表示要获取GPIO的节点对象地址
+    + `propname`：属性名。指定要获取的GPIO属性名称
+5. 返回值：GPIO描述符
+
+#### 7.1.3 `device_get_next_child_node`获取下一个子节点对象地址
+
+1. 函数原型
+    ```c
+    struct fwnode_handle *device_get_next_child_node(struct device *dev, struct fwnode_handle *child)
+    ```
+2. 头文件
+    ```c
+    #include <linux/device.h>
+    ```
+3. 函数功能：用于获取给定父设备节点`dev`的下一个子设备节点
+4. 参数
+    + `dev`：父设备节点
+    + `child`：指向`struct fwnode_handle`的指针，表示当前子设备节点
+5. 返回值：返回指向`struct fwnode_handle`的指针
+
+### 7.2 函数使用示例
+
+使用前面这3个函数，可以循环遍历三级节点，取出每个节点的GPIO描述符。
+
+```c
+static int led_probe(struct platform_device *pdev)
+{
+    int count = 0;
+    struct fwnode_handle *child_fw = NULL;
+    struct gpio_desc *led[2];
+
+
+    // 获取父设备节点的子设备节点数量
+   count = device_get_child_node_count(&pdev->dev);
+    printk("count: %d\n", count);
+
+    for (int i = 0; i < count; i++) {
+        // 获取下一个子设备节点
+        child_fw = device_get_next_child_node(&pdev->dev, child_fw);
+        if (child_fw) {
+            // 获取三级节点的GPIO描述符
+            led[i] = fwnode_get_named_gpiod(child_fw, "led-gpios");
+        }
+    }
+
+    return 0;
+}
+```
