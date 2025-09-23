@@ -778,7 +778,9 @@ void GIC_DisableIRQ(IRQn_Type IRQn)
 }
 ```
 
-### 3.3 中断号
+## 第4章 中断子系统
+
+### 4.1 中断号
 
 Linux内核中的中断管理采用双重标识机制(`IRQ number`和`HW interrupt ID`)，来标识一个来自外设的中断。
 
@@ -787,7 +789,7 @@ Linux内核中的中断管理采用双重标识机制(`IRQ number`和`HW interru
 
 ![](./src/0010.jpg)
 
-#### 3.3.1 为什么需要双重中断号
+#### 4.1.1 为什么需要双重中断号
 
 如果是在GIC控制器级联的情况下，仅仅用HW interrupt ID就不能唯一标识一个外设中断，还需要知道该HW interrupt ID所属的中断控制器(因为HW interrupt ID在不同的中断控制器上是会重复编码的)
 
@@ -797,10 +799,153 @@ Linux内核中的中断管理采用双重标识机制(`IRQ number`和`HW interru
 
 驱动无需感知HW ID，只需调用`platform_get_irq()`或`of_irq_get()`获取IRQ number
 
-#### 3.3.2 单片机为何只有一种中断号
+#### 4.1.2 单片机为何只有一种中断号
 
 1. 硬件环境单一
     + 固定中断控制器：单片机(如stm32)通常集成单一中断控制器(NVIC)，中断源数量有限且物理连接固定
     + 无动态扩展需求：外设与中断线绑定在芯片设计时确定，无需多平台适配
 2. 资源限制：IRQ domain映射表需占用内存(约数KB) 在资源紧张的单片机中不必要
+
+### 4.2 中断申请函数
+
+#### 4.2.1 `request_irq`函数
+
+##### 4.2.1.1 函数原型
+
+```c
+int request_irq(unsigned int irq, 
+                irq_handler_t handler, 
+                unsigned long flags,
+                const char *name,
+                void *dev)
+```
+
+##### 4.2.1.2 参数详解
+
+1. `unsigned int irq` (中断号)
+    + 作用：指定要注册的中断号
+    + 取值范围：
+        + 系统已使用的中断：`0-31`
+        + 用户自定义终端：`32-16640`
+    + 注意事项：必须确保中断号有效且未被其他设备独占使用
+
+2. `irq_handler_t handler` (中断处理函数)
+    + 函数原型：`typedef irqreturn_t (*irq_handler_t)(int, void *)`
+    + 参数：
+        + `int`：触发的中断号
+        + `void *`：设备标识指针，与`request_irq`的`dev`参数对应
+    + 返回值：`irqreturn_t`类型。常用值：
+        + `IRQ_NONE`：表示该中断不是由本设备触发
+        + `IRQ_HANDLED`：表示中断已处理
+        + `IRQ_WAKE_THREAD`：唤醒中断线程(用于线程化中断)
+
+3. `unsigned long flags` (中断标志)
+    + 作用：配置中断的行为特性
+    + 常用标志：
+        + `IRQF_SHARED`：多个设备共享同一个中断线(必须指定)
+        + `IRQF_DISABLED`：中断处理期间禁用所有其他中断(旧版内核使用，现代内核中该标志已被忽略)
+        + `IRQF_TRIGGER_RISING / IRQF_TRIGGER_FALLING`：上升/下降沿触发
+        + `IRQF_TRIGGER_HIGH / IRQF_TRIGGER_LOW`：高/低电平触发
+
+4. `const char *name` (中断名称)
+    + 作用：设置中断的文本描述
+    + 用途：在`/proc/interrupts`文件中显示，便于系统调试和监控
+    + 示例：`"eth0"`、`"my_device"`
+
+5. `void *dev` (设备标识)
+    + 作用：设备特定的数据指针
+    + 关键用途：
+        + 在共享中断`IRQF_SHARED`时，作为唯一标识区分不同设备
+        + 传递给中断处理函数的第二个参数
+        + 用于`free_irq()`函数，释放特定中断处理程序
+    + 最佳实践：通常设置为设备结构体指针
+
+6. 返回值
+    + `0`：中断申请成功
+    + `负值`：中断申请失败
+
+##### 4.2.1.3 函数功能
+
+1. *注册中断处理程序*：将指定的中断处理函数与特定中断号绑定
+2. *激活中断*：函数会自动使能(*激活*)该中断线，无需额外操作
+3. *资源管理*：检查中断号是否可用、新申请的中断添加到内核的数据结构
+4. *中断线程化支持*：现代Linux内核中，`request_irq`实际上是`request_threaded_irq`的封装
+    ```c
+    int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,
+            const char *name, void *dev)
+    {
+        return request_threaded_irq(irq, handler, NULL, flags, name, dev);
+    }
+    ```
+
+##### 4.2.1.4 典型使用场景
+
+1. 设备驱动程序。设备驱动初始化时，注册中断处理函数：
+
+    ```c
+    static irqreturn_t my_device_irq_handler(int irq, void *dev_id)
+    {
+        struct my_device *dev = dev_id;
+        // 处理中断...
+        return IRQ_HANDLED;
+    }
+
+    static int my_device_probe(struct platform_device *pdev)
+    {
+        int ret;
+        struct my_device *dev = platform_get_drvdata(pdev);
+        
+        ret = request_irq(dev->irq, my_device_irq_handler, 
+                        IRQF_TRIGGER_RISING, "my_device", dev);
+        if (ret) {
+            dev_err(&pdev->dev, "Failed to request IRQ\n");
+            return ret;
+        }
+        // ...
+    }
+    ```
+
+2. 共享中断。多个设备共享同一个中断线：
+
+    ```c
+    // 设备1
+    request_irq(irq_num, handler1, IRQF_SHARED, "device1", &dev1_data);
+
+    // 设备2
+    request_irq(irq_num, handler2, IRQF_SHARED, "device2", &dev2_data);
+
+    // 中断处理函数中需要检查是否是自己的设备触发的中断
+    irqreturn_t handler1(int irq, void *dev_id)
+    {
+        struct device_data *data = dev_id;
+        if (!is_my_interrupt(data)) 
+            return IRQ_NONE;
+        
+        // 处理中断
+        return IRQ_HANDLED;
+    }
+    ```
+
+##### 4.2.1.5 为什么这样设计
+
+1. 灵活的中断处理模型
+    + *上半部与下半部分离*：中断处理分为快速执行的上半部(中断处理函数)和可以延迟执行的下半部(`tasklet`、工作队列)
+    + *中断线程化支持*：现代内核中`request_irq`实际调用`request_threaded_irq`，允许将耗时操作移到线程中执行，提高系统响应性
+
+2. 资源管理与共享机制
+    + *共享中断设计*：通过`dev`参数和`IRQF_SHARED`标志，允许多个设备共享同一中断线，解决中断资源有限的问题
+    + *唯一标识机制*：`dev`参数作为共享中断的唯一标识，确保内核能正确区分不同设备
+
+3. 兼容性与可扩展性
+    + *标志位设计*：通过`flags`参数支持新特性而不破坏旧API
+    + *触发方式灵活*：支持多种中断触发方式，适应不同硬件需求
+    + *名称标识*：在`/proc/interrupts`中显示设备名称，便于系统监控和调试
+
+##### 4.2.1.6 注意事项
+
+1. *不能在中断上下文调用*：`request_irq`可能导致睡眠，因此不能再中断处理函数或其他禁止睡眠的上下文中使用
+2. *中断处理函数限制*
+    + 执行时间应尽量短
+    + 不能调用可能睡眠的函数
+    + 不能获取可能引起阻塞的锁
 
