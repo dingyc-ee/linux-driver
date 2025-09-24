@@ -949,3 +949,687 @@ int request_irq(unsigned int irq,
     + 不能调用可能睡眠的函数
     + 不能获取可能引起阻塞的锁
 
+#### 4.2.2 `gpio(gpiod)_to_irq`函数
+
+##### 4.2.2.1 函数原型
+
+```c
+int gpiod_to_irq(const struct gpio_desc *desc);
+
+int gpio_to_irq(unsigned int gpio);
+```
+
+##### 4.2.2.2 参数详解
+
++ 类型：指向`gpio desc`描述符的指针
++ 来源：通常由`gpiod_get`、`gpiod_get_index`等函数获取
++ 返回值
+    + 成功：返回非负整数，表示有效的中断号
+    + 失败：返回负的错误码
+
+##### 4.2.2.3 函数功能
+
+核心功能：将GPIO描述符转换为对应的中断号，实现从GPIO引脚到中断线的映射。
+
+#### 4.2.3 `free_irq`函数
+
+##### 4.2.3.1 函数原型
+
+```c
+void free_irq(unsigned int irq, void *dev_id);
+```
+
+##### 4.2.3.2 参数详解
+
+1. `nsigned int irq` (中断号)
+    + 作用：指定要释放的中断号
+    + 要求：
+        + 必须是之前通过`request_irq`成功注册的中断号
+        + 必须有效且在系统支持的范围内(`0 ~ NR_IRQS`)
+
+2. `void *dev_id` (设备标识符)
+    + 作用：唯一标识中断处理程序的设备指针
+    + 关键特性：
+        + 必须与调用`request_irq`时传递的`dev`参数完全相同
+        + 在共享中断情况下，这是区分不同设备的关键
+
+##### 4.2.3.3 函数功能
+
+核心功能：清理和释放中断资源。
+
+##### 4.2.3.4 典型使用场景
+
+1. 设备驱动卸载(`remove`函数)
+
+    ```c
+    static void my_driver_remove(struct platform_device *pdev)
+    {
+        struct my_device *dev = platform_get_drvdata(pdev);
+        
+        // 释放中断
+        free_irq(dev->irq, dev);
+        
+        // 其他资源清理...
+        kfree(dev);
+    }
+    ```
+
+2. 设备热插拔处理
+
+    ```c
+    static void handle_device_removal(struct my_device *dev)
+    {
+        // 停止设备操作
+        device_stop(dev);
+        
+        // 释放中断
+        free_irq(dev->irq, dev);
+        
+        // 清理其他资源
+        release_dma_channel(dev->dma);
+    }
+    ```
+
+### 4.3 中断服务函数`irqreturn_t (*irq_handler_t)(int irq, void *dev_id)`
+
+中断服务程序，是在中断事件发生时自动调用的函数。她负责处理与中断相关的操作，例如读取数据、清除中断标志、更新状态。
+
+#### 4.3.1 函数功能
+
+##### 4.3.1.1 核心功能
+
++ 快速响应硬件：在最短时间内响应硬件中断
++ 关键操作执行：
+    + 读取 / 清除中断状态寄存器
+    + 保存关键硬件状态
+    + 调度下半部处理(如设置标志、唤醒线程)
++ 避免耗时操作：不执行可能睡眠，阻塞或耗时的操作
+
+##### 4.3.1.2 执行环境特点
+
++ 中断上下文：
+    + 运行在原子上下文中
+    + 不能睡眠或调用可能睡眠的函数
+    + 不能获取可能导致睡眠的锁
+    + 不能进行用户空间内存访问
++ 资源限制：
+    + 使用有限的中断栈(通常是4KB或8KB)
+    + 不能进行大量内存分配
+    + 中断处理期间，同类型中断被屏蔽
++ 优先级
+    + 具有最高执行优先级
+    + 会抢占当前正在执行的进程和软中断
+
+#### 4.3.2 参数详解
+
+1. `int irq` (中断号)
+    + 作用：标识触发中断的硬件中断线
+    + 注意事项：一般情况下，中断处理函数更少直接使用这个参数
+
+2. `void *dev_id` (设备标识)
+    + 作用：设备特定的数据指针，用于区分不同设备
+    + 设计意义：实现设备无关性。中断处理函数可以操作任意设备类型
+
+#### 4.3.3 返回值
+
+返回值`irqreturn_t`是一个枚举类型。如下：
+
+```c
+enum irqreturn {
+    IRQ_NONE		= (0 << 0),
+    IRQ_HANDLED		= (1 << 0),
+    IRQ_WAKE_THREAD = (1 << 1),
+};
+```
+
+1. `IRQ_NONE`
+    + 含义：该中断不是由本设备触发
+    + 典型场景：在共享中断环境中，当前设备检查后发现不是自己的中断
+    + 行为影响：
+        + 内核会继续调用该中断线上注册的其他处理程序
+        + 如果所有处理程序都返回`IRQ_NONE`，内核会记录`unhandled IRQ`警告
+
+2. `IRQ_HANDLED`
+    + 含义：中断已成功处理
+    + 典型场景：
+        + 设备成功处理了中断事件
+        + 在非共享中断环境中，通常总是返回此值
+    + 行为影响：
+        + 内核知道该中断已被处理，不再调用该中断线上的其他处理程序
+        + 对于非共享中断，这是最常用的返回值
+
+3. `IRQ_WAKE_THREAD`
+    + 含义：需要唤醒中断线程进行处理
+    + 典型场景：
+        + 使用`request_threaded_irq`注册的线程化中断
+        + 当上半部(硬中断处理函数)执行完毕后，需要触发下半部(线程函数)
+    + 行为影响：
+        + 内核会唤醒与该中断关联的内核线程
+        + 线程函数(`thread_fn`)将在进程上下文中执行
+        + 这是实现中断线程化的核心机制
+
+#### 4.3.4 典型使用场景
+
+##### 4.3.4.1 标准中断处理
+
+```c
+static irqreturn_t my_irq_handler(int irq, void *dev_id)
+{
+    struct my_device *dev = dev_id;
+    u32 status;
+    
+    /* 读取中断状态寄存器 */
+    status = readl(dev->base + STATUS_REG);
+    
+    /* 检查是否是本设备触发的中断 */
+    if (!(status & MY_DEVICE_INT_MASK))
+        return IRQ_NONE;
+    
+    /* 清除中断标志 */
+    writel(status & MY_DEVICE_INT_MASK, dev->base + STATUS_REG);
+    
+    /* 保存关键状态 */
+    dev->irq_count++;
+    
+    /* 调度下半部处理（如tasklet或工作队列） */
+    tasklet_schedule(&dev->irq_tasklet);
+    
+    return IRQ_HANDLED;
+}
+```
+
+##### 4.3.4.2 共享中断处理
+
+```c
+static irqreturn_t shared_irq_handler(int irq, void *dev_id)
+{
+    struct shared_device *dev = dev_id;
+    int handled = 0;
+    
+    /* 检查设备状态寄存器 */
+    if (check_device_status(dev)) {
+        /* 处理中断 */
+        process_interrupt(dev);
+        handled = 1;
+    }
+    
+    /* 返回IRQ_HANDLED或IRQ_NONE根据实际处理情况 */
+    return handled ? IRQ_HANDLED : IRQ_NONE;
+}
+
+/* 注册共享中断 */
+request_irq(irq, shared_irq_handler, IRQF_SHARED, "shared_dev", dev);
+```
+
+##### 4.3.4.3 线程化中断
+
++ 注册线程化中断
+
+    ```c
+    request_threaded_irq(irq, threaded_irq_handler, irq_thread_fn, IRQF_TRIGGER_RISING, "my_device", dev);
+    ```
+
++ 线程化中断(上半部)
+
+    ```c
+    static irqreturn_t threaded_irq_handler(int irq, void *dev_id)
+    {
+        struct my_device *dev = dev_id;
+        
+        /* 快速检查中断源并清除中断标志 */
+        if (!check_and_clear_interrupt(dev))
+            return IRQ_NONE;
+        
+        /* 唤醒中断线程 */
+        return IRQ_WAKE_THREAD;
+    }
+    ```
+
++ 线程化中断(线程函数)
+
+    ```c
+    static irqreturn_t irq_thread_fn(int irq, void *dev_id)
+    {
+        struct my_device *dev = dev_id;
+        
+        /* 可以执行耗时操作，可以睡眠 */
+        handle_interrupt_in_thread(dev);
+        
+        return IRQ_HANDLED;
+    }
+    ```
+
+#### 4.3.5 最佳实践与注意事项
+
+1. 中断处理函数编写准则
+    + 保持简短：执行时间应尽可能短
+    + 避免阻塞：不能调用可能睡眠的函数
+    + 快速退出：及时清除中断标志，避免丢失中断
+    + 检查中断源：在共享中断中必须验证是否是自己的中断
+    + 避免复杂运算：将耗时操作推迟到下半部
+
+2. 性能优化技巧
+    + 批处理中断：对于高频中断，考虑一次处理多个事件
+    + 状态缓存：缓存频繁访问的硬件状态
+    + 避免锁竞争：尽量减少在中断上下文中获取锁
+    + 优先使用线程化中断：对于可能耗时的处理，优先考虑线程化
+
+### 4.4 Linux内核中硬件中断标志清除机制详解
+
+核心结论：在Linux内核中，*通常需要在中断服务函数中手动清除中断标志*，而不是由内核自动清除。这是由硬件设计和中断处理机制决定的。不同硬件设备有不同的中断清除方式，内核无法统一处理。
+
+#### 4.4.1 为什么需要手动清除中断标志
+
+清除中断标志是中断服务程序(`ISR`)的必要组成部分，目的是允许硬件在将来再次触发中断。不同硬件设备由不同的中断清除机制：
+
++ 某些硬件需要向特定寄存器写入特定值
++ 有些设备需要*`写1清除`*特定标志位
++ 有些设备需要读取状态寄存器来自动清除中断
+
+这种硬件多样性使得内核无法提供同一的自动清除机制。
+
+#### 4.4.2 清除中断标志的正确时机
+
+##### 4.4.2.1 早期清除原则
+
+最佳实践是在中断服务函数的早期，就清除中断标志
+
+```c
+static irqreturn_t my_irq_handler(int irq, void *dev_id)
+{
+    struct my_device *dev = dev_id;
+    u32 status;
+    
+    /* 1. 读取中断状态 */
+    status = readl(dev->base + INT_STATUS_REG);
+    
+    /* 2. 检查是否是本设备触发的中断 */
+    if (!(status & MY_DEVICE_INT_MASK))
+        return IRQ_NONE;
+    
+    /* 3. 关键步骤：清除中断标志 */
+    writel(status & MY_DEVICE_INT_MASK, dev->base + INT_CLEAR_REG);
+    
+    /* 4. 后续处理（可考虑调度下半部） */
+    tasklet_schedule(&dev->irq_tasklet);
+    
+    return IRQ_HANDLED;
+}
+```
+
+##### 4.4.2.2 为什么要在早期清除
+
++ 避免丢失中断：及时清除中断标志可确保硬件能触发新的中断
++ 提高系统响应性：减少中断屏蔽时间，使系统能更快响应后续中断
++ 防止中断风暴：对于高频中断设备，延迟清除可能导致中断堆积
+
+### 4.5 GPIO中断测试
+
+我们使用`GPIO5_IO00`来作为按键中断。
+
+#### 4.5.1 设备树
+
+```dts
+/* pinctrl */
+pinctrl_key: keygrp {
+    fsl,pins = <
+        MX6ULL_PAD_SNVS_TAMPER0__GPIO5_IO00		0x1b0b0
+    >;
+};
+
+/* key节点 */
+key {
+    compatible = "gpio-key";
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_key>;
+    key-gpios = <&gpio5 0 GPIO_ACTIVE_HIGH>;
+    interrupt-parent = <&gpio5>;
+    interrupts = <0 IRQ_TYPE_EDGE_FALLING>;
+};
+```
+
+#### 4.5.2 驱动程序
+
+这个程序主要做了以下工作：
+
+1. 从`platform`设备获取到`gpio desc`描述符
+2. 从设备节点的`interrupts`属性中读取中断触发类型。(*非常重要，一定要这么干，否则会出错*)
+3. 每次进中断就刷新软件定时器
+4. 在软件定时器中读取GPIO电平。如果是按下则计时，否则报弹起
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/of.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/gpio/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+
+#define DRIVER_NAME         "gpio-key"
+
+struct my_dev {
+    const char *name;
+    dev_t  dev_num;
+    struct cdev cdev;
+    struct class *class;
+    struct gpio_desc *desc;
+    int    irq;
+    u32    irq_type;
+    struct timer_list timer;
+    u32    counter;
+};
+
+static void key_timer(unsigned long arg)
+{
+    u32 s = 0;
+    const u32 count_per_s = 50;
+    struct my_dev *dev = (struct my_dev *)arg;
+    int value = gpiod_get_value(dev->desc);
+    if (value == 0) {
+        if (!(dev->counter % count_per_s)) {
+            s = dev->counter / count_per_s;
+            if (s == 0) {
+                printk("key_down\n");
+            }
+            else {
+                printk("key_press_%ds\n", s);
+            }
+        }
+        mod_timer(&dev->timer, jiffies + msecs_to_jiffies(20));
+        dev->counter++;
+    }
+    else {
+        if (dev->counter != 0) {
+            printk("key_up\n");
+        }
+        dev->counter = 0;
+    }
+}
+
+static irqreturn_t key_interrupt(int irq, void *dev_id)
+{
+    struct my_dev *dev = dev_id;
+    printk("key_interrupt\n");
+    mod_timer(&dev->timer, jiffies + msecs_to_jiffies(20));
+    return IRQ_HANDLED;
+}
+
+static const struct file_operations my_fops = {
+
+};
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_dev *dev = NULL;
+
+    printk("my_probe...\n");
+    dev = kzalloc(sizeof(struct my_dev), GFP_KERNEL);
+    dev->name = pdev->name;
+    dev->desc = gpiod_get_optional(&pdev->dev, "key", GPIOD_IN);
+    dev->irq = gpiod_to_irq(dev->desc);
+    /* 从设备节点的属性中读取中断触发类型 */
+    of_property_read_u32_index(pdev->dev.of_node, "interrupts", 1, &dev->irq_type);
+    setup_timer(&dev->timer, key_timer, (unsigned long)dev);
+    request_irq(dev->irq, key_interrupt, IRQF_SHARED | dev->irq_type, dev->name, dev);
+    printk("pin:%d irq:%d type:%d\n", desc_to_gpio(dev->desc), dev->irq, dev->irq_type);
+
+    alloc_chrdev_region(&dev->dev_num, 0, 1, dev->name);
+    cdev_init(&dev->cdev, &my_fops);
+    dev->cdev.owner = THIS_MODULE;
+    cdev_add(&dev->cdev, dev->dev_num, 1);
+    dev->class = class_create(THIS_MODULE, dev->name);
+    device_create(dev->class, NULL, dev->dev_num, NULL, dev->name);
+
+    platform_set_drvdata(pdev, dev);
+    printk("probe_done!\n");
+
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    struct my_dev *dev = platform_get_drvdata(pdev);
+
+    printk("my_remove...\n");
+    device_destroy(dev->class, dev->dev_num);
+    class_destroy(dev->class);
+    cdev_del(&dev->cdev);
+    unregister_chrdev_region(dev->dev_num, 1);
+    free_irq(dev->irq, dev);
+    del_timer_sync(&dev->timer);
+    gpiod_put(dev->desc);
+
+    kfree(dev);
+    printk("remove_done!\n");
+
+    return 0;
+}
+
+static const struct of_device_id my_dt_match[] = {
+    { .compatible = DRIVER_NAME },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .driver = {
+        .name  = DRIVER_NAME,
+        .owner = THIS_MODULE,
+        .of_match_table = my_dt_match,
+    },
+    .probe  = my_probe,
+    .remove = my_remove,
+};
+
+static int __init my_init(void)
+{
+    printk("my_init\n");
+    platform_driver_register(&my_driver);
+	return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk("my_exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+```
+
+#### 4.5.3 测试结果
+
+![](./src/0012.jpg)
+
+#### 4.5.4 我们为什么没有清GPIO中断？
+
+前面讲到，中断触发后应该尽快清除中断。但我们的中断服务程序却没有这么做，为什么还能正常运行呢？
+
+因为`imx-mxc`的框架已经给我们做好了。后面的章节详细分析！
+
+## 第5章 中断申请流程
+
+前面我们写了一个最简单的按键中断服务程序。用起来很简单，我们来仔细看下实现原理。
+
+### 5.1 `request_irq`函数
+
+中断申请使用的是`request_irq`函数，它用于请求一个中断号(`IRQ number`)并将一个中断处理程序与该中断关联起来。可以看到，`request_irq()`函数实际上是调用了`request_threaded_irq()`来完成中断申请的过程。
+
+`request_threaded_irq()`函数提供了线程化的中断处理方式。可以在中断上下文中执行中断处理函数。
+
+```c
+int request_irq(unsigned int irq, irq_handler_t handler, unsigned long flags,
+	    const char *name, void *dev)
+{
+	return request_threaded_irq(irq, handler, NULL, flags, name, dev);
+}
+```
+
+### 5.2 `request_threaded_irq()`函数
+
+`request_threaded_irq()`是Linux内核中，用于注册线程化中断处理程序的核心函数。他将中断处理分为两个部分：快速执行的上半部(`在中断上下文中运行`)、可以执行耗时操作的下半部(`在内核线程中运行`)。这种设计解决了传统中断处理模型中上半部必须快速执行、不能睡眠的限制，是现代Linux中断处理的重要机制。
+
+#### 5.2.1 函数原型
+
+```c
+int request_threaded_irq(unsigned int irq, 
+                         irq_handler_t handler,
+			             irq_handler_t thread_fn, 
+                         unsigned long irqflags,
+			             const char *devname, 
+                         void *dev_id)
+```
+
+#### 5.2.2 参数详解
+
+1. `unsigned int irq` (中断号)
+2. `irq_handler_t handler` (上半部处理函数)
+    + 执行环境：中断上下文(原子上下文)
+    + 限制：
+        + 不能睡眠
+        + 不能进行大量计算
+        + 不能访问用户空间内存
+        + 栈空间有限(通常4/8KB)
+3. `irq_handler_t thread_fn` (下半部处理函数)
+    + 执行环境：内核线程上下文(进程上下文)
+    + 特点：
+        + 可以睡眠
+        + 可以执行耗时操作
+        + 可以使用常规同步机制(如`mutex`)
+        + 有完整的内核栈空间
+    + 特殊处理：如果为`NULL`则退化为传统的`request_irq`行为。这也是`request_irq`函数的实现方式
+4. `unsigned long irqflags` (中断标志)
+5. `const char *devname` (设备名称)
+6. `void *dev_id` (设备标识符)
+
+#### 5.2.3 为什么这样设计
+
+1. 解决传统中断处理的局限性
+    + 不能睡眠的限制：
+        + 传统中断处理程序运行在原子上下文中，不能调用可能导致睡眠的函数
+        + 这严重限制了中断处理的复杂度和功能
+    + 中断嵌套问题：
+        + 长时间运行的中断处理会阻塞其他中断
+        + 影响系统实时性和响应性
+    + 优先级反转：高优先级任务可能被低优先级的中断处理阻塞
+2. 提高系统实时性
+3. 更好的资源管理
+    + 避免死锁：中断线程可以使用常规的互斥锁，避免中断上下文使用自旋锁导致的死锁风险
+    + 内存分配灵活性：可以在中断处理中使用`kmalloc(GFP_KERNEL)`等可能睡眠的内存分配方式
+    + 简化驱动代码：驱动开发者无需严格区分上半部和下半部，可以直接编写完整的处理逻辑
+4. 实行现代多核系统
+    + 传统中断处理通常绑定到特定CPU核心，限制了并行处理能力
+    + 中断线程可以像普通进程一样在多核之间迁移，更好的利用多核资源
+    + 每个中断有独立线程，避免了共享工作队列导致的竞争问题
+
+#### 5.2.4 源码分析
+
+##### 5.2.4.1 `request_threaded_irq()`源码
+
+主要的执行流程：
+
+1. 共享中断验证。共享中断必须提供`dev_id`作为唯一标识(不能为空指针)
+2. 根据中断号获取中断描述符。这个接下来还会重点介绍
+3. 分配并初始化`irqaction`。填充上半部、下半部处理函数等关键信息
+4. 设置中断。调用`__setup_irq`进行实际的中断设置
+
+```c
+int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+			 irq_handler_t thread_fn, unsigned long irqflags,
+			 const char *devname, void *dev_id)
+{
+	struct irqaction *action;
+	struct irq_desc *desc;
+	int retval;
+
+    // 1. 共享中断验证
+	if ((irqflags & IRQF_SHARED) && !dev_id)
+		return -EINVAL;
+
+    // 2. 获取中断描述符
+	desc = irq_to_desc(irq);
+	if (!desc)
+		return -EINVAL;
+
+    // 3. 分配并初始化 irqaction
+	action = kzalloc(sizeof(struct irqaction), GFP_KERNEL);
+	action->handler = handler;
+	action->thread_fn = thread_fn;
+	action->flags = irqflags;
+	action->name = devname;
+	action->dev_id = dev_id;
+
+    // 4. 设置中断
+	chip_bus_lock(desc);
+	retval = __setup_irq(irq, desc, action);
+	chip_bus_sync_unlock(desc);
+
+	return retval;
+}
+```
+
+##### 5.2.4.2 `struct irq_desc`中断描述符
+
+`struct irq_desc`是Linux内核中断子系统的核心数据结构。作为*中断描述符*，它管理着系统中每个中断线的所有关键信息，是连接硬件中断和软件处理逻辑的桥梁。
+
+###### 5.2.4.2.1 组织方式
+
+每个中断都有一个`irq_desc`中断描述符。在内核中有两种组织方式：
+
+1. 数组方式 (传统方式)
+    + 定义全局数组：`struct irq_desc irq_desc[NR_IRQS]`
+        ```c
+        struct irq_desc irq_desc[NR_IRQS] __cacheline_aligned_in_smp = {
+            [0 ... NR_IRQS-1] = {
+                .handle_irq	= handle_bad_irq,
+            }
+        };
+        ```
+    + 硬件中断号直接作为数组索引
+    + 优点：简单高效，访问速度快
+    + 缺点：浪费内存(尤其当`NR_IRQS`很大但实际使用中断少时)
+
+2. `radix-tree`方式 (稀疏IRQ 现代Linux)
+    + 定义`irq_desc_tree`基数树。在内核启动早期初始化
+        ```c
+        static RADIX_TREE(irq_desc_tree, GFP_KERNEL);
+
+        static void irq_insert_desc(unsigned int irq, struct irq_desc *desc)
+        {
+            radix_tree_insert(&irq_desc_tree, irq, desc);
+        }
+
+        // 在内核启动时被调用
+        int __init early_irq_init(void)
+        {
+            int i, initcnt, node = first_online_node;
+            struct irq_desc *desc;
+
+            initcnt = arch_probe_nr_irqs();
+            printk(KERN_INFO "NR_IRQS:%d nr_irqs:%d %d\n", NR_IRQS, nr_irqs, initcnt);
+
+            // 申请所有中断号NR_IRQS的node节点, 不是irq_desc结构体, 所以能节省内存
+            for (i = 0; i < initcnt; i++) {
+                desc = alloc_desc(i, node, NULL);
+                set_bit(i, allocated_irqs);
+                irq_insert_desc(i, desc);
+            }
+        }
+        ```
+    + `irq_to_desc`通过`irq`获取`irq_desc`时, 就是查询基数树
+        ```c
+        struct irq_desc *irq_to_desc(unsigned int irq)
+        {
+            return radix_tree_lookup(&irq_desc_tree, irq);
+        }
+        ```
+    + 优点：节省内存，支持动态分配中断号
+    + 缺点：访问稍慢，实现更复杂
+
