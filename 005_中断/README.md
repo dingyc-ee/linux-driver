@@ -1633,3 +1633,24 @@ int request_threaded_irq(unsigned int irq, irq_handler_t handler,
     + 优点：节省内存，支持动态分配中断号
     + 缺点：访问稍慢，实现更复杂
 
+### 5.3 `i.MX6ULL Linux内核中断处理流程：从硬件触发到处理函数调用`
+
+`i.MX6ULL`基于ARM Cortem-A7架构，使用`GIC-400`作为中断控制器。
+
+#### 5.3.1 整理流程概述
+
+```
+硬件中断触发 
+    -> CPU跳转到异常向量表
+        -> 汇编层：保存上下文，获取中断号
+            -> 调用handle_IRQ C函数
+                -> 通过GIC获取硬件中断号
+                    -> 通过irq_domain转换为Linux中断号
+                        -> 获取对应的irq_desc结构
+                            -> 调用orq_desc->handle_irq
+                                -> 执行中断流控制
+                                    -> 调用action链表中的处理函数
+                                        -> 回复上下文，返回用户空间
+```
+
+
