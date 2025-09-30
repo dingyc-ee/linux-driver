@@ -2215,4 +2215,475 @@ unsigned int irq_create_mapping(struct irq_domain *domain,  // 中断域指针
 
 这个里面的具体实现就太过于复杂了。不是一两天能够分析完的，我们等到之后有时间了再继续分析！
 
+## 第6章 Linux内核中断类型：`硬件中断、软中断、软件中断`
 
+### 6.1 概念定义与核心区别
+
+#### 6.1.1 硬件中断(`Hardware Interrupt`)
+
++ 定义：由物理硬件设备产生的异步信号，通过中断请求线(IRQ)发送到中断控制器，再由中断控制器通知CPU
+触发源：外部物理设备(如键盘、网卡、磁盘)
++ 特点：
+    + 异步发生，不可预测
+    + 必须快速响应(通常以微秒计)
+    + 执行时会关闭本地CPU中断
+    + 运行在中断上下文(不能睡眠、不能调度)
+
+#### 6.1.2 软中断(`SoftIRQ`)
+
++ 定义：Linux内核实现的一种下半部机制，用于延迟执行硬件中断中不需要立即处理的任务
++ 触发：内核在硬件中断处理过程中主动触发
++ 特点：
+    + 静态分配(编译时确定)
+    + 可在多个CPU上并发执行
+    + 不能被同类型软中断打断，但可被硬件中断打断
+    + 运行在中断上下文(不能睡眠)
+
+#### 6.1.3 软件中断(`Software Interrupt`)
+
++ 定义：由CPU指定特定指令(如`int`指令)主动触发的中断，主要用于系统调用
++ 触发：用户程序通过特定指令主动触发
++ 特点：
+    + 同步发生，由程序控制
+    + 用于从用户态切换到内核态
+    + 执行系统调用处理程序
+    + 可以睡眠(在系统调用处理中)
+
+#### 6.1.4 重要区别
+
+在Linux内核中，软中断和软件中断是完全不同的概念，经常被混淆。软中断是内核下半部机制，软件中断通常指系统调用。
+
+### 6.2 工作流程对比
+
+| 特性 | 硬件中断 | 软中断 | 软件中断 |
+| - | - | — | - |
+| 触发方式 | 硬件设备产生电信号 | 内核调用`raise_softirq()` | 用户程序执行`int/syscall`指令 |
+| 执行上下文 | 中断上下文 | 中断上下文 | 从用户态切换到内核态 |
+| 可否睡眠 | 不可 | 不可 | 可以 |
+| 可重入性 | 不可嵌套 | 同类型可多CPU并行 | 按常规函数调用 |
+| 主要用途 | 快速响应硬件事件 | 延时处理耗时任务 | 实现系统调用 |
+| 执行优先级 | 最高 | 中等 | 低（用户请求） |
+
+### 6.3 三者协同工作的典型场景：网络数据接收
+
+让我们看一个综合示例，展示三种中断如何协同工作：
+
+#### 6.3.1 硬件中断阶段
+
+1. 数据到达
+    + 网卡接收到网络数据包后，将其存入MDA缓冲区(网卡自带的内存区域)
+    + 网卡通过硬件中断向CPU发送中断请求
+2. 硬件中断处理
+    + CPU响应中断，暂停当前任务，切换到中断上下文
+    + 执行网卡驱动的中断处理程序(ISR)
+    + ISR执行关键但快速的任务
+        + 确认中断：避免重复触发
+        + 将数据包从MDA缓冲区复制到内核的`sk_buff`结构体
+    + 触发软中断
+        + 调用`napi_schedule()`或类似函数，标记需要处理的软中断(如`NET_RX_SOFTIRQ`)
+        + 现代网卡使用NAPI机制：首次终端后切换到轮询模式，减少高频中断
+
+#### 6.3.2 软中断阶段
+
+1. 软中断触发时机
+    + 硬件中断返回前
+    + 系统调用返回用户空间前
+    + 由专门的`ksoftirqd`内核线程处理(当软中断积压过多时)
+2. 软中断处理流程
+    + 执行`NET_RX_SOFTIRQ`软中断处理函数
+    + 调用`netif_receive_skb()`进入内核网络协议栈
+    + 逐层解析数据包
+        + 数据链路层：检查MAC地址
+        + 网络层：解析IP地址和路由
+        + 传输层：根据端口号找到关联的`Socket`
+    + 将数据包存入目标`Socket`的内核接收缓冲区
+    + 调用`sk_data_ready()`唤醒等待在该`Socket`上的用户进程
+
+#### 6.3.3 软件中断阶段(系统调用)
+
+1. 用户进程请求数据
+    + 用户进程调用`recv()`系统调用
+    + 这是一个软件中断，触发从用户态到内核态的切换
+2. 系统调用处理
+    + 内核检查`Socket`缓冲区
+    + 若有数据：将数据从内核缓冲区复制到用户空间
+    + 若无数据：进程阻塞(在阻塞模式下)或返回`EAGAIN`错误(在非阻塞模式下)
+    + 当软中断阶段唤醒进城后，进程被调度执行，完成数据读取
+
+### 6.4 Linux内核网卡NAPI机制
+
+#### 6.4.1 NAPI机制的背景与诞生原因
+
+##### 6.4.1.1 传统中断驱动模型的瓶颈
+
+在Linux内核2.4版本之前，网络数据包处理完全依赖于*纯中断驱动模型*：每当网卡接收到一个数据包就会触发一次硬件中断，CPU暂停当前任务处理这个数据包。这种模型在低速网络环境下工作良好，但随着网络速度的提升，问题逐渐显现：
+
++ 中断风暴：高速网络环境下，网卡以极高频率触发中断
+    + 以100M网卡为例，实际接收速率达80M bit/s，数据包平均长度1500 Bytes
+    + 每秒中断数 = 80M bit/s / (8bit  * 1500 byte) = 6667个中断/s
+    + 这意味着平均每0.15毫秒就要处理一次中断
+
++ CPU资源浪费：
+    + CPU大部分事件消耗在中断上下文切换上，而非实际数据处理
+    + 中断处理程序执行开销，可能超过处理数据包本身的时间
+
++ 系统性能下降：
+    + 频繁中断破坏CPU缓存局部性，增加缓存失效
+    + 系统响应延迟增加，整体吞吐量下降
+    + 严重时可能导致系统饥饿
+
+##### 6.4.1.2 NAPI的诞生
+
+Linux内核从`2.4版本`开始引入NAPI机制，旨在解决上述问题。NAPI不是完全摒弃中断，而是创造了一种*中断与轮询相结合*的混合模型，根据网络流量动态调整工作方式。
+
+#### 6.4.2 NAPI机制的核心原理
+
+##### 6.4.2.1 基本工作思想
+
+NAPI的核心思想是：**在低流量时使用中断接收数据包，在高流量时切换到轮询方式接收。**
+
++ 初始中断阶段：当第一个数据包到达时，触发一次硬件中断
++ 轮询处理阶段：中断后CPU主动轮询网卡，批量处理多个数据包
++ 中断重启用：当数据包处理完毕或达到一定条件后，重新开启中断
+
+##### 6.4.2.2 工作流程详解
+
+1. 数据包到达与首次中断
+    + 网卡接收到数据包，将其存入DMA缓冲区
+    + 触发硬件中断，CPU执行中断处理程序ISR
+
+2. 中断处理程序ISR关键操作
+    + 确认中断，防止重复触发
+    + 调用`napi_schedule()`函数
+    + **关键步骤：禁用网卡接收中断(避免后续数据包继续触发中断)**
+    + 将`napi_struct`结构体加入软中断处理队列
+
+3. 软中断处理阶段
+    + 内核在适当时机(如硬中断返回前，系统调用返回前或由`ksoftirqd`处理)
+    + 执行`net_rx_action()`软中断处理函数
+    + 调用设备驱动注册的`poll`方法批量处理数据包
+    + 每次处理的数据包受`预算(budget)`限制
+
+4. 轮询处理循环
+    ```c
+    while (有数据包 && 未达到预算限制) {
+        从网卡DMA缓冲区获取数据包
+        处理数据包(进入网络协议栈)
+        更新统计信息
+    }
+    ```
+
+5. 状态判断与中断冲启用
+    + 如果仍有数据包待处理：继续轮询
+    + 如果已无数据包：调用`napi_complete()`，重新启用网卡中断
+    + 等待下一次数据包到达触发中断
+
+#### 6.4.3 NAPI机制的关键技术细节
+
+要实现MAPI功能，设备驱动必须和操作系统合作：
+
+1. 预留内存：操作系统为网卡预留一段内存区域
+2. 地址映射：网卡知道这块内存的地址，将收到的数据包直接放入该区域
+3. 操作系统处理：操作系统定期从该内存区域取走数据包
+
+#### 6.4.4 NAPI的工作优势与性能提升
+
+| 指标 | 传统中断模型 | NAPI模型 | 提升效果 |
+| - | - | - | - |
+| 中断频率 | 每包一次中断 | 高流量时大幅降低 | 减少90%以上中断 |
+| CPU利用率 | 低(大量时间在中断处理) | 高(专注于数据处理) | 提升吞吐量30-50% |
+| 系统延迟 | 高(中断上下文切换开销大) | 低(批量处理减少切换) | 减少延迟抖动 |
+| 缓存效率 | 低(频繁上下文切换) | 高(连续执行) | 提高缓存命中率 |
+
+实际性能表现：
+
++ 在千兆/万兆网络环境下，NAPI可将CPU利用率从70-80%降低到30-40%
++ 网络吞吐量可提升30-50%， 特别是在处理大量小数据包时
++ 系统响应更稳定，延迟抖动显著减少
+
+#### 6.4.5 总结
+
+NAPI机制的引入标志着Linux网络处理从简单的中断驱动模型，进化为更加智能、高效的混合处理模型，为Linux成为高性能网络服务器曹旭哦系统鉴定了坚实基础。如今，NAPI已成为几乎所有Linux网络驱动的标准实现方式，是现代Linux网络性能的关键保障。
+
+## 第7章 中断下文`tasklet`实验
+
+在上一章中，我们申请GPIO中断，使用的是`request_irq`。但`request_trq`绑定的中断服务程序指的是中断上文。前面提到，中断分为两个过程：中断上文和中断下文。本章我们来学习中断下文的一种实现方式：`tasklet`。
+
+### 7.1 什么是`tasklet`
+
+`tasklet`是linux内核的一种特殊软中断机制，广泛应用于处理中断下文相关的任务。它是一种常见且有效的方法，在多核系统上可以避免并发问题。`tasklet`绑定的函数在同一时间只能在一个CPU上运行，因此不会出现并发冲突。
+
+### 7.2 结构体原型
+
+```c
+#include <linux/interrupt.h>
+
+struct tasklet_struct
+{
+	struct tasklet_struct *next;
+	unsigned long state;    // 标识tasklet状态
+	atomic_t count;         // 原子计数器。用于控制tasklet的并发执行。为0表示可以安全执行，为1表示正在执行中
+	void (*func)(unsigned long);
+	unsigned long data;
+};
+```
+
+### 7.3 相关操作函数
+
+#### 7.3.1 静态初始化
+
+在Linux内核中，有一个用于静态初始化`tasklet`的宏函数：`DECLARE_TASKLET`。原型如下：
+
+```c
+#define DECLARE_TASKLET(name, func, data) \
+struct tasklet_struct name = { NULL, 0, ATOMIC_INIT(0), func, data }
+```
+
+如果`tasklet`初始化为非使能状态。使用一下宏定义：
+
+```c
+#define DECLARE_TASKLET_DISABLED(name, func, data) \
+struct tasklet_struct name = { NULL, 0, ATOMIC_INIT(1), func, data }
+```
+
+需要注意的是，使用`DECLARE_TASKLET`静态初始化的`tasklet`无法在运行时动态销毁。因此在不需要`tasklet`时，应该避免使用此方法。
+
+#### 7.3.2 动态初始化
+
+可以使用函数`tasklet_init`对`tasklet`进行动态初始化。这样我们可以灵活的管理`tasklet`的生命周期。在不需要时，可以使用`tasklet_kill`函数进行销毁，以释放相关资源。
+
+```c
+void tasklet_init(struct tasklet_struct *t, void (*func)(unsigned long), unsigned long data);
+```
+
+#### 7.3.3 关闭函数
+
+可以使用函数`tasklet_disable`来关闭一个已经初始化的`tasklet`。关闭`tasklet`后即使调用`tasklet_schedule`函数触发`tasklet`，也不会在执行`tasklet`的处理函数。
+
+这可用于临时暂停或关闭`tasklet`的执行，直到再次启用(通过调用`tasklet_enable`函数)。需要注意的时，关闭`tasklet`并不会销毁`tasklet`结构体！
+
+```c
+void tasklet_disable(struct tasklet_struct *t);
+```
+
+#### 7.3.4 使能函数
+
+使能`tasklet`后，如果调用`tasklet_schedule`函数触发`tasklet`，则`tasklet`的处理函数将会被执行。这样`tasklet`将开始按计划执行其处理逻辑。
+
+需要注意的是，使能`tasklet`并不会自动触发`tasklet`的执行，而是通过调用`tasklet_schedule`函数来触发。
+
+```c
+void tasklet_enable(struct tasklet_struct *t);
+```
+
+#### 7.3.5 调度函数
+
+可以使用函数`tasklet_schedule`来调度(触发)一个已经初始化的`tasklet`执行。需要注意的是，调度`tasklet`支持将`tasklet`标记为需要执行，并不会立即执行`tasklet`的处理函数。实际的执行时间取决于内核的调度和处理机制。
+
+```c
+void tasklet_schedule(struct tasklet_struct *t);
+```
+
+#### 7.3.6 销毁函数
+
+调用`tasklet_kill`函数会释放`tasklet`所占用的资源，并将`tasklet`标记为无效。因此，销毁后的`tasklet`不能再被使用。
+
+需要注意的是，在销毁`tasklet`前，应该确保`tasklet`已经被停止(通过调用`tasklet_disable`函数)。否则，1销毁一个正在执行的`tasklet`可能导致内核崩溃或其他错误。
+
+```c
+tasklet_kill(struct tasklet_struct *t);
+```
+
+### 7.4 代码实测
+
+我们启动一个按键中断。在中断上半部中调度`tasklet`，在下半部的`tasklet`中启用延时检测电平防抖。
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/of.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/gpio/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+#include <linux/delay.h>
+
+#define DRIVER_NAME         "gpio-key"
+
+struct my_dev {
+    const char *name;
+    dev_t  dev_num;
+    struct cdev cdev;
+    struct class *class;
+    struct gpio_desc *desc;
+    int    irq;
+    u32    irq_type;
+    struct tasklet_struct tasklet; 
+};
+
+static void my_tasklet(unsigned long arg)
+{
+    struct my_dev *dev = (struct my_dev *)arg;
+    mdelay(10);
+    if (!gpiod_get_value(dev->desc)) {
+        printk("[tasklet] key_down\n");
+    }
+}
+
+static irqreturn_t key_interrupt(int irq, void *dev_id)
+{
+    struct my_dev *dev = dev_id;
+    printk("IRQ\n");
+    tasklet_schedule(&dev->tasklet);
+    return IRQ_HANDLED;
+}
+
+static const struct file_operations my_fops = {
+
+};
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_dev *dev = NULL;
+
+    printk("my_probe...\n");
+    dev = kzalloc(sizeof(struct my_dev), GFP_KERNEL);
+    dev->name = pdev->name;
+    dev->desc = gpiod_get_optional(&pdev->dev, "key", GPIOD_IN);
+    dev->irq = gpiod_to_irq(dev->desc);
+    of_property_read_u32_index(pdev->dev.of_node, "interrupts", 1, &dev->irq_type);
+    tasklet_init(&dev->tasklet, my_tasklet, (unsigned long)dev);
+    request_irq(dev->irq, key_interrupt, IRQF_SHARED | dev->irq_type, dev->name, dev);
+
+    alloc_chrdev_region(&dev->dev_num, 0, 1, dev->name);
+    cdev_init(&dev->cdev, &my_fops);
+    dev->cdev.owner = THIS_MODULE;
+    cdev_add(&dev->cdev, dev->dev_num, 1);
+    dev->class = class_create(THIS_MODULE, dev->name);
+    device_create(dev->class, NULL, dev->dev_num, NULL, dev->name);
+
+    platform_set_drvdata(pdev, dev);
+    printk("probe_done!\n");
+
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    struct my_dev *dev = platform_get_drvdata(pdev);
+
+    printk("my_remove...\n");
+    device_destroy(dev->class, dev->dev_num);
+    class_destroy(dev->class);
+    cdev_del(&dev->cdev);
+    unregister_chrdev_region(dev->dev_num, 1);
+    tasklet_disable(&dev->tasklet);
+    tasklet_kill(&dev->tasklet);
+    free_irq(dev->irq, dev);
+    
+    gpiod_put(dev->desc);
+
+    kfree(dev);
+    printk("remove_done!\n");
+
+    return 0;
+}
+
+static const struct of_device_id my_dt_match[] = {
+    { .compatible = DRIVER_NAME },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .driver = {
+        .name  = DRIVER_NAME,
+        .owner = THIS_MODULE,
+        .of_match_table = my_dt_match,
+    },
+    .probe  = my_probe,
+    .remove = my_remove,
+};
+
+static int __init my_init(void)
+{
+    printk("my_init\n");
+    platform_driver_register(&my_driver);
+	return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk("my_exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+```
+
+测试结果如下：
+
+![](./src/0016.jpg)
+
+### 7.5 注意事项
+
+#### 7.5.1 `tasklet`重入问题的分析
+
+以前面的按键驱动为例。`tasklet`中调用了`mdelay`忙等待延时函数，用来按键消抖。我们等待了10ms，那如果在这10ms的过程中，又产生了按键中断。怎么办？`tasklet`会重入吗？
+
+```c
+static void my_tasklet(unsigned long arg)
+{
+    struct my_dev *dev = (struct my_dev *)arg;
+    mdelay(10);
+    if (!gpiod_get_value(dev->desc)) {
+        printk("[tasklet] key_down\n");
+    }
+}
+```
+
+**不会重入。在Linux中，当`tasklet`正在执行(即使包含延时函数)时，如果又有新的中断发生，`tasklet`处理函数不会被重入。**
+
+##### 7.5.1.1 `tasklet`重入保护机制
+
+```c
+struct tasklet_struct {
+    // ... 其他成员
+    atomic_t count;  // 关键字段，用于防止重入
+    // ... 其他成员
+};
+```
+
+Linux内核`tasklet`通过`atomic_t count`原子计数来防止重入。当`tasklet`被调度执行时，内核会执行以下操作：
+
++ 检查`count`是否为0
++ 如果为0，则将`count`设置为1，表示`tasklet`正在执行
++ 执行`tasklet`处理函数
+
+##### 7.5.1.2 中断处理流程
+
+当新中断发生时，如果`tasklet`仍在执行中：
+
++ 中断处理函数中，可能调用`tasklet_schedule`
++ `tasklet_schedule`会尝试将`tasklet`添加到队列
++ 但在添加前，会检查`count`
+
+```c
+if (atomic_read(&t->count)) {
+    // tasklet正在执行，不重入
+    tasklet_schedule(t);  // 重新加入队列，等待执行
+}
+```
+
+#### 7.5.2 延时函数的说明
+
+`tasklet`中的延时函数，需要澄清：
+
++ `tasklet`不能包含睡眠函数：如`msleep`、`kmalloc`等，因为`tasklet`在中断上下文中执行，不能睡眠
++ 可以包含忙等待延时函数：如`udelay`、`mdelay`。这些指示忙等待，不会导致`tasklet`被阻塞
