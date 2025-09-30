@@ -1637,20 +1637,582 @@ int request_threaded_irq(unsigned int irq, irq_handler_t handler,
 
 `i.MX6ULL`基于ARM Cortem-A7架构，使用`GIC-400`作为中断控制器。
 
-#### 5.3.1 整理流程概述
+#### 5.3.1 整体中断处理流程
 
 ```
 硬件中断触发 
-    -> CPU跳转到异常向量表
-        -> 汇编层：保存上下文，获取中断号
-            -> 调用handle_IRQ C函数
-                -> 通过GIC获取硬件中断号
-                    -> 通过irq_domain转换为Linux中断号
-                        -> 获取对应的irq_desc结构
-                            -> 调用orq_desc->handle_irq
-                                -> 执行中断流控制
-                                    -> 调用action链表中的处理函数
-                                        -> 回复上下文，返回用户空间
+    -> CPU跳转到异常向量表0x18
+        -> 执行vector_irq
+            -> 根据中断的模式选择处理函数
+                -> __irq_usr/__irq_svc内核模式中断处理
+                    -> svc_entry: 保存内核上下文
+                        -> 执行irq_handler宏
+                            -> 调用handle_arch_irq
+                                -> 获取硬件中断号
+                                    -> 转为Linux中断号
+                                        -> 调用irq_desc->handle_irq
+                                            -> 执行中断流控制
+                                                -> 调用action链表中的处理函数
+                                                    -> 恢复上下文。返回
 ```
+
+#### 5.3.2 详细调用流程分析
+
+##### 5.3.2.1 硬件中断触发与向量表跳转
+
+当硬件中断发生时，CPU会自动：
+
++ 切换到IRQ模式
++ 保存返回地址到lr_irq
++ 保存CPSR到SPSR_irq
++ 禁用IRQ中断
++ 跳转到异常向量表的IRQ向量位置(`0x18`)
+
+```asm
+__vectors_start:
+	W(b)	vector_rst
+	W(b)	vector_und
+	W(ldr)	pc, __vectors_start + 0x1000    ; 为什么这里是__vectors_start + 0x1000 ?
+	W(b)	vector_pabt
+	W(b)	vector_dabt
+	W(b)	vector_addrexcptn
+	W(b)	vector_irq      ; irq中断
+	W(b)	vector_fiq
+```
+
+##### 5.3.2.2 `vector_irq`异常入口处理
+
+`vector_irq`是由`vector_stub`宏定义的。代码中定义如下：
+
+```asm
+/*
+ * Interrupt dispatcher
+ */
+    ; 不同模式下的irq处理函数
+	.long	__irq_usr	    ; 用户模式irq处理函数
+	.long	__irq_invalid
+	.long	__irq_invalid
+	.long	__irq_svc       ; 内核模式irq处理函数
+```
+
+`vector_stub`是一个宏定义。它定义了中断处理的通用入口代码：
+
+```asm
+	.macro	vector_stub, name, mode, correction=0
+	.align	5
+
+vector_\name:
+	.if \correction
+	sub	lr, lr, #\correction    ; 修正返回地址(ARM中通常-4)
+	.endif
+
+    ; 保存r0, lr_<exception>和spsr_<exception>
+	stmia	sp, {r0, lr}		@ save r0, lr
+	mrs	lr, spsr
+	str	lr, [sp, #8]		@ save spsr
+
+    ; 准备进入SVC模式, IRQ保持禁用
+	mrs	r0, cpsr
+	eor	r0, r0, #(\mode ^ SVC_MODE | PSR_ISETSTATE)
+	msr	spsr_cxsf, r0
+
+	; 根据SPSR的低4位获取处理器模式, 并跳转到对应模式的处理函数(如USR_irq、SVC_irq)
+	and	lr, lr, #0x0f
+    THUMB(	adr	r0, 1f			)
+    THUMB(	ldr	lr, [r0, lr, lsl #2]	)
+	mov	r0, sp
+    ARM(	ldr	lr, [pc, lr, lsl #2]	)
+	movs	pc, lr			; 跳到对应的处理函数
+ENDPROC(vector_\name)
+
+    ; 处理函数地址表, 跟在这后面
+```
+
+关键步骤：
+
+1. 修正lr(减去4，因为ARM流水线导致PC指向+8位置)
+2. 保存r0, lr和spsr到栈
+3. 设置SPSR为SVC模式(但保持IRQ禁用)
+4. 从SPSR低4位获取中断前的处理器模式(如USR、SVC等)
+5. 根据模式，选择不同的处理函数(从函数地址表中获取)
+6. 跳转到对应的处理函数
+
+##### 5.3.2.3 模式特定的中断处理函数
+
+根据中断前的处理器模式，回调到不同的处理函数：
+
++ `__irq_usr`: 中断前处于用户模式(USR)
++ `__irq_svc`: 中断前处于SVC模式(内核模式)
+
+```asm
+__irq_usr:
+	usr_entry                   ; 保存用户上下文
+	irq_handler                 ; 调用中断处理核心
+	b	ret_to_user_from_irq    ; 返回用户空间
+
+__irq_svc:
+	svc_entry                   ; 保存内核上下文
+	irq_handler                 ; 调用中断处理核心
+	svc_exit r5, irq = 1        ; 从中断返回
+```
+
+##### 5.3.2.4 `irq_handler`宏：跳转到C语言处理函数
+
+这是从汇编跳转到C代码的关键点：
+
+```asm
+
+.macro	irq_handler
+	ldr	r1, =handle_arch_irq    ; 加载handle_arch_irq地址
+	mov	r0, sp                  ; r0 = 栈指针(指向保存的上下文)
+	adr	lr, BSYM(9997f)         ; lr = 返回地址
+	ldr	pc, [r1]                ; 跳转到handle_arch_irq
+```
+
+关键点：
+
++ r0被设置为栈指针(指向保存的寄存器上下文)
++ r1被设置为`handle_arch_irq`的地址
++ lr被设置为返回地址(9997f标签处)
++ pc被设置为`handle_arch_irq`, 跳过去执行
+
+在`i.MX6ULL`的4.1.15内核中，`handle_arch_irq`通常指向`gic_handle_irq`函数。
+
+##### 5.3.2.4 C语言处理函数：`handle_arch_irq(gic_handle_irq)`
+
+在C代码中，`handle_arch_irq`通常初始化为指向`gic_handle_irq`：
+
+```c
+// drivers/irqchip/irq-gic.c
+void __init gic_init(unsigned int irq_start, struct device_node *node)
+{
+    // ...
+    set_handle_irq(gic_handle_irq);
+    // ...
+}
+```
+
+`gic_handle_irq`函数定义如下：
+
+当硬件中断触发后，执行流程从汇编层跳转到`gic_handle_irq`函数。
+
+```c
+// drivers/irqchip/irq-gic.c
+
+static void __exception_irq_entry gic_handle_irq(struct pt_regs *regs)
+{
+	u32 irqstat, irqnr;
+	struct gic_chip_data *gic = &gic_data[0];
+	void __iomem *cpu_base = gic_data_cpu_base(gic);
+
+	do {
+        // 读取GICC_IRQ寄存器，获取硬件中断号
+		irqstat = readl_relaxed(cpu_base + GIC_CPU_INTACK);
+		irqnr = irqstat & GICC_IAR_INT_ID_MASK; // 硬件中断号
+
+        // 通过irq_find_mapping将硬件中断号转换为Linux中断号
+		if (likely(irqnr > 15 && irqnr < 1021)) {
+			handle_domain_irq(gic->domain, irqnr, regs);
+			continue;
+		}
+	} while (1);
+}
+```
+
+`handle_domain_irq`函数，用于把一个硬件中断号转为逻辑中断域。源码如下：
+
+```c
+int __handle_domain_irq(struct irq_domain *domain, unsigned int hwirq,
+			bool lookup, struct pt_regs *regs)
+{
+	struct pt_regs *old_regs = set_irq_regs(regs);
+	unsigned int irq = hwirq;
+	int ret = 0;
+
+	irq_enter();
+	irq = irq_find_mapping(domain, hwirq);
+
+	/*
+	 * Some hardware gives randomly wrong interrupts.  Rather
+	 * than crashing, do something sensible.
+	 */
+	generic_handle_irq(irq);
+
+	irq_exit();
+	set_irq_regs(old_regs);
+	return ret;
+}
+```
+
+我们先忽略硬件中断号映射虚拟中断域的过程。继续往后看`generic_handle_irq`是怎么执行中断服务函数的。
+
+##### 5.3.2.5 通用中断处理函数`generic_handle_irq`
+
+这里是通过`irq`获取`desc`中断描述符，然后调用`desc->handle_irq(irq, desc)`来处理中断。
+
+```c
+int generic_handle_irq(unsigned int irq)
+{
+	struct irq_desc *desc = irq_to_desc(irq);
+	generic_handle_irq_desc(irq, desc);
+	return 0;
+}
+
+static inline void generic_handle_irq_desc(unsigned int irq, struct irq_desc *desc)
+{
+	desc->handle_irq(irq, desc);
+}
+```
+
+关键流程：
+
+1. `generic_handle_irq`函数，读取虚拟中断号`irq`对应的`irq_desc`描述符
+2. 调用`desc->handle_irq(irq_desc)`执行中断处理
+
+### 5.4 中断域(`irq_domain`)机制
+
+#### 5.4.1 中断域的作用
+
+`irq_domain`是Linux内核为*解决多级中断控制器级联*问题引入的核心抽象。在复杂SoC中，可能存在多个中断控制器级联的情况(如`GIC->GPIO控制器`)，每个控制器都有自己的硬件中断号编码空间。`irq_domain`建立了`hwirq`到虚拟中断号`virq`的映射关系。
+
+```c
+struct irq_domain {
+	struct list_head link;              // 全局链表节点
+	const char *name;                   // 域名称
+	const struct irq_domain_ops *ops;   // 域操作函数集
+	void *host_data;                    // 私有数据
+
+	struct device_node *of_node;        // 设备树节点
+
+	irq_hw_number_t hwirq_max;          // 最大硬件中断号
+	unsigned int revmap_direct_max_irq; // 直接映射的最大中断号
+	unsigned int revmap_size;           // 映射的个数
+	unsigned int linear_revmap[];       // 线性映射表(数组)，我们会在后面动态申请内存创建
+    struct radix_tree_root revmap_tree; // 基数树用于树形映射
+};
+```
+
+映射机制类型：
+
+1. 直接映射：`hwirq`直接作为`virq`，适用于简单控制器
+2. 线性映射：通过数组直接索引，适用于中断数量少且连续的场景
+3. 基数树映射：使用树状结构管理稀疏中断号，适合中断数量大或分散的场景
+
+
+![](./src/0013.png)
+
+#### 5.4.2 中断域的创建
+
+当设备树的GIC控制器与内核源码`irq_gic.c`匹配时，执行`gic_of_init()`函数。
+
+![](./src/0014.jpg)
+
+```c
+static int gic_cnt = 0;
+
+gic_of_init(struct device_node *node, struct device_node *parent)
+{
+	void __iomem *cpu_base;
+	void __iomem *dist_base;
+	u32 percpu_offset = 0;
+	int irq;
+
+	if (WARN_ON(!node))
+		return -ENODEV;
+
+    // 映射distributor
+	dist_base = of_iomap(node, 0);
+	WARN(!dist_base, "unable to map gic dist registers\n");
+
+    // 映射cpu
+	cpu_base = of_iomap(node, 1);
+	WARN(!cpu_base, "unable to map gic cpu registers\n");
+
+    // 初始化gic
+	gic_init_bases(gic_cnt, -1, dist_base, cpu_base, percpu_offset, node);
+
+	gic_cnt++;
+	return 0;
+}
+```
+
+##### 5.4.2.1 初始化GIC
+
+```c
+#define MAX_GIC_NR	1
+static struct gic_chip_data gic_data[MAX_GIC_NR];
+
+#define NR_GIC_CPU_IF 8
+static u8 gic_cpu_map[NR_GIC_CPU_IF];
+
+static const struct irq_domain_ops gic_irq_domain_hierarchy_ops = {
+	.xlate = gic_irq_domain_xlate,  // 映射函数
+	.alloc = gic_irq_domain_alloc,
+	.free = irq_domain_free_irqs_top,
+};
+
+void __init gic_init_bases( unsigned int gic_nr,    // 0: GIC控制器编号。imx6ull只有1个，此值为0
+                            int irq_start,          // -1
+			                void __iomem *dist_base, // distributor基地址(ioremap)
+                            void __iomem *cpu_base,  // cpu基地址(ioremap)
+			                u32 percpu_offset,       // 0
+                            struct device_node *node) // 设备树节点
+{
+	irq_hw_number_t hwirq_base;
+	struct gic_chip_data *gic;
+	int gic_irqs, irq_base, i;
+
+    // 保存dist和cpu的基地址
+	gic = &gic_data[gic_nr];
+    gic->dist_base.common_base = dist_base;
+    gic->cpu_base.common_base = cpu_base;
+
+	// GIC控制器最多支持8个CPU
+	for (i = 0; i < NR_GIC_CPU_IF; i++)
+		gic_cpu_map[i] = 0xff;
+
+	// 获取支持的最大中断个数
+	gic_irqs = readl_relaxed(gic_data_dist_base(gic) + GIC_DIST_CTR) & 0x1f;
+	gic_irqs = (gic_irqs + 1) * 32;
+	if (gic_irqs > 1020)
+		gic_irqs = 1020;
+	gic->gic_irqs = gic_irqs;
+
+    // 线性映射
+	if (node) {
+		gic->domain = irq_domain_add_linear(node, gic_irqs, &gic_irq_domain_hierarchy_ops, gic);
+	}
+
+    // 设置handle_arch_irq为gic_handle_irq，此处跟前面分析中断的汇编流程就对应上了
+	set_handle_irq(gic_handle_irq);
+
+    // 初始化fist和cpu(使能硬件寄存器)
+	gic_dist_init(gic);
+	gic_cpu_init(gic);
+}
+```
+
+###### 5.4.2.1.1 `irq_domain_add_linear`映射
+
+`irq_domain_add_linear`最终会调用到`__irq_domain_add`函数。我们来看下实现：
+
+```c
+
+
+struct irq_domain *__irq_domain_add(struct device_node *of_node, // 设备树节点
+                    int size,                   // 最大中断号
+				    irq_hw_number_t hwirq_max,  // 最大中断ID
+                    int direct_max,             // 0
+				    const struct irq_domain_ops *ops,
+				    void *host_data)            // gic_data指针
+{
+	struct irq_domain *domain;
+
+    // 后面多申请了(sizeof(unsigned int) * size的内存，用于线性映射的数组
+	domain = kzalloc_node(sizeof(*domain) + (sizeof(unsigned int) * size),
+			      GFP_KERNEL, of_node_to_nid(of_node));
+
+    // 填充结构体成员
+	INIT_RADIX_TREE(&domain->revmap_tree, GFP_KERNEL);
+	domain->ops = ops;
+	domain->host_data = host_data;
+	domain->of_node = of_node_get(of_node);
+	domain->hwirq_max = hwirq_max;
+	domain->revmap_size = size;
+	domain->revmap_direct_max_irq = direct_max;
+	irq_domain_check_hierarchy(domain);
+
+	mutex_lock(&irq_domain_mutex);
+	list_add(&domain->link, &irq_domain_list);
+	mutex_unlock(&irq_domain_mutex);
+
+	return domain;
+}
+```
+
+### 5.5 `irq_of_parse_and_map`:硬件中断号到虚拟中断号的映射
+
+`irq_of_parse_and_map`是内核的一个关键函数，用于从设备树中解析指定设备节点的中断信息，并将其映射为虚拟中断号。
+
+#### 5.1 函数原型
+
+```c
+#define MAX_PHANDLE_ARGS 16
+struct of_phandle_args {
+	struct device_node *np;
+	int args_count;
+	uint32_t args[MAX_PHANDLE_ARGS];
+};
+
+unsigned int irq_of_parse_and_map(struct device_node *dev, int index)
+{
+	struct of_phandle_args oirq;
+
+	of_irq_parse_one(dev, index, &oirq);
+	return irq_create_of_mapping(&oirq);
+}
+```
+
++ `struct device_node *dev`: 设备节点
++ `int index`: 整数索引。用于指定要解析的设备树中的第几个中断。因为一个设备可能有多个中断源
++ 返回值: 成功时返回一个有效的Linuz内核IRQ号
+
+#### 5.2 函数内部执行流程深度解析
+
+以下面的按键中断设备树为例，深度分析函数内部执行流程。
+
+```dts
+key {
+    compatible = "gpio-key";
+    pinctrl-names = "default";
+    pinctrl-0 = <&pinctrl_key>;
+    key-gpios = <&gpio5 0 GPIO_ACTIVE_HIGH>;
+    interrupt-parent = <&gpio5>;
+    interrupts = <0 IRQ_TYPE_EDGE_FALLING>;
+};
+```
+
+##### 5.2.1 `of_irq_parse_one(dev, index, &oirq)`: 设备树中断信息解析
+
+`of_irq_parse_one`函数，把设备节点中断源信息`#interrupt-cells`填充到`struct of_phandle_args`结构体中。
+
+```c
+struct of_phandle_args {
+	struct device_node *np;
+	int args_count;
+	uint32_t args[MAX_PHANDLE_ARGS];
+};
+
+int of_irq_parse_one(struct device_node *device, int index, struct of_phandle_args *out_irq)
+{
+	struct device_node *p;
+	const __be32 *intspec, *tmp, *addr;
+	u32 intsize, intlen;
+	int i, res;
+
+	// intspec指向 <0 IRQ_TYPE_EDGE_FALLING> 这个数组的首地址
+	intspec = of_get_property(device, "interrupts", &intlen);
+
+	// 获取中断父节点，也就是gpio5控制器
+	p = of_irq_find_parent(device);
+
+	// 获取中断父节点中断源cells的参数个数
+	tmp = of_get_property(p, "#interrupt-cells", NULL);
+	intsize = be32_to_cpu(*tmp);
+
+    // 设置out_irq的设备节点，interrupt-cells的参数个数和参数数组
+	out_irq->np = p;
+	out_irq->args_count = intsize;
+	for (i = 0; i < intsize; i++)
+		out_irq->args[i] = be32_to_cpup(intspec++);
+}
+```
+
+此函数执行完成后，`out_irq`的成员如下：
+
+```c
+gpio5: gpio@020ac000 {
+    compatible = "fsl,imx6ul-gpio", "fsl,imx35-gpio";
+    reg = <0x020ac000 0x4000>;
+    interrupts = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>,
+                <GIC_SPI 75 IRQ_TYPE_LEVEL_HIGH>;
+    gpio-controller;
+    #gpio-cells = <2>;
+    interrupt-controller;
+    #interrupt-cells = <2>;
+};
+
+out_irq->np = &gpio5
+out_irq->args_count = 3
+out_irq->args[] = <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>
+```
+
+##### 5.2.2 `irq_create_of_mapping(&oirq)`: 创建中断的映射
+
+```c
+unsigned int irq_create_of_mapping(struct of_phandle_args *irq_data)
+{
+	struct irq_domain *domain;
+	irq_hw_number_t hwirq;
+	unsigned int type = IRQ_TYPE_NONE;
+	int virq;
+
+    // 1. 查找中断域。调用domain->ops->xlat函数(gic_irq_domain_xlate)，翻译成硬件中断号和触发类型
+	domain = irq_find_host(irq_data->np);
+	domain->ops->xlate(domain, irq_data->np, irq_data->args, irq_data->args_count, &hwirq, &type);
+
+    // 2. 查找或创建映射，并设置中断类型
+    virq = irq_create_mapping(domain, hwirq);
+    irq_set_irq_type(virq, type);
+
+    return virq;
+```
+
+###### 5.2.2.1 `xlate`翻译硬件中断号和触发类型
+
+![](./src/0015.jpg)
+
+实际的硬件中断号，还要再`+32`。这个函数的作用是，从`<GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>`设备树中提取出`硬件中断号：74`、`中断触发类型：IRQ_TYPE_LEVEL_HIGH`。
+
+```c
+static int gic_irq_domain_xlate(struct irq_domain *d,
+				                struct device_node *controller,
+				                const u32 *intspec,     // <GIC_SPI 74 IRQ_TYPE_LEVEL_HIGH>
+                                unsigned int intsize,   // 3
+				                unsigned long *out_hwirq, // 
+                                unsigned int *out_type)
+{
+	unsigned long ret = 0;
+
+	if (intsize < 3)
+		return -EINVAL;
+
+	/* Get the interrupt number and add 16 to skip over SGIs */
+	*out_hwirq = intspec[1] + 16;
+
+	/* For SPIs, we need to add 16 more to get the GIC irq ID number */
+	if (!intspec[0])
+		*out_hwirq += 16;
+
+	*out_type = intspec[2] & IRQ_TYPE_SENSE_MASK;
+
+	return ret;
+}
+```
+
+###### 5.2.2.2 `irq_create_mapping`创建映射
+
+具体工作流程：
+
+1. 检查该硬件中断是否已被映射，避免重复映射
+2. 分配一个新的虚拟中断号
+3. 建立`hwirq`到`virq`的映射关系
+4. 返回映射成功的虚拟中断号
+
+```c
+unsigned int irq_create_mapping(struct irq_domain *domain,  // 中断域指针
+                                irq_hw_number_t hwirq)      // 硬件中断号
+{
+	int virq;
+
+	// 1. 检查该硬件中断是否已被映射，避免重复映射
+	virq = irq_find_mapping(domain, hwirq);
+	if (virq) {
+		pr_debug("-> existing mapping on virq %d\n", virq);
+		return virq;
+	}
+
+	// 2. 分配一个新的虚拟中断号
+	virq = irq_domain_alloc_descs(-1, 1, hwirq, of_node_to_nid(domain->of_node));
+
+    // 3. 建立`hwirq`到`virq`的映射关系
+	iirq_domain_associate(domain, virq, hwirq);
+
+    // 4. 返回映射成功的虚拟中断号
+	return virq;
+}
+```
+
+这个里面的具体实现就太过于复杂了。不是一两天能够分析完的，我们等到之后有时间了再继续分析！
 
 
