@@ -2687,3 +2687,449 @@ if (atomic_read(&t->count)) {
 
 + `tasklet`不能包含睡眠函数：如`msleep`、`kmalloc`等，因为`tasklet`在中断上下文中执行，不能睡眠
 + 可以包含忙等待延时函数：如`udelay`、`mdelay`。这些指示忙等待，不会导致`tasklet`被阻塞
+
+## 第8章 软中断
+
+Linux内核的软中断(`softirq`)，是一种用于处理延迟执行任务的机制，一般用在网络设备或块设备驱动中。
+
+### 8.1 什么是软中断
+
+打开Linux源码`include/linux/interrupt/h`文件，如下所示：
+
+```c
+enum
+{
+	HI_SOFTIRQ=0,
+	TIMER_SOFTIRQ,
+	NET_TX_SOFTIRQ,
+	NET_RX_SOFTIRQ,
+	BLOCK_SOFTIRQ,
+	BLOCK_IOPOLL_SOFTIRQ,
+	TASKLET_SOFTIRQ,
+	SCHED_SOFTIRQ,
+	HRTIMER_SOFTIRQ,
+	RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */
+
+	NR_SOFTIRQS
+};
+```
+
+以上代码定义了一个枚举类型，用于标识软中断的不同类型或优先级。每个枚举常量对应一个特定的软中断类型：
+
++ `HI_SOFTIRQ`: 高优先级软中断
++ `TIMER_SOFTIRQ`: 定时器软中断
++ `NET_TX_SOFTIRQ`: 网络传输发送软中断
++ `NET_RX_SOFTIRQ`: 网络传输接收软中断
++ `BLOCK_SOFTIRQ`: 块设备软中断
++ `TASKLET_SOFTIRQ`: 任务软中断
++ `SCHED_SOFTIRQ`: 调度软中断
++ `NR_SOFTIRQS`: 表示软中断的总数，用于指示软中断类型的数据
+
+中断号的优先级越小，代表优先级越高。在驱动代码中，我们可以使用Linux驱动代码中上述的软中断，当然我们也可以自己添加软中断。
+
+如下所示，我们添加一个自定义的软中断`TEST_SOFTIRQ`:
+
+```c
+enum
+{
+	HI_SOFTIRQ=0,
+	TIMER_SOFTIRQ,
+	NET_TX_SOFTIRQ,
+	NET_RX_SOFTIRQ,
+	BLOCK_SOFTIRQ,
+	BLOCK_IOPOLL_SOFTIRQ,
+	TASKLET_SOFTIRQ,
+	SCHED_SOFTIRQ,
+	HRTIMER_SOFTIRQ,
+	RCU_SOFTIRQ,    /* Preferable RCU should always be the last softirq */
+    TEST_SOFTIRQ,   // 添加的自定义中断
+	NR_SOFTIRQS
+};
+```
+
+*注意：尽管我们添加一个自定义的软中断非常简单，但是Linux内核开发者并不希望我们这样做。如果我们要用软中断，建议使用`tasklet`。虽然Linux内核开发者不建议自定义软中断，但我们可以了解学习软中断。*
+
+按上述修改，重新编译内核源码。
+
+### 8.2 软中断接口函数
+
+#### 8.2.1 `open_softirq`注册软中断
+
+```c
+void open_softirq(int nr, void (*action)(struct softirq_action *));
+```
+
+参数介绍：
+
++ `int nr`: 软中断的编号。就是上面的枚举类型
++ `action`: 函数指针。作为软中断的处理函数
+
+#### 8.2.2 `raise_softirq`触发软中断
+
+```c
+void raise_softirq(unsigned int nr);
+```
+
+参数介绍：`unsigned int nr`，软中断的编号。
+
+#### 8.2.3 `raise_softirq_irqoff`在禁用硬中断的情况下，触发软中断
+
+```c
+void raise_softirq_irqoff(unsigned int nr);
+```
+
+参数介绍：`unsigned int nr`，软中断的编号。
+
+#### 8.2.4 `raise_softirq`和`raise_softirq_irqoff`介绍
+
+##### 8.2.4.1 两个API的定义与区别
+
+| 函数 | 原型 |
+| - | - |
+| `raise_softirq(unsigned int nr)` | 在当前CPU上标记指定`softirq`为`pending` |
+| `raise_softirq_irqoff(unsigned int nr)` | **要求中断已关闭**。在当前CPU上设置`softirq pending` |
+
+##### 8.2.4.2 核心区别：是否已经关闭中断？
+
+| 区别点 | `raise_softirq()` | `raise_softirq_irqoff()` |
+| - | - | - |
+| 是否检查中断状态 | 是。会判断终端是否开启 | 否。**假定中断已关闭** |
+| 是否需要加锁 | 如果中断开启，则需要关中断 + 锁 | 不需要额外保护(已在原子上下文) |
+| 性能开销 | 稍高(可能涉及`cli`、`sti`和锁) | 更高效(直接写内存) |
+| 使用前提 | 可在任何上下文中安全调用 | 必须确保中断已被关闭(如`hardirq`中) |
+
+实现原理：`raise_softirq()`内部会直接调用`local_irq_save()`关闭本地中断，防止竞态！
+
+##### 8.2.4.3 典型使用场景 -- 设备驱动的硬件中断服务函数
+
+在硬件中断处理函数中，推荐使用`raise_softirq_irqoff()`。示例代码：
+
+```c
+static irqreturn_t my_button_isr(int irq, void *dev_id)
+{
+    /* 硬件中断上下文中，中断是关闭的 */
+    do_fast_stuff();  // 快速处理
+
+    /* 触发软中断（推荐用 irqoff 版本） */
+    raise_softirq_irqoff(MY_SOFTIRQ);
+
+    return IRQ_HANDLED;
+}
+```
+
+理由：
+
++ 硬中断进入时，CPU自动关闭本地中断
++ 此时你处于**中断禁用状态**
++ 直接调用`raise_softirq_irqoff()`安全且高效
++ 避免了`raise_softirq()`再次做中断开关判断和加锁的开销
+
+**结论：这是最常见也是最推荐的做法！**
+
+##### 8.2.4.4 总结
+
+| 使用场景 | 应该使用的函数 | 原因 |
+| - | - | - |
+| 硬件中断处理函数(`ISR`) | `raise_softirq_irqoff(nr)` | 中断已关，性能最优 |
+| 不确定中断状态 | `raise_softirq(nr)` | 安全第一 |
+
+#### 8.3 代码实测
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/of.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/gpio/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+
+#define DRIVER_NAME         "gpio-key"
+
+struct my_dev {
+    const char *name;
+    dev_t  dev_num;
+    struct cdev cdev;
+    struct class *class;
+    struct gpio_desc *desc;
+    int    irq;
+    u32    irq_type;
+};
+
+static void my_softirq_action(struct softirq_action *my_action)
+{
+    printk("[softirq]\n");
+}
+
+static irqreturn_t key_interrupt(int irq, void *dev_id)
+{
+    printk("IRQ\n");
+    raise_softirq_irqoff(TEST_SOFTIRQ);     // 触发软中断
+    return IRQ_HANDLED;
+}
+
+static const struct file_operations my_fops = {
+
+};
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_dev *dev = NULL;
+
+    printk("my_probe...\n");
+    dev = kzalloc(sizeof(struct my_dev), GFP_KERNEL);
+    dev->name = pdev->name;
+    dev->desc = gpiod_get_optional(&pdev->dev, "key", GPIOD_IN);
+    dev->irq = gpiod_to_irq(dev->desc);
+    of_property_read_u32_index(pdev->dev.of_node, "interrupts", 1, &dev->irq_type);
+    open_softirq(TEST_SOFTIRQ, my_softirq_action);  // 注册软中断
+    request_irq(dev->irq, key_interrupt, IRQF_SHARED | dev->irq_type, dev->name, dev);
+
+    alloc_chrdev_region(&dev->dev_num, 0, 1, dev->name);
+    cdev_init(&dev->cdev, &my_fops);
+    dev->cdev.owner = THIS_MODULE;
+    cdev_add(&dev->cdev, dev->dev_num, 1);
+    dev->class = class_create(THIS_MODULE, dev->name);
+    device_create(dev->class, NULL, dev->dev_num, NULL, dev->name);
+
+    platform_set_drvdata(pdev, dev);
+    printk("probe_done!\n");
+
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    struct my_dev *dev = platform_get_drvdata(pdev);
+
+    printk("my_remove...\n");
+    device_destroy(dev->class, dev->dev_num);
+    class_destroy(dev->class);
+    cdev_del(&dev->cdev);
+    unregister_chrdev_region(dev->dev_num, 1);
+    free_irq(dev->irq, dev);
+    
+    gpiod_put(dev->desc);
+
+    kfree(dev);
+    printk("remove_done!\n");
+
+    return 0;
+}
+
+static const struct of_device_id my_dt_match[] = {
+    { .compatible = DRIVER_NAME },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .driver = {
+        .name  = DRIVER_NAME,
+        .owner = THIS_MODULE,
+        .of_match_table = my_dt_match,
+    },
+    .probe  = my_probe,
+    .remove = my_remove,
+};
+
+static int __init my_init(void)
+{
+    printk("my_init\n");
+    platform_driver_register(&my_driver);
+	return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk("my_exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+```
+
+测试结果如下。可以看到，驱动模块报错，找不到`open_softirq`和`raise_softirq_irqoff`。为啥会有这种报错？我们还是第一次遇见。
+
+![](./src/0017.jpg)
+
+看下Linux内核源码。这两个函数没有`EXPORT_SYMBOL`。因为Linux内核开发者不希望去东欧工程师擅自在枚举类型中添加软中断。
+
+![](./src/0018.jpg)
+
+我们修改`include/linux/softirq.c`，将这两个函数导出到符号表，重新编译内核和驱动模块。测试结果如下：
+
+![](./src/0019.jpg)
+
+## 第9章 特殊的软中断 -- `tasklet`源码分析
+
+### 9.1 `tasklet`软中断的注册
+
+`tasklet`是Linux内核中的一种软中断机制，它可以被看作是一种轻量级的延迟处理。他是通过软中断控制结构来实现的，因此也被称为软中断。我们来分析一下源码。
+
+软中断的初始化函数定义在内核源码`kernel/softirq.c`，内容如下：
+
+```c
+/*
+ * Tasklets
+ */
+struct tasklet_head {
+	struct tasklet_struct *head;
+	struct tasklet_struct **tail;
+};
+
+static DEFINE_PER_CPU(struct tasklet_head, tasklet_vec);
+
+void __init softirq_init(void)
+{
+	int cpu;
+
+    // 1. 遍历每个可能的CPU. 在多核系统中，此循环用于初始化每个CPU的tasklet_vec链表
+	for_each_possible_cpu(cpu) {
+        // 将tasklet_vec的tail指针设为对应head指针，确保tasklet_vec初始状态为空
+		per_cpu(tasklet_vec, cpu).tail = &per_cpu(tasklet_vec, cpu).head;
+	}
+
+    // 2. 注册TASKLET_SOFTIRQ软中断的处理函数：tasklet_action
+	open_softirq(TASKLET_SOFTIRQ, tasklet_action);
+}
+```
+
+在第7章介绍`tasklet`时，给了2个常用的API。如下：
+
+```c
+struct tasklet_struct
+{
+	struct tasklet_struct *next;
+	unsigned long state;
+	atomic_t count;
+	void (*func)(unsigned long);
+	unsigned long data;
+};
+
+// 用于初始化结构体成员
+void tasklet_init(struct tasklet_struct *t, void (*func)(unsigned long), unsigned long data)
+{
+	t->next = NULL;
+	t->state = 0;
+	atomic_set(&t->count, 0);
+	t->func = func;
+	t->data = data;
+}
+
+// 把tasklet添加到当前CPU的tasklet_vec链表中，调用raise_softirq_irqoff触发软中断调度
+void tasklet_schedule(struct tasklet_struct *t)
+{
+	unsigned long flags;
+
+	local_irq_save(flags);
+	t->next = NULL;
+	*__this_cpu_read(tasklet_vec.tail) = t;
+	__this_cpu_write(tasklet_vec.tail, &(t->next));
+	raise_softirq_irqoff(TASKLET_SOFTIRQ);
+	local_irq_restore(flags);
+}
+```
+
+关键过程如下：
+
+1. `tasklet_schedule()`函数，把`tasklet`添加到当前CPU的tasklet_vec链表中
+2. `tasklet_schedule()`函数，调用`raise_softirq_irqoff()`触发软中断调度执行
+
+### 9.2 `tasklet_action`处理函数
+
+我们再来看下`tasklet`软中断的处理函数`tasklet_action`源码
+
+```c
+static void tasklet_action(struct softirq_action *a)
+{
+	struct tasklet_struct *list;
+
+    // 1. 摘取当前CPU的tasklet链表
+	local_irq_disable();
+	list = __this_cpu_read(tasklet_vec.head);
+	__this_cpu_write(tasklet_vec.head, NULL);
+	__this_cpu_write(tasklet_vec.tail, this_cpu_ptr(&tasklet_vec.head));
+	local_irq_enable();
+
+    // 2. 遍历并尝试执行每个tasklet
+	while (list) {
+		struct tasklet_struct *t = list;
+
+		list = list->next;
+		if (tasklet_trylock(t)) {
+				t->func(t->data);
+				tasklet_unlock(t);
+				continue;
+			tasklet_unlock(t);
+		}
+
+        // 3. 无法立即执行某个tasklet时，把这个未被执行的tasklet重新添加到当前CPU链表，并再次触发软中断
+		local_irq_disable();
+		t->next = NULL;
+		*__this_cpu_read(tasklet_vec.tail) = t;
+		__this_cpu_write(tasklet_vec.tail, &(t->next));
+		__raise_softirq_irqoff(TASKLET_SOFTIRQ);
+		local_irq_enable();
+	}
+}
+```
+
+前面的内容都很好理解。最后一段是做什么？意义何在？
+
+我们在某些场景下，可能存在无法立即执行`tasklet`的情况。因此，需要重新添加回链表，并触发下次执行。
+
+场景举例：`tasklet`正在运行(已被另一个CPU执行)
+
+```c
+void my_tasklet_func(unsigned long data)
+{
+    // 执行耗时操作(如访问硬件)
+    mdelay(1000);   // 占用时间较长
+}
+```
+
+此时：
+
++ CPU0正在执行这个`tasklet`
++ CPU1上的中断又调用了`tasklet_schedule()`(设置`SCHED`标志)
++ 当前软中断处理中，发现`tasklet_trylock(t)`失败(RUN位已置位)
+
+必须推迟执行，不能阻塞或丢弃！ -- 所以将其重新排队，等下一次软中断再来尝试。
+
+### 9.3 `tasklet`设计哲学
+
+Linux内核对`tasklet`的设计遵循以下原则：
+
+| 原则 | 实现方式 |
+| - | - |
+| 串行化执行 | 每个tasklet最多在一个CPU上运行(通过`RUN`锁) |
+| 不丢失调度请求 | 即使不能立即执行，也要重新排队 |
+| 自动重试机制 | 通过`__raise_softirq_irqoff()`触发下一轮排队 |
+
+### 9.4 最后这段代码的意义
+
+| 问 | 答 |
+| - | - |
+| 为什么要把t重新添加到`tasklet_evt` | 因为当前无法执行(被锁住或禁用)，需推迟到未来再试 |
+| 会不会造成无限循环 | 不会。内核有重启次数限制和`ksoftirqd`保底机制 |
+| 这是不是性能开销 | 是。但如果频繁发生，说明设计有问题(如`tasklet`太长) |
+| 有没有替代方案 | 更现代的做法是使用`workqueue`，支持动态创建、睡眠、优先级等 |
+
+### 9.5 建议实践准则
+
+我们可以看到，`tasklet`其实是在链表中按顺序执行的。所以：一个`tasklet`太长就会导致其他所有`tasklet`的阻塞。更严重时，会导致`tasklet_trylock()`失败带来更大的性能开销。
+
+| 场景 | 建议 |
+| `tasklet`执行时间 | 控制在几毫秒内，避免阻塞其他`softirq` |
+| 长时间操作 | 改用`workqueue` |
+| 需要传参或多实例 | 使用`work_struct + container_of()` |
+| 高频小人物 | `tasklet`仍是合理选择 |
+
+
