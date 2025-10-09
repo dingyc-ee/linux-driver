@@ -3132,4 +3132,199 @@ Linux内核对`tasklet`的设计遵循以下原则：
 | 需要传参或多实例 | 使用`work_struct + container_of()` |
 | 高频小人物 | `tasklet`仍是合理选择 |
 
+## 第10章 共享工作队列
+
+### 10.1 什么是工作队列
+
+**工作队列(`workqueue`)**是Linux内核中，用于将任务从中断上下文或其他原子上下文推迟到**进程上下文**执行的一种机制。工作队列与软中断的差异：
+
++ 可以睡眠
++ 可以调度
++ 可以使用互斥锁(`mutex`)
++ 可以进行内存分配(`GFP_KERNEL`)
+
+这使得`workqueue`称为设备驱动开发中，最推荐使用的延迟执行机制。
+
+### 10.2 基本组成结构
+
+#### 10.2.1 `struct work_struct`
+
+表示一个待执行的工作项。
+
+```c
+struct work_struct {
+	atomic_long_t data;
+	struct list_head entry;
+	work_func_t func; // 回调函数
+};
+```
+
+*注意：不能在栈上定义`work_struct`，因为可能异步执行时栈已被销毁。*
+
+#### 10.2.2 `work_func_t`任务处理函数
+
+```c
+typedef void (*work_func_t)(struct work_struct *work);
+```
+
+### 10.3 工作队列类型
+
+| 类型 | 特点 |
+| - | - |
+| **默认工作队列** | 使用全局共享的`system_wq`，简单但可能受其他模块影响 |
+| **专用工作队列** | 自己独立创建线程池，性能更号、隔离性强 |
+| **有序工作队列** | `system_unbound_wq`，保证顺序执行 |
+| **高优先级工作队列** | `system_highpri_wq` |
+
+### 10.4 工作队列相常用API
+
+#### 10.2.4.1 基本初始化API
+
+1. `INIT_WORK(struct work_struct *work, work_func_t func)`
+
+    静态初始化一个普通`work`。使用场景：无需延迟的即时任务。
+
+2. `DECLARE_WORK(name, func)`
+
+    声明并初始化`work`(位于栈或全局区)。不推荐在局部作用域使用，容易出错。
+
+#### 10.4.2 提交与调度API
+
+1. `int schedule_work(struct work_struct *work)`
+
+    将`work`提交给**默认共享工作队列(`system_wq`)**，立即执行(无延迟)。成功返回0，已在队列中返回1
+
+2. `bool queue_work(struct workqueue_struct *wq, struct work_struct *work)`
+
+    将`work`提交到**指定的工作队列**。成功返回true，已在队列中返回false
+
+#### 10.4.3 取消与同步API
+
+1. `bool cancel_work_sync(struct work_struct *work)`
+
+    同步取消一个未执行的`work`，并等待当前正在运行的完成。必须在模块卸载时调用。
+
+2. `bool flush_workqueue(struct workqueue_struct *wq)`
+
+    等待`workqueue`中**所有已提交的任务完成**。使用场景：模块推出前确保无后台任务运行
+
+3. `bool flush_work(struct work_struct *work)`
+
+    等待指定`work`完成(无论是否在运行)。适合需要`确认某任务已完成`的同步场景
+
+### 10.5 测试代码
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/of.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/gpio/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+#include <linux/delay.h>
+#include <linux/workqueue.h>
+
+#define DRIVER_NAME         "gpio-key"
+
+struct my_dev {
+    const char *name;
+    struct gpio_desc *desc;
+    int    irq;
+    u32    irq_type;
+    struct work_struct work;
+};
+
+static void my_work_func(struct work_struct *work)
+{
+    struct my_dev *dev = container_of(work, struct my_dev, work);
+    msleep(20);
+    if (!gpiod_get_value(dev->desc)) {
+        printk("[system_wq] %s down\n", dev->name);
+    }
+}
+
+static irqreturn_t key_interrupt(int irq, void *dev_id)
+{
+    struct my_dev *dev = (struct my_dev *)dev_id;
+    printk("IRQ\n");
+    schedule_work(&dev->work);
+    return IRQ_HANDLED;
+}
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_dev *dev = NULL;
+
+    printk("my_probe...\n");
+    dev = kzalloc(sizeof(struct my_dev), GFP_KERNEL);
+    dev->name = pdev->name;
+    dev->desc = gpiod_get_optional(&pdev->dev, "key", GPIOD_IN);
+    dev->irq = gpiod_to_irq(dev->desc);
+    of_property_read_u32_index(pdev->dev.of_node, "interrupts", 1, &dev->irq_type);
+    INIT_WORK(&dev->work, my_work_func);
+    request_irq(dev->irq, key_interrupt, IRQF_SHARED | dev->irq_type, dev->name, dev);
+
+    platform_set_drvdata(pdev, dev);
+    
+    printk("probe_done!\n");
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    struct my_dev *dev = platform_get_drvdata(pdev);
+
+    printk("my_remove...\n");
+    free_irq(dev->irq, dev);
+    gpiod_put(dev->desc);
+    kfree(dev);
+    printk("remove_done!\n");
+
+    return 0;
+}
+
+static const struct of_device_id my_dt_match[] = {
+    { .compatible = DRIVER_NAME },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .driver = {
+        .name  = DRIVER_NAME,
+        .owner = THIS_MODULE,
+        .of_match_table = my_dt_match,
+    },
+    .probe  = my_probe,
+    .remove = my_remove,
+};
+
+static int __init my_init(void)
+{
+    printk("my_init\n");
+    platform_driver_register(&my_driver);
+	return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk("my_exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+```
+
+测试结果：
+
+![](./src/0020.jpg)
+
+
 
