@@ -3326,5 +3326,566 @@ MODULE_LICENSE("GPL");
 
 ![](./src/0020.jpg)
 
+## 第11章 自定义工作队列
 
+前面我们介绍了*共享工作队列*的使用。*共享工作队列*使用起来简单，但他是全局共享的。有很多地方都在向这个工作队列发消息，实时性得不到保证。
 
+```c
+static int __init init_workqueues(void)
+{
+    /* system_wq: 共享工作队列 */
+	system_wq           = alloc_workqueue("events", 0, 0);
+	system_highpri_wq   = alloc_workqueue("events_highpri", WQ_HIGHPRI, 0);
+	system_long_wq      = alloc_workqueue("events_long", 0, 0);
+	system_unbound_wq   = alloc_workqueue("events_unbound", WQ_UNBOUND, WQ_UNBOUND_MAX_ACTIVE);
+	return 0;
+}
+early_initcall(init_workqueues);
+```
+
+更好的方案是，按功能模块使用自定义工作队列。我们来看下相关API。
+
+### 11.1 创建工作队列
+
+1. `struct workqueue_struct *create_workqueue(const char *name)`
+
+    给每个CPU都创建一个CPU相关的工作队列。成功返回`struct workqueue_struct *`指针，失败返回NULL。
+
+2. `struct workqueue_struct *alloc_workqueue(const char *name, unsigned int flags, int max_active, ...)`
+
+    创建一个自定义工作队列。参数如下：
+    
+    + `name`: 工作队列名称(出现在ps和日志中)
+    + `flags`: 控制并发性和绑定方式。常见标志包括：
+        + `WQ_UNBOUND`: 不绑定CPU，适用于高延迟任务
+        + `WQ_MEM_RECLAIM`: 允许在内存回收路径中安全使用
+        + `WQ_HIGHPRI`: 高优先级worker
+    + `max_active`: 每个CPU上最多同时活跃的work数量(通常为1或8)
+
+### 11.2 向工作队列提交任务
+
+当工作队列创建好之后，需要将工作任务项提交到工作队列。
+
+1. `bool queue_work_on(int cpu, struct workqueue_struct *wq, struct work_struct *work)`
+
+    指定提交到某个cpu。
+
+2. `bool queue_work(struct workqueue_struct *wq, struct work_struct *work)`
+
+    不绑定CPU。
+
+### 11.3 取消和刷新工作
+
+1. `bool cancel_work_sync(struct work_struct *work)`
+
+    + 功能：同步取消一个未执行的work。如果正在执行，会等待其完成
+    + 使用场景：模块卸载前清理`pending work`
+
+2. `void flush_workqueue(struct workqueue_struct *wq)`
+
+    + 功能：等待工作队列中所有已提交的`worker`执行完毕
+    + 注意：不会取消`worker`，只是等待他们完成
+    + 典型用途：设备关闭或驱动`cleanup`阶段
+
+### 11.4 删除工作队列
+
+`void destroy_workqueue(struct workqueue_struct *wq)`
+
+    删除自定义的工作队列。
+
+### 11.5 获取宿主结构体
+
+由于工作函数只接收`struct work_struct *`，通常直接将其嵌入到更大的结构体中。
+
+```c
+struct my_device {
+    int data;
+    struct work_struct work;
+};
+
+void my_work_handler(struct work_struct *work)
+{
+    struct my_device *dev = container_of(work, struct my_device, work);
+    printk(KERN_INFO "Data: %d\n", dev->data);
+}
+```
+
+### 11.6 测试代码
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/of.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/gpio/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+#include <linux/delay.h>
+#include <linux/workqueue.h>
+
+#define DRIVER_NAME         "gpio-key"
+
+struct my_dev {
+    const char *name;
+    struct gpio_desc *desc;
+    int    irq;
+    u32    irq_type;
+    struct workqueue_struct *wq;
+    struct work_struct work;
+};
+
+static void my_work_func(struct work_struct *work)
+{
+    struct my_dev *dev = container_of(work, struct my_dev, work);
+    msleep(20);
+    if (!gpiod_get_value(dev->desc)) {
+        printk("[my_wq] %s down\n", dev->name);
+    }
+}
+
+static irqreturn_t key_interrupt(int irq, void *dev_id)
+{
+    struct my_dev *dev = (struct my_dev *)dev_id;
+    printk("IRQ\n");
+    queue_work(dev->wq, &dev->work);
+    return IRQ_HANDLED;
+}
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_dev *dev = NULL;
+
+    printk("my_probe...\n");
+    dev = kzalloc(sizeof(struct my_dev), GFP_KERNEL);
+    dev->name = pdev->name;
+    dev->desc = gpiod_get_optional(&pdev->dev, "key", GPIOD_IN);
+    dev->irq = gpiod_to_irq(dev->desc);
+    of_property_read_u32_index(pdev->dev.of_node, "interrupts", 1, &dev->irq_type);
+    dev->wq = create_workqueue("my_wq");
+    INIT_WORK(&dev->work, my_work_func);
+    request_irq(dev->irq, key_interrupt, IRQF_SHARED | dev->irq_type, dev->name, dev);
+
+    platform_set_drvdata(pdev, dev);
+    
+    printk("probe_done!\n");
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    struct my_dev *dev = platform_get_drvdata(pdev);
+
+    printk("my_remove...\n");
+    free_irq(dev->irq, dev);
+    cancel_work_sync(&dev->work);
+    flush_workqueue(dev->wq);
+    destroy_workqueue(dev->wq);
+    gpiod_put(dev->desc);
+    kfree(dev);
+    printk("remove_done!\n");
+
+    return 0;
+}
+
+static const struct of_device_id my_dt_match[] = {
+    { .compatible = DRIVER_NAME },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .driver = {
+        .name  = DRIVER_NAME,
+        .owner = THIS_MODULE,
+        .of_match_table = my_dt_match,
+    },
+    .probe  = my_probe,
+    .remove = my_remove,
+};
+
+static int __init my_init(void)
+{
+    printk("my_init\n");
+    platform_driver_register(&my_driver);
+	return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk("my_exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+```
+
+测试结果如下：
+
+![](./src/0021.jpg)
+
+## 第12章 延迟工作队列
+
+### 12.1 什么是延迟工作队列
+
+延迟工作队列是Linux内核中，一种用于**延迟执行任务**的机制。它允许你指定一个延迟时间，即该工作将在当前时间加上一定延迟之后才被调度执行。核心功能如下：
+
+1. **异步执行任务**: 将耗时操作从原子上下文(如中断处理程序)转移到进程上下文
+2. **定时延迟执行**: 支持在指定时间后自动调度执行任务
+3. **可取消性**: 可以在任务执行前取消延迟工作
+4. **多处理器支持**: 工作可以在合适的CPU上运行，支持并发和负载均衡
+
+### 12.2 相关数据结构
+
+```c
+struct delayed_work {
+	struct work_struct work;
+	struct timer_list timer;
+};
+```
+
+这是延迟工作的核心结构体。参数如下：
+
++ `work`: 嵌入的标准`work_struct`，表示实际要执行的工作
++ `timer`: 内核定时器，用于实现延迟调度
+
+### 12.3 常用API
+
+#### 12.3.1 初始化延迟工作
+
+1. `DECLARE_DELAYED_WORK(name, function)`
+
+    静态定义并初始化延迟工作。
+
+2. `INIT_DELAYED_WORK(&my_dwork, my_function)`
+
+    动态初始化延迟工作。
+
+#### 12.3.2 提交延迟工作
+
+1. `bool schedule_delayed_work(struct delayed_work *dwork, unsigned long delay)`
+
+    将工作加入系统默认工作队列(`共享工作队列`)。并在指定延迟后执行。
+
+    + `dwork`: 延迟工作结构体
+    + `delay`: 延迟到tick数(`jiffies`)，通常用`msecs_to_jiffies()`或`HZ`转换
+    + `返回值`: 如果工作之前已在队列中，则返回false。否则为true
+
+2. `bool queue_delayed_work(struct workqueue_struct *wq, struct delayed_work *dwork, unsigned long delay)`
+
+    在自定义工作队列上调度延迟工作。
+
+#### 12.3.3 取消延迟工作
+
+取消延迟工作，并等待其执行完成(如果正在运行)。
+
+```c
+bool cancel_delayed_work_sync(struct delayed_work *dwork)
+```
+
+#### 12.3.4 判断状态
+
+检查延迟工作是否已经排队但尚未执行，常用于判断是否需要重新调度或避免重复添加。
+
+```c
+bool delayed_work_pending(const struct delayed_work *dwork)
+```
+
+#### 12.3.5 修改延迟时间(刷新)
+
+```c
+bool mod_delayed_work(struct workqueue_struct *wq, struct delayed_work *dwork, unsigned long delay)
+```
+
+### 14.4 按键消抖程序
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/of.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/gpio/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+#include <linux/delay.h>
+#include <linux/workqueue.h>
+
+#define DRIVER_NAME         "gpio-key"
+
+struct my_dev {
+    const char *name;
+    struct gpio_desc *desc;
+    int    irq;
+    u32    irq_type;
+    struct delayed_work work;
+};
+
+static void my_work_func(struct work_struct *work)
+{
+    struct delayed_work *dwork = container_of(work, struct delayed_work, work);
+    struct my_dev *dev = container_of(dwork, struct my_dev, work);
+    if (!gpiod_get_value(dev->desc)) {
+        printk("[delay_wq] %s down\n", dev->name);
+    }
+}
+
+static irqreturn_t key_interrupt(int irq, void *dev_id)
+{
+    struct my_dev *dev = (struct my_dev *)dev_id;
+    printk("IRQ\n");
+    if (delayed_work_pending(&dev->work)) {
+        cancel_delayed_work_sync(&dev->work);
+    }
+    schedule_delayed_work(&dev->work, msecs_to_jiffies(20));
+    return IRQ_HANDLED;
+}
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_dev *dev = NULL;
+
+    printk("my_probe...\n");
+    dev = kzalloc(sizeof(struct my_dev), GFP_KERNEL);
+    dev->name = pdev->name;
+    dev->desc = gpiod_get_optional(&pdev->dev, "key", GPIOD_IN);
+    dev->irq = gpiod_to_irq(dev->desc);
+    of_property_read_u32_index(pdev->dev.of_node, "interrupts", 1, &dev->irq_type);
+    INIT_DELAYED_WORK(&dev->work, my_work_func);
+    request_irq(dev->irq, key_interrupt, IRQF_SHARED | dev->irq_type, dev->name, dev);
+
+    platform_set_drvdata(pdev, dev);
+    
+    printk("probe_done!\n");
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    struct my_dev *dev = platform_get_drvdata(pdev);
+
+    printk("my_remove...\n");
+    free_irq(dev->irq, dev);
+    cancel_delayed_work_sync(&dev->work);
+    gpiod_put(dev->desc);
+    kfree(dev);
+    printk("remove_done!\n");
+
+    return 0;
+}
+
+static const struct of_device_id my_dt_match[] = {
+    { .compatible = DRIVER_NAME },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .driver = {
+        .name  = DRIVER_NAME,
+        .owner = THIS_MODULE,
+        .of_match_table = my_dt_match,
+    },
+    .probe  = my_probe,
+    .remove = my_remove,
+};
+
+static int __init my_init(void)
+{
+    printk("my_init\n");
+    platform_driver_register(&my_driver);
+	return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk("my_exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+```
+
+测试结果如下：
+
+![](./src/0022.jpg)
+
+## 第13章 中断线程化
+
+**中断线程化**是实时Linux项目开发的一个新特性，目的是降低中断处理对系统实时延迟的影响。
+
+### 13.1 中断线程化的底层原理
+
+#### 13.1.1 基本概念
+
+中断线程化：为某个中断请求(`IRQ`)创建一个专属的内核线程。当中断发生时，由中断控制器触发后，不是直接调用中断处理函数，而是唤醒对应的线程来执行处理。
+
+有两种模式：
+
++ 全线程化：中断处理函数完全在线程中执行
++ 混合模式：`Primary Handler` + `Threaded Handler`
+    + `Primary Handler`: 运行在中断上下文中，快速判断是否真正需要处理。返回`IRQ_WAKE_THREAD`才会唤醒线程
+    + `Threaded Handler`: 运行在专属线程中，执行实际的耗时操作
+
+```c
+int request_threaded_irq(unsigned int irq, 
+                        irq_handler_t handler,  // Primary Handler(可选)
+			            irq_handler_t thread_fn,    // 线程处理函数
+                        unsigned long irqflags,
+			            const char *devname, 
+                        void *dev_id)
+```
+
+#### 13.1.2 内核内部流程
+
+1. 设备产生中断 -> CPU接收到IRQ
+2. 内核调用注册的`handler`(如果存在)
+    + 若返回`IRQ_NONE`或`IRQ_HANDLED`: 不启动线程
+    + 若返回`IRQ_WAKE_THREAD`: 唤醒对应线程
+3. 内核唤醒与该IRQ绑定的内核线程
+4. 线程执行`thread_fn(dev)`，此时处于进程上下文，可睡眠、调度、访问用户空间等
+5. 处理完成后线程进入等待状态，直到下一次中断唤醒
+
+### 13.2 优缺点分析
+
+优点：
+
++ 提升系统响应性：缩短中断关闭时间
++ 支持阻塞操作：可在处理中睡眠、同步
++ 更好的调度控制：可设置线程优先级、CPU亲和性
++ 减少`softirq`压力
++ 易于调试：线程可见于`ps / top`，便于追踪
+
+缺点：
+
++ 资源开销大：每个线程化中断占用一个内核线程(约8KB~16KB栈空间)
++ 上下文切换开销：从中断跳转到线程有一定延迟
++ 不适用于快速中断：如果中断频率极高而处理极快，反而不如直接在**中断上半部**处理
+
+最佳选择：
+
+| 维度 | 最佳选择 |
+| - | - |
+| **最高实时性** | 中断线程化 |
+| **最低开销** | `tasklet` |
+| **最灵活通用** | 工作队列 |
+
+### 13.3 测试代码
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/of.h>
+#include <linux/cdev.h>
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include <linux/gpio/consumer.h>
+#include <linux/platform_device.h>
+#include <linux/irq.h>
+#include <linux/interrupt.h>
+#include <linux/delay.h>
+#include <linux/workqueue.h>
+
+#define DRIVER_NAME         "gpio-key"
+
+struct my_dev {
+    const char *name;
+    struct gpio_desc *desc;
+    int    irq;
+    u32    irq_type;
+};
+
+static irqreturn_t irq_top(int irq, void *dev_id)
+{
+    printk("[IRQ top]\n");
+    return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t irq_thread(int irq, void *dev_id)
+{
+    struct my_dev *dev = (struct my_dev *)dev_id;
+    msleep(20);
+    if (gpiod_get_value(dev->desc) == 0) {
+        printk("[IRQ thread] %s down\n", dev->name);
+    }
+    return IRQ_HANDLED;
+}
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_dev *dev = NULL;
+
+    printk("my_probe...\n");
+    dev = kzalloc(sizeof(struct my_dev), GFP_KERNEL);
+    dev->name = pdev->name;
+    dev->desc = gpiod_get_optional(&pdev->dev, "key", GPIOD_IN);
+    dev->irq = gpiod_to_irq(dev->desc);
+    of_property_read_u32_index(pdev->dev.of_node, "interrupts", 1, &dev->irq_type);
+    request_threaded_irq(dev->irq, irq_top, irq_thread, IRQF_SHARED | dev->irq_type, dev->name, dev);
+
+    platform_set_drvdata(pdev, dev);
+    printk("probe_done!\n");
+    return 0;
+}
+
+static int my_remove(struct platform_device *pdev)
+{
+    struct my_dev *dev = platform_get_drvdata(pdev);
+
+    printk("my_remove...\n");
+    free_irq(dev->irq, dev);
+    gpiod_put(dev->desc);
+    kfree(dev);
+    printk("remove_done!\n");
+
+    return 0;
+}
+
+static const struct of_device_id my_dt_match[] = {
+    { .compatible = DRIVER_NAME },
+    { /* Sentinel */ }
+};
+
+static struct platform_driver my_driver = {
+    .driver = {
+        .name  = DRIVER_NAME,
+        .owner = THIS_MODULE,
+        .of_match_table = my_dt_match,
+    },
+    .probe  = my_probe,
+    .remove = my_remove,
+};
+
+static int __init my_init(void)
+{
+    printk("my_init\n");
+    platform_driver_register(&my_driver);
+	return 0;
+}
+
+static void __exit my_exit(void)
+{
+    platform_driver_unregister(&my_driver);
+    printk("my_exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+```
+
+测试结果如下：
+
+![](./src/0023.jpg)
