@@ -674,7 +674,230 @@ MODULE_AUTHOR("ding");
 
 ![](./src/0006.jpg)
 
-## 第5章 从最简单的设备驱动代码入手分析匹配规则
+## 第5章 继续完善设备驱动层代码
+
+在前一章节，我们编写了最简单的设备驱动层代码，创建了输入设备结构体。本章我们继续完善设备驱动层代码，用输入设备来上报事件。
+
+### 5.1 上报事件
+
+上报事件是指在设备驱动层中，当输入设备产生事件时，将该事件通知给输入子系统。在上报事件前，首先要确定要上报的事件类型。事件类型可以是：按键事件、相对位置事件、绝对位置事件等，取决于输入设备的特性与能力。
+
+在Linux内核中，事件类型由预定义的常量表示。在确定事件类型之后，就需要使用相应的上报函数将事件数据传递给输入子系统。
+
+```c
+// input.h
+
+#define EV_SYN			0x00
+#define EV_KEY			0x01	// 按键事件
+#define EV_REL			0x02	// 相对位置事件
+#define EV_ABS			0x03	// 绝对位置事件
+// ...
+#define EV_LED			0x11
+#define EV_MAX			0x1f
+#define EV_CNT			(EV_MAX+1)
+```
+
+![](./src/0007.jpg)
+
+### 5.2 上报函数
+
+当在设备驱动层中使用上报函数时，这些函数负责将时间数据传递给输入子系统，以便将事件信息传递给应用程序或系统组件进行响应和处理。
+
+#### 5.2.1 `input_report_key`函数
+
+```c
+void input_report_key(struct input_dev *dev, unsigned int code, int value);
+```
+
++ 功能：上报按键事件
++ 参数：
+	+ `dev`: 输入设备
+	+ `code`: 按键码。表示按下或释放的具体按键
+	+ `value`: 按键状态。0表示按键释放，1表示按键按下
+
+#### 5.2.2 `input_report_rel`函数
+
+```c
+void input_report_rel(struct input_dev *dev, unsigned int code, int value);
+```
+
++ 功能：上报相对位置事件
++ 参数：
+	+ `dev`: 输入设备
+	+ `code`: 位置码。表示相对位置的具体类型
+	+ `value`: 位置偏移量。表示设备相对于先前设备的偏移量
+
+#### 5.2.3 `input_report_abs`函数
+
+```c
+void input_report_abs(struct input_dev *dev, unsigned int code, int value);
+```
+
++ 功能：上报绝对位置事件
++ 参数：
+	+ `dev`: 输入设备
+	+ `code`: 位置码。表示绝对位置的具体类型
+	+ `value`: 位置值。表示设备的绝对位置
+
+#### 5.2.4 `input_report_switch`函数
+
+```c
+void input_report_switch(struct input_dev *dev, unsigned int code, int value);
+```
+
++ 功能：上报开关事件
++ 参数：
+	+ `dev`: 输入设备
+	+ `code`: 开关码。表示开关的具体类型
+	+ `value`: 开关状态。0表示关闭，非零值表示打开
+
+#### 5.2.5 `input_sync`函数
+
+```c
+void input_sync(struct input_dev *dev);
+```
+
++ 功能：同步事件
++ 参数`dev`：输入设备
+
+每个上报函数都是内联函数，通过调用`input_event()`函数将事件数据添加到输入事件队列中。在使用上报函数之后，通常回调用`input_sync()`函数进行同步。同步事件的目的时，告知输入子系统事件的结束，以便子系统可以将事件传递给响应的印共有六个程序或系统组件进行处理。
+
+### 5.3 测试代码
+
+我们的测试代码原理是，启动一个1000ms周期定时器。在定时器中翻转按键状态值，并上报。至于为什么要翻转按键值，我们后面再分析。
+
+```c
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/input.h>
+#include <linux/slab.h>
+
+struct my_dev {
+    struct input_dev *input;
+    struct timer_list timer;
+    int key_value;
+};
+
+static struct my_dev *s_dev;
+
+static void my_timer(unsigned long arg)
+{
+    struct my_dev *dev = (struct my_dev *)arg;
+
+    input_report_key(dev->input, KEY_1, dev->key_value);
+    input_sync(dev->input);
+    dev->key_value = !dev->key_value;
+
+    mod_timer(&dev->timer, jiffies + msecs_to_jiffies(1000));
+}
+
+static int __init my_init(void)
+{
+    printk("my_init\n");
+    
+    s_dev = kzalloc(sizeof(struct my_dev), GFP_KERNEL);
+
+    s_dev->input = input_allocate_device();
+    s_dev->input->name = "my_input_key";
+    set_bit(EV_SYN, s_dev->input->evbit);
+    set_bit(EV_KEY, s_dev->input->evbit);
+    set_bit(KEY_1,  s_dev->input->keybit);
+    input_register_device(s_dev->input);
+
+    setup_timer(&s_dev->timer, my_timer, (unsigned long)s_dev);
+    mod_timer(&s_dev->timer, jiffies + msecs_to_jiffies(1000));
+	return 0;
+}
+
+static void __exit my_exit(void)
+{
+    del_timer_sync(&s_dev->timer);
+
+    input_unregister_device(s_dev->input);
+    input_free_device(s_dev->input);
+    
+    kfree(s_dev);
+    printk("my_exit\n");
+}
+
+module_init(my_init);
+module_exit(my_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("ding");
+```
+
+测试结果如下：
+
++ 使用`insmod input_key.ko`加载驱动，可以看到多出来一个`event4`节点
++ 使用`hexdump /dev/input/event2`命令，查看设备节点的输出信息
+
+![](./src/0008.jpg)
+
+### 5.4 编写应用获取上报数据
+
+在上一个小节的实验中，我们是通过`hexdump`命令从输入设备的设备系欸但那获取的16进制数据。那要如何通过编写上层应用程序来获取到上述相应的数据？
+
+读取某个输入设备的数据对应的流程如下所示：
+
+1. 应用程序打开`/dev/input/eventX`设备文件. X为对应的输入设备编号
+2. 应用程序使用`read`函数从设备文件中读取数据。如果设备上没有数据可读，则`read`函数会一直阻塞等待，直到数据可用
+3. 读取的数据为一个`input_event`结构体，其包含事件类型、事件码、事件值3个字段。用于描述输入设备发生的事件信息
+4. 应用程序根据读到的事件数据进行处理，例如根据事件类型和事件码判断是哪个键被按下，鼠标移动的距离等，并进行相应的操作
+5. 在使用完输入设备后，使用`close`系统调用关闭输入设备文件
+
+测试代码：
+
+```c
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <linux/input.h>
+
+int main(int argc, char *argv[])
+{
+    int fd, ret;
+    struct input_event event;
+
+    if (argc < 2) {
+        printf("Usage: ./app /dev/input/eventX\n");
+        return -1;
+    }
+    fd = open(argv[1], O_RDONLY);
+    if (fd < 0) {
+        printf("Open %s fail\n", argv[1]);
+        return -2;
+    }
+    while (1) {
+        ret = read(fd, &event, sizeof(struct input_event));
+        if (ret < 0) {
+            printf("Read fail\n");
+            return -3;
+        }
+
+        if (event.type == EV_KEY) {
+            if (event.code == KEY_1) {
+                if (event.value == 1) {
+                    printf("value: 1\n");
+                }
+                else if (event.value == 0) {
+                    printf("value: 0\n");
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+```
+
+测试结果：
+
+![](./src/0009.jpg)
+
+## 第6章 输入子系统上报数据格式分析
+
+
 
 
 
