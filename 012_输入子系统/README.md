@@ -897,7 +897,28 @@ int main(int argc, char *argv[])
 
 ## 第6章 输入子系统上报数据格式分析
 
+在之前的章节中，我们通过`hexdump`和应用程序，都读到了按键输入设备上报的数据。我们来看下数据内容：
 
+```c
+struct timeval {
+	long	tv_sec;		/* seconds: 4字节 */
+	long	tv_usec;	/* microseconds: 4字节 */
+};
 
+struct input_event {
+	struct timeval time;	// 8字节
+	__u16 type;		// 2字节
+	__u16 code;		// 2字节
+	__s32 value;	// 4字节
+};
+```
 
+事实上，我们用`hexdump`读到的数据流，就是`struct input_event`结构体数据流。
 
+我们把结构体的各个内容打印一下看看：
+
+![](./src/0010.jpg)
+
+## 第7章 `input`子系统源码分析
+
+// TODO
